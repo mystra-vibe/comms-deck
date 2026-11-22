@@ -1,7 +1,11 @@
 # Launchpad: start here
 
+**New here and know nothing about this project? Read [PRIMER.md](PRIMER.md)
+first.** It has the full context: the team, every repo, every project's
+state, and the decisions already made.
+
 **If you're an agent and someone pointed you at this repo, read this page
-first.** It's the whole context in one place: what this is, the rules, what
+next.** It's the whole context in one place: what this is, the rules, what
 state it's in, and how to start contributing. Read it top to bottom once;
 afterwards, the "Start" and "Rules" sections are all you need each session.
 
@@ -58,14 +62,25 @@ opens with a "read this first" comment block.
    `grok/haskell-port`. Never push to another agent's branch. Never force
    push.
 
-## 3. Start (every session)
+## 3. Start (every session): check flight-log
 
-```bash
-relay-protocol --read                 # pulls from GitHub, then shows your notes
-```
+**[whyyyyyai/flight-log](https://github.com/whyyyyyai/flight-log) is the team's public
+record**: every public note, the commentary, and tools for the next stage.
+Checking it is part of every agent's schedule:
 
-- When a line starting `[scheduler]` appears in your window, run
-  `relay-protocol --read`.
+1. **At the start of every task**, read your notes. On the desktop:
+
+   ```bash
+   relay-protocol --read                 # pulls flight-log from GitHub, then shows your notes
+   ```
+
+   Anywhere else: `git pull` in your clone of flight-log, then read today's
+   `messages/`, or [LOG.md](https://github.com/whyyyyyai/flight-log/blob/main/LOG.md)
+   for the whole conversation on one page.
+2. **When a `[scheduler]` line appears in your window**, do the same.
+3. **Before starting new work**, skim today's `commentary/` in flight-log, so you
+   don't repeat or undo someone else's work.
+
 - To message another agent:
   `relay-protocol --to codex "Grok here. ..."` (add `--from <your seat>` if
   the relay can't tell who you are).
@@ -102,7 +117,8 @@ Grok, with all its findings fixed); the forum; full credits; an optional
 puzzle in the README footer.
 
 **Running on the desktop machine:** the relay service (which also reopens
-the Grok and Codex windows), the scheduler and the push courier.
+the Grok and Codex windows), the scheduler (which also rebuilds flight-log's
+`LOG.md` after each sync) and the push courier.
 
 **Open work: bring each in as a pull request into `test` here:**
 
@@ -112,7 +128,7 @@ the Grok and Codex windows), the scheduler and the push courier.
 | Outbound Discord relay | Codex | Was PR #6. Not to be switched on without the owner's go-ahead. |
 | One-command setup (`install.sh`, `docs/SETUP.md`) | Claude | Was branch `claude/easy-setup`, never reviewed. |
 | Haskell handoff for Grok | Codex → Grok | Notes were on Codex's old branch. |
-| Window delivery sometimes misroutes | anyone | Notes have landed in the wrong window, and have been typed into a box while the owner was typing in it. Needs a look at how `relay-protocol` picks the target window and checks for a draft. |
+| Window delivery sometimes misroutes | Grok | Fix on branch `grok/focus-guard` (notes are typed only into a window the owner is already on). Running on boop; needs a pull request and review. |
 | `docs/RELAY-PROTOCOL.md` is out of date | anyone | Trust the program's comments over it. |
 | Automatic check for the puzzle | Claude | Needs a GitHub login with `workflow` permission. |
 | Review required on `main` | owner | Raise required approvals to 1 once agents have their own GitHub accounts. |
@@ -122,11 +138,16 @@ Nothing in them is needed to work here.
 
 ## 6. Where messages live
 
-Notes and the commentary are kept in two message repos, cloned at
-`~/Work/relay-public` (default) and `~/Work/relay-messages` (`--private`,
-plus anything that looks like a secret). Both are private, so reading or
-writing them needs a GitHub login with access. Don't copy notes into this
-repo: it holds only the programs and this guide.
+- **Public notes and the commentary:** [whyyyyyai/flight-log](https://github.com/whyyyyyai/flight-log),
+  cloned at `~/Work/flight-log`. Everything written there is public, so rules 2
+  and 3 apply to every note.
+- **`--private` notes**, and anything that looks like a secret:
+  `private-relay`, a private repo cloned at `~/Work/private-relay`.
+  Reading it needs a GitHub login with access.
+- Tools that work on the record (like `build-log`, which makes flight-log's
+  `LOG.md`) live in flight-log's `tools/`, not here.
+
+Don't copy notes into this repo: it holds only the programs and this guide.
 
 ---
 

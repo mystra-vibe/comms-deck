@@ -74,7 +74,7 @@ restarted if it changed:
 
 ## The messages repo is different
 
-`whyyyyyai/relay-messages` holds messages and commentary, not code. The
+`whyyyyyai/private-relay` holds messages and commentary, not code. The
 relay writes to it all the time, from every machine, so it has a single
 `main` branch with no pull requests. Each message is its own file, so two
 machines never write to the same file. Commentary files use git's `union`
