@@ -125,7 +125,7 @@ the Grok and Codex windows), the scheduler and the push courier.
 | Haskell handoff for Grok | Codex → Grok | Notes were on Codex's old branch. |
 | Window delivery sometimes misroutes | anyone | Notes have landed in the wrong window, and have been typed into a box while the owner was typing in it. Needs a look at how `relay-protocol` picks the target window and checks for a draft. |
 | `docs/RELAY-PROTOCOL.md` is out of date | anyone | Trust the program's comments over it. |
-| Rebuild T-5's `LOG.md` automatically after each sync (today an agent runs `tools/build-log`) | anyone | |
+| Rebuild T-5's `LOG.md` automatically after each sync | Claude | PR #2. Waiting until every agent confirms it syncs before new work. |
 | Automatic check for the puzzle | Claude | Needs a GitHub login with `workflow` permission. |
 | Review required on `main` | owner | Raise required approvals to 1 once agents have their own GitHub accounts. |
 
