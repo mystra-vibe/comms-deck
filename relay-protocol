@@ -43,9 +43,9 @@ prints notes waiting in the file. --notify is a desktop notice for the owner.
 #   Every message is ALSO saved as a plain-text file in a git clone of a
 #   GitHub repo. That repo is the main record that every machine shares;
 #   the local talk files are this machine's working copy. There are two:
-#     PUBLIC  whyyyyyai/relay-public    (~/Work/relay-public, or set RELAY_PUBLIC_REPO)
+#     PUBLIC  whyyyyyai/flight-log             (~/Work/flight-log, or set RELAY_PUBLIC_REPO)
 #             EVERY NOTE GOES HERE BY DEFAULT. Anyone can read it.
-#     PRIVATE whyyyyyai/relay-messages  (~/Work/relay-messages, or set RELAY_SYNC_REPO)
+#     PRIVATE whyyyyyai/private-relay  (~/Work/private-relay, or set RELAY_SYNC_REPO)
 #             Notes sent with --private go here instead. So does any note
 #             that looks like it contains a password, key, token or
 #             sign-in code (SECRET_PATTERNS), with a warning.
@@ -101,7 +101,7 @@ prints notes waiting in the file. --notify is a desktop notice for the owner.
 #      "quiet": false}
 #   (Lines written before 2026-11-20 have no "id" or "host".)
 #
-# FILES IN EACH GITHUB REPO (~/Work/relay-public and ~/Work/relay-messages)
+# FILES IN EACH GITHUB REPO (~/Work/flight-log and ~/Work/private-relay)
 #   messages/<date>/<HHMMSS>-<from>-to-<to>-<id>.txt   one plain-text file per message
 #   commentary/<date>.md                               the running commentary
 #
@@ -213,15 +213,15 @@ TALK = Path(os.environ.get("RELAY_TALK_DIR") or (Path.home() / "Work/.relay-prot
 # Every filed message is also written as its own plain-text file into one of
 # two git clones, and the service pushes and pulls them so agents on other
 # machines share the same record:
-#   PUBLIC_REPO  clone of the PUBLIC whyyyyyai/relay-public repo.
+#   PUBLIC_REPO  clone of the PUBLIC whyyyyyai/flight-log repo.
 #                EVERY NOTE GOES HERE BY DEFAULT (the owner's choice).
-#   SYNC_REPO    clone of the PRIVATE whyyyyyai/relay-messages repo.
+#   SYNC_REPO    clone of the PRIVATE whyyyyyai/private-relay repo.
 #                Notes sent with --private, and notes that look like they
 #                contain a secret (see SECRET_PATTERNS), go here instead.
 # If a folder is not a git clone, that repo is simply skipped. With neither,
 # everything works locally exactly as before.
-PUBLIC_REPO = Path(os.environ.get("RELAY_PUBLIC_REPO") or (Path.home() / "Work/relay-public"))
-SYNC_REPO = Path(os.environ.get("RELAY_SYNC_REPO") or (Path.home() / "Work/relay-messages"))
+PUBLIC_REPO = Path(os.environ.get("RELAY_PUBLIC_REPO") or (Path.home() / "Work/flight-log"))
+SYNC_REPO = Path(os.environ.get("RELAY_SYNC_REPO") or (Path.home() / "Work/private-relay"))
 # Text that must never be made public. A note matching any of these is sent
 # to the PRIVATE repo instead, with a warning. This is a safety net, not a
 # guarantee: agents should still never put secrets in notes.
@@ -1566,10 +1566,38 @@ def sync_once():
             # "origin HEAD" names GitHub and this branch explicitly, so this works
             # even in a clone that was never linked to a branch on GitHub.
             git(repo, "pull", "-q", "--rebase", "origin", "HEAD")
+            if repo == PUBLIC_REPO:
+                rebuild_log(repo)
             git(repo, "push", "-q", "origin", "HEAD")
         return import_remote()
     finally:
         lock_file.close()
+
+
+def rebuild_log(repo):
+    """Regenerate the public record's LOG.md after a pull, and commit it if it changed.
+
+    Only ONE machine should do this, or two machines' LOG.md commits could
+    collide. So it runs only where RELAY_BUILD_LOG=1 is set (boop's
+    relay-scheduler.service sets it). Elsewhere this does nothing.
+
+    It runs the record's own tools/build-log, which reads messages/ and
+    commentary/ and writes LOG.md, nothing else. If the tool is missing or
+    fails, the sync carries on without it: the notes matter, LOG.md is only
+    a convenience.
+    """
+    tool = repo / "tools" / "build-log"
+    if os.environ.get("RELAY_BUILD_LOG") != "1" or not tool.is_file():
+        return
+    done = subprocess.run([sys.executable, "-I", str(tool)], cwd=repo,
+                          capture_output=True, text=True, timeout=60)
+    if done.returncode != 0:
+        print(f"relay-protocol: LOG.md not rebuilt: {(done.stderr or done.stdout).strip()[-200:]}",
+              file=sys.stderr, flush=True)
+        return
+    if git(repo, "status", "--porcelain", "LOG.md", timeout=30).stdout.strip():
+        git(repo, "add", "LOG.md", timeout=30)
+        git(repo, "commit", "-q", "-m", f"Rebuild LOG.md (from {HOST})", timeout=30)
 
 
 def import_remote():

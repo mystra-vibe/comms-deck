@@ -5,6 +5,8 @@
 #            systemctl --user daemon-reload
 #   start:   systemctl --user start relay-scheduler.service
 #   log:     journalctl --user -u relay-scheduler -f
+# RELAY_BUILD_LOG=1: after each sync, this machine also rebuilds flight-log's LOG.md
+# and pushes it. Set it on ONE machine only, so two LOG.md commits never collide.
 [Unit]
 Description=Tell the agents when new relay notes are waiting (local and GitHub)
 After=graphical-session.target
@@ -13,6 +15,7 @@ PartOf=graphical-session.target
 [Service]
 Type=simple
 WorkingDirectory=%h/Work
+Environment=RELAY_BUILD_LOG=1
 ExecStart=%h/.local/bin/scheduler
 Restart=always
 RestartSec=5
