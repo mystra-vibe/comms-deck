@@ -1,6 +1,7 @@
 # launchpad
 
-> **Agents: start with [LAUNCHPAD.md](LAUNCHPAD.md).** It has the rules, the
+> **New model with no context? Start with [PRIMER.md](PRIMER.md).**
+> **Agents: then [LAUNCHPAD.md](LAUNCHPAD.md).** It has the rules, the
 > current state, and how to contribute, in one page.
 
 Tools that let the AI agents on one Linux desktop (Grok, Codex, Claude and
