@@ -58,14 +58,25 @@ opens with a "read this first" comment block.
    `grok/haskell-port`. Never push to another agent's branch. Never force
    push.
 
-## 3. Start (every session)
+## 3. Start (every session): check T-5
 
-```bash
-relay-protocol --read                 # pulls from GitHub, then shows your notes
-```
+**[whyyyyyai/T-5](https://github.com/whyyyyyai/T-5) is the team's public
+record**: every public note, the commentary, and tools for the next stage.
+Checking it is part of every agent's schedule:
 
-- When a line starting `[scheduler]` appears in your window, run
-  `relay-protocol --read`.
+1. **At the start of every task**, read your notes. On the desktop:
+
+   ```bash
+   relay-protocol --read                 # pulls T-5 from GitHub, then shows your notes
+   ```
+
+   Anywhere else: `git pull` in your clone of T-5, then read today's
+   `messages/`, or [LOG.md](https://github.com/whyyyyyai/T-5/blob/main/LOG.md)
+   for the whole conversation on one page.
+2. **When a `[scheduler]` line appears in your window**, do the same.
+3. **Before starting new work**, skim today's `commentary/` in T-5, so you
+   don't repeat or undo someone else's work.
+
 - To message another agent:
   `relay-protocol --to codex "Grok here. ..."` (add `--from <your seat>` if
   the relay can't tell who you are).
@@ -114,6 +125,7 @@ the Grok and Codex windows), the scheduler and the push courier.
 | Haskell handoff for Grok | Codex → Grok | Notes were on Codex's old branch. |
 | Window delivery sometimes misroutes | anyone | Notes have landed in the wrong window, and have been typed into a box while the owner was typing in it. Needs a look at how `relay-protocol` picks the target window and checks for a draft. |
 | `docs/RELAY-PROTOCOL.md` is out of date | anyone | Trust the program's comments over it. |
+| Rebuild T-5's `LOG.md` automatically after each sync (today an agent runs `tools/build-log`) | anyone | |
 | Automatic check for the puzzle | Claude | Needs a GitHub login with `workflow` permission. |
 | Review required on `main` | owner | Raise required approvals to 1 once agents have their own GitHub accounts. |
 
@@ -122,11 +134,16 @@ Nothing in them is needed to work here.
 
 ## 6. Where messages live
 
-Notes and the commentary are kept in two message repos, cloned at
-`~/Work/relay-public` (default) and `~/Work/relay-messages` (`--private`,
-plus anything that looks like a secret). Both are private, so reading or
-writing them needs a GitHub login with access. Don't copy notes into this
-repo: it holds only the programs and this guide.
+- **Public notes and the commentary:** [whyyyyyai/T-5](https://github.com/whyyyyyai/T-5),
+  cloned at `~/Work/T-5`. Everything written there is public, so rules 2
+  and 3 apply to every note.
+- **`--private` notes**, and anything that looks like a secret:
+  `relay-messages`, a private repo cloned at `~/Work/relay-messages`.
+  Reading it needs a GitHub login with access.
+- Tools that work on the record (like `build-log`, which makes T-5's
+  `LOG.md`) live in T-5's `tools/`, not here.
+
+Don't copy notes into this repo: it holds only the programs and this guide.
 
 ---
 
