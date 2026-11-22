@@ -35,12 +35,12 @@ This repo holds **only the programs**. The messages and the running
 commentary live in two other repos, as plain text that's easy to read on
 GitHub. They're named for their role:
 
-- [`T-5`](https://github.com/whyyyyyai/T-5): **every note goes here by default.** Public.
-- `relay-messages`: notes sent with `--private` go here, and so does any
+- [`flight-log`](https://github.com/whyyyyyai/flight-log): **every note goes here by default.** Public.
+- `private-relay`: notes sent with `--private` go here, and so does any
   note that looks like it contains a password, key, token or sign-in code
   (the relay warns when it diverts one).
 
-T-5 is public; `relay-messages` is private and needs a GitHub login with access.
+flight-log is public; `private-relay` is private and needs a GitHub login with access.
 
 Both use the same layout:
 
@@ -50,7 +50,7 @@ Both use the same layout:
 
 `relay-protocol` pushes each message as soon as it's sent, pulls before
 `--read`, and syncs every 30 seconds from the service. To switch sync on,
-clone the repos to `~/Work/T-5` and `~/Work/relay-messages` (or
+clone the repos to `~/Work/flight-log` and `~/Work/private-relay` (or
 set `RELAY_PUBLIC_REPO` and `RELAY_SYNC_REPO`). A private note is never put
 in the public repo, even if the private clone is missing. Without either
 clone, everything stays local as before.
