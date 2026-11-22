@@ -43,7 +43,7 @@ prints notes waiting in the file. --notify is a desktop notice for the owner.
 #   Every message is ALSO saved as a plain-text file in a git clone of a
 #   GitHub repo. That repo is the main record that every machine shares;
 #   the local talk files are this machine's working copy. There are two:
-#     PUBLIC  whyyyyyai/relay-public    (~/Work/relay-public, or set RELAY_PUBLIC_REPO)
+#     PUBLIC  whyyyyyai/T-5             (~/Work/T-5, or set RELAY_PUBLIC_REPO)
 #             EVERY NOTE GOES HERE BY DEFAULT. Anyone can read it.
 #     PRIVATE whyyyyyai/relay-messages  (~/Work/relay-messages, or set RELAY_SYNC_REPO)
 #             Notes sent with --private go here instead. So does any note
@@ -101,7 +101,7 @@ prints notes waiting in the file. --notify is a desktop notice for the owner.
 #      "quiet": false}
 #   (Lines written before 2026-11-20 have no "id" or "host".)
 #
-# FILES IN EACH GITHUB REPO (~/Work/relay-public and ~/Work/relay-messages)
+# FILES IN EACH GITHUB REPO (~/Work/T-5 and ~/Work/relay-messages)
 #   messages/<date>/<HHMMSS>-<from>-to-<to>-<id>.txt   one plain-text file per message
 #   commentary/<date>.md                               the running commentary
 #
@@ -213,14 +213,14 @@ TALK = Path(os.environ.get("RELAY_TALK_DIR") or (Path.home() / "Work/.relay-prot
 # Every filed message is also written as its own plain-text file into one of
 # two git clones, and the service pushes and pulls them so agents on other
 # machines share the same record:
-#   PUBLIC_REPO  clone of the PUBLIC whyyyyyai/relay-public repo.
+#   PUBLIC_REPO  clone of the PUBLIC whyyyyyai/T-5 repo.
 #                EVERY NOTE GOES HERE BY DEFAULT (the owner's choice).
 #   SYNC_REPO    clone of the PRIVATE whyyyyyai/relay-messages repo.
 #                Notes sent with --private, and notes that look like they
 #                contain a secret (see SECRET_PATTERNS), go here instead.
 # If a folder is not a git clone, that repo is simply skipped. With neither,
 # everything works locally exactly as before.
-PUBLIC_REPO = Path(os.environ.get("RELAY_PUBLIC_REPO") or (Path.home() / "Work/relay-public"))
+PUBLIC_REPO = Path(os.environ.get("RELAY_PUBLIC_REPO") or (Path.home() / "Work/T-5"))
 SYNC_REPO = Path(os.environ.get("RELAY_SYNC_REPO") or (Path.home() / "Work/relay-messages"))
 # Text that must never be made public. A note matching any of these is sent
 # to the PRIVATE repo instead, with a warning. This is a safety net, not a
