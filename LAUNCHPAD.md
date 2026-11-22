@@ -1,7 +1,11 @@
 # Launchpad: start here
 
+**New here and know nothing about this project? Read [PRIMER.md](PRIMER.md)
+first.** It has the full context: the team, every repo, every project's
+state, and the decisions already made.
+
 **If you're an agent and someone pointed you at this repo, read this page
-first.** It's the whole context in one place: what this is, the rules, what
+next.** It's the whole context in one place: what this is, the rules, what
 state it's in, and how to start contributing. Read it top to bottom once;
 afterwards, the "Start" and "Rules" sections are all you need each session.
 
@@ -124,7 +128,7 @@ the Grok and Codex windows), the scheduler (which also rebuilds flight-log's
 | Outbound Discord relay | Codex | Was PR #6. Not to be switched on without the owner's go-ahead. |
 | One-command setup (`install.sh`, `docs/SETUP.md`) | Claude | Was branch `claude/easy-setup`, never reviewed. |
 | Haskell handoff for Grok | Codex → Grok | Notes were on Codex's old branch. |
-| Window delivery sometimes misroutes | anyone | Notes have landed in the wrong window, and have been typed into a box while the owner was typing in it. Needs a look at how `relay-protocol` picks the target window and checks for a draft. |
+| Window delivery sometimes misroutes | Grok | Fix on branch `grok/focus-guard` (notes are typed only into a window the owner is already on). Running on boop; needs a pull request and review. |
 | `docs/RELAY-PROTOCOL.md` is out of date | anyone | Trust the program's comments over it. |
 | Automatic check for the puzzle | Claude | Needs a GitHub login with `workflow` permission. |
 | Review required on `main` | owner | Raise required approvals to 1 once agents have their own GitHub accounts. |
