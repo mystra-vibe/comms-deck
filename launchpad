@@ -10,6 +10,7 @@
   launchpad serve                                       the background service
   launchpad mcp                                         MCP server (send/read as tools)
   launchpad hook --source <claude|grok>                 called by the agents' hooks
+  launchpad statusline --source <claude|grok>           the agents' status line (feeds the usage panel)
   launchpad install [--yes]                             set this machine up
   launchpad self-test                                   run the tests in a temp folder
 """
@@ -834,6 +835,57 @@ def chat(history=200, hide_private=False):
             out.flush()
 
 
+# The status line (`launchpad statusline --source <agent>`): Claude Code and
+# Grok both pipe their session details (model, context, cost, and for Claude
+# plan limits) to a status line command as JSON. This saves that JSON as
+# usage/<seat>.json for the chat view's usage panel, and prints a short row
+# for the agent's own window.
+
+
+def statusline(source):
+    """Save the agent's status JSON and print a one-line summary."""
+    try:
+        data = json.loads(sys.stdin.read() or "{}")
+    except ValueError:
+        data = {}
+    seat = os.environ.get("LAUNCHPAD_SEAT") or source
+    write_json(DATA / "usage" / f"{seat}.json", {"time": time.time(), "source": source, "data": data})
+    parts = [dig(data, "model", "display_name")]
+    pct = context_percent(data)
+    if pct is not None:
+        parts.append(f"ctx {pct:.0f}%")
+    cost = dig(data, "cost", "total_cost_usd")
+    if isinstance(cost, (int, float)) and cost >= 0.005:
+        parts.append(f"${cost:.2f}")
+    five = dig(data, "rate_limits", "five_hour", "used_percentage")
+    if isinstance(five, (int, float)):
+        parts.append(f"5h {five:.0f}%")
+    waiting = len(pending(seat))
+    if waiting:
+        parts.append(f"{waiting} note(s) waiting")
+    print(" · ".join(str(p) for p in parts if p))
+
+
+def dig(data, *keys):
+    """data[k1][k2]... or None if any step is missing."""
+    for key in keys:
+        if not isinstance(data, dict):
+            return None
+        data = data.get(key)
+    return data
+
+
+def context_percent(data):
+    """How full the context window is, 0-100, or None if unknown."""
+    pct = dig(data, "context_window", "used_percentage")
+    if isinstance(pct, (int, float)):
+        return float(pct)
+    used, size = dig(data, "context_window", "context_tokens"), dig(data, "context_window", "context_window_size")
+    if isinstance(used, (int, float)) and isinstance(size, (int, float)) and size:
+        return 100.0 * used / size
+    return None
+
+
 def status_text():
     """A short table of every agent seat."""
     rows = []
@@ -1165,6 +1217,8 @@ def main():
     p = sub.add_parser("hook")
     p.add_argument("--source", required=True, choices=("claude", "grok"))
     p.add_argument("--event", default="")
+    p = sub.add_parser("statusline")
+    p.add_argument("--source", required=True, choices=("claude", "grok"))
     p = sub.add_parser("install")
     p.add_argument("--yes", action="store_true")
     sub.add_parser("self-test")
@@ -1207,6 +1261,11 @@ def main():
                 hook(args.source, args.event)
             except Exception as error:  # a hook must never break the agent
                 print(f"launchpad hook: {error}", file=sys.stderr)
+        elif args.cmd == "statusline":
+            try:
+                statusline(args.source)
+            except Exception as error:  # a status line must never break the agent
+                print(f"launchpad: {error}")
         elif args.cmd == "install":
             install(args.yes)
         elif args.cmd == "self-test":
