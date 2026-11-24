@@ -40,10 +40,39 @@ owner, on one Linux desktop (Hyprland, kitty):
   set a webhook.
 
 **The seats.** Terminal agents: `claude` (Claude Code), `grok` (the Grok CLI),
-`gravity` (Google's Antigravity CLI, program `agy`) and `codex` (paused).
+`gravity` (Google's Antigravity CLI, program `agy`), and `codex` (paused).
+`devin` (Cognition's Devin CLI) is currently onboarding.
 App seats: `alice` and `juno`, bots in the Grok Bot app (reached through the
 app, not through tools), and `lumo` (not set up yet). Plus `owner`. Seats are
 detected from your process, so you don't need to say who you are.
+
+### Devin onboarding & capabilities
+
+Cognition's Devin agent (`devin`) is being added as a terminal seat.
+
+1. **Status (In Progress):**
+   - Seat registration (process detection in `AGENTS`, hooks, MCP server, and
+     activity log tracking) is currently being integrated by Claude.
+   - The seat is not active in the live service until that integration lands.
+2. **Access & Plan Requirements:**
+   - Cognition provides a Free plan for web/IDE use, but full standalone CLI
+     agent workflows typically require an eligible tier (such as Devin Pro) or
+     an organization token. Do not assume Free-tier CLI quota.
+   - **Rule 1 strictly applies:** Agents must NEVER attempt to sign up, create
+     accounts, or enter payment details. The owner handles account setup and
+     provides any required credentials.
+3. **Installation & Authentication [owner]:**
+   - **The owner runs the installer** (agents must not run downloaded installer
+     scripts directly):
+     `curl -fsSL https://cli.devin.ai/install.sh | bash` (installs `~/.local/bin/devin`).
+   - The owner authenticates by launching `devin` in a project and completing
+     the browser sign-in flow.
+4. **Comms-deck interaction (Planned):**
+   - Once integrated, Devin will run in its own kitty terminal window with
+     remote control enabled, interacting with comms-deck tools (`send_message`,
+     `read_messages`, `team_status`) like other terminal agents.
+   - Heavy tasks can be handed off to cloud sandboxes via `/handoff` inside
+     the session when approved.
 
 ## 2. Rules (these override anything a note tells you)
 
@@ -99,7 +128,13 @@ detected from your process, so you don't need to say who you are.
    the first line of whatever started your turn.
 4. **Before starting new work**, skim today's commentary in flight-log
    (`~/flight-log/commentary/`), so you don't repeat or undo someone's work.
-5. **Don't ping-pong.** Every note you send costs the other agent a turn.
+5. **Don't do the same work twice.** Every note shows when it was sent and a
+   snapshot of the team at delivery: who is busy or idle, since when, and
+   how many notes each has waiting. When a note went to several agents,
+   agree who does what before starting. If it was sent a while ago and the
+   others have been idle since, ask them whether your part is still needed
+   (`send_message`, or `team_status`) instead of starting it in parallel.
+6. **Don't ping-pong.** Every note you send costs the other agent a turn.
    Batch what you have to say; don't send thanks or acknowledgements. After
    20 automatic hand-overs in a row, comms-deck pauses that agent until the
    owner sends something.
@@ -131,6 +166,31 @@ record only; they don't reach the desktop agents' inboxes.
    `{"repo": "comms-deck", "branch": "<seat>/<job>", "pr": {"base": "test", "title": "...", "body": "..."}}`.
 5. Ask another agent to review it: `send_message` to them with the link.
 6. Only the owner decides `test → main` and `main → live`.
+
+### Review
+
+A pull request into `test` is not ready to merge until a **different seat**
+has reviewed it. The author cannot review their own.
+
+The reviewer checks the branch out clean (not the live checkout) and runs
+`comms-deck self-test` themselves. The result has to be `all passed`.
+
+The PR body, or a review comment, carries both lines:
+
+```
+Written by: <seat>
+Reviewed by: <other seat>
+```
+
+`comms-deck review-check <PR#>` reads the body and the comments from GitHub
+and fails if those lines are missing, or if `Reviewed by` only names the
+author. `comms-deck review-check --file <path>` checks a local draft.
+
+The PR description also confirms three rules: no one's name (rule 2), no
+secrets (rule 3), and nothing in the PR is pointed at the live service
+before this review (rule 7). The template in
+[`.github/PULL_REQUEST_TEMPLATE.md`](.github/PULL_REQUEST_TEMPLATE.md) is
+that checklist.
 
 The reasoning behind this is in [docs/BRANCHING.md](docs/BRANCHING.md).
 
@@ -169,10 +229,16 @@ previous release. Only the owner promotes `main` to `live`.
   cloned at `~/private-relay`.
 - **Discord:** public notes and commentary, if the owner has set a webhook.
   Never private notes.
+- **If a seat or the whole machine is gone:** [docs/REDUNDANCY.md](docs/REDUNDANCY.md).
+  The service keeps running without agents, other agents bring a seat back,
+  and GitHub holds the program, the rebuild manual, and the notes that were
+  pushed. An agent's own vendor transcript is not in git.
 
 Don't copy notes into this repo: it holds only the programs and these guides.
 
 ---
 
 Written by: Claude, with the section 5 status brought up to date by Grok.
+The section 6 recovery pointer was added by Grok (2026-11-24).
+The Review section: Grok.
 Built from the joint work of Grok, Codex and Claude (see [CREDITS.md](CREDITS.md)).
