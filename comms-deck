@@ -147,9 +147,13 @@ for _pair in filter(None, setting("SEATS", "").split(",")):
 # in the Grok Bot window is woken from that chat (section 7b). Any other app
 # seat is left to its own connector.
 _app_file = CONFIG / "app-seats"
-APP_SEATS = tuple(line.split("#")[0].strip() for line in
-                  (_app_file.read_text().splitlines() if _app_file.exists() else [])
-                  if line.split("#")[0].strip())
+APP_PROCESS = {}  # seat -> the app it lives in; "name:app" in the file, default grok-bot
+for _line in (_app_file.read_text().splitlines() if _app_file.exists() else []):
+    _line = _line.split("#")[0].strip()
+    if _line:
+        _name, _, _app = _line.partition(":")
+        APP_PROCESS[_name.strip()] = _app.strip() or "grok-bot"
+APP_SEATS = tuple(APP_PROCESS)
 SEATS = tuple(AGENTS) + APP_SEATS + ("owner",)
 
 # The repos the notes are copied to. A missing clone just means no copy.
@@ -341,8 +345,20 @@ def app_seat_state(seat):
     'not connected' if the Grok Bot app is open without one, 'away' if closed."""
     state = read_json(seat_file(seat), {}) or {}
     seen = float(state.get("app_seen") or 0)
-    if time.time() - seen < 15 and state.get("state") in ("busy", "idle", "away", "not connected"):
+    if time.time() - seen < 15 and state.get("state") in (
+            "busy", "idle", "away", "not connected", "chat not open", "no chat yet"):
         return state["state"]
+    if APP_PROCESS.get(seat, "grok-bot") != "grok-bot":
+        # Not a Grok Bot seat: it can only connect through its own app's MCP.
+        for d in Path("/proc").iterdir():
+            try:
+                cmd = (d / "cmdline").read_bytes()
+                if b"comms-deck\0mcp" in cmd and f"COMMS_DECK_SEAT={seat}".encode() in \
+                        (d / "environ").read_bytes().split(b"\0"):
+                    return "connected"
+            except OSError:
+                continue
+        return "not set up"
     app_open = False
     for d in Path("/proc").iterdir():
         if not d.name.isdigit():
@@ -369,10 +385,50 @@ def update_seat(seat, **changes):
     with open(path.with_suffix(".lock"), "w") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         state = read_json(path, {}) or {}
+        before = state.get("state")
         state.update(changes)
         state["updated"] = time.time()
+        if "state" in changes and changes["state"] != before:
+            state["since"] = time.time()
+            record_activity(seat, changes["state"])
         write_json(path, state)
         return state
+
+
+def record_activity(seat, new_state):
+    """Add one line to activity.jsonl: a seat changed state. Kept to 2000 lines."""
+    path = DATA / "activity.jsonl"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "a+") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        f.write(json.dumps({"time": time.time(), "seat": seat, "state": new_state}) + "\n")
+        f.flush()
+        if f.tell() > 400_000:
+            f.seek(0)
+            keep = f.readlines()[-2000:]
+            f.seek(0)
+            f.truncate()
+            f.writelines(keep)
+
+
+def recent_activity(limit):
+    """The newest `limit` state changes, newest first, with repeats folded."""
+    try:
+        lines = (DATA / "activity.jsonl").read_text().splitlines()[-400:]
+    except OSError:
+        return []
+    out = []
+    for line in reversed(lines):
+        try:
+            r = json.loads(line)
+        except ValueError:
+            continue
+        if out and out[-1]["seat"] == r["seat"] and out[-1]["state"] == r["state"]:
+            continue
+        out.append(r)
+        if len(out) >= limit:
+            break
+    return out
 
 
 def remember_window(seat, pid):
@@ -943,6 +999,11 @@ def log(text):
 
 
 GROK_BOT_PORT = 9222
+
+
+def GROK_BOT_SEATS():
+    """The app seats that live in the Grok Bot app."""
+    return [seat for seat in APP_SEATS if APP_PROCESS.get(seat, "grok-bot") == "grok-bot"]
 GROK_BOT_PAGE = "renderer/index.html"
 APP_USAGE_EVERY = 60
 _WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
@@ -1543,14 +1604,15 @@ def drive_app_seat(seat, cdp, focused):
     with_usage = time.time() - float(prev_usage.get("time") or 0) >= APP_USAGE_EVERY
     snap = app_snapshot(cdp, seat, with_usage)
     if not snap.get("has_row"):
-        return False  # this seat is not in the Grok Bot window
+        update_seat(seat, state="no chat yet", app_seen=time.time(), app_page="grok-bot")
+        return False  # this seat has no chat in the Grok Bot window
     if with_usage:
         write_app_usage(seat, snap.get("usage"))
     if not snap.get("open"):
         waiting = any(not record.get("quiet") for _, record in pending(seat))
         if waiting and not focused and not snap.get("replying"):
             cdp_eval(cdp, page_script(_CLICK_JS, seat))
-        update_seat(seat, state="not connected", app_seen=time.time(), app_page="grok-bot")
+        update_seat(seat, state="chat not open", app_seen=time.time(), app_page="grok-bot")
         return False
     file_app_replies(seat, state, snap)
     page_state = "busy" if snap.get("replying") else "idle"
@@ -1569,11 +1631,13 @@ def try_app_seats():
     """One pass over the Grok Bot window for every app seat that lives there."""
     if not APP_SEATS:
         return
+    if not GROK_BOT_SEATS():
+        return
     focused = app_window_focused()
     try:
         cdp = open_grok_bot_page()
     except (OSError, RuntimeError, TimeoutError, ValueError, urllib.error.URLError):
-        for seat in APP_SEATS:
+        for seat in GROK_BOT_SEATS():
             state = load_seat(seat)
             if state.get("app_page") == "grok-bot":
                 mark_app_down(seat, state)
@@ -1581,7 +1645,7 @@ def try_app_seats():
     try:
         cdp_eval(cdp, _SCROLL_JS)
         time.sleep(0.2)
-        for seat in APP_SEATS:
+        for seat in GROK_BOT_SEATS():
             try:
                 drive_app_seat(seat, cdp, focused)
             except Exception as error:
@@ -1749,7 +1813,8 @@ def watch():
 # a status bar that stays put (an ANSI scroll region), showing each seat.
 
 SEAT_COLOURS = {"claude": 208, "grok": 45, "codex": 78, "owner": 220, "push-courier": 245}
-STATE_COLOURS = {"busy": 208, "idle": 78, "away": 240, "connected": 78, "not connected": 214}
+STATE_COLOURS = {"busy": 208, "idle": 78, "away": 240, "connected": 78, "not connected": 214,
+                 "chat not open": 214, "no chat yet": 240, "not set up": 240}
 
 
 def colour(seat):
@@ -1832,14 +1897,22 @@ def usage_panel(width):
     inner = width - 2
     bar_w = max(6, inner - 16)
     lines = [f"\033[1mUSAGE\033[0m", ""]
+    shown_account = False
     for seat in tuple(AGENTS) + APP_SEATS:
         record = read_json(DATA / "usage" / f"{seat}.json")
         state = load_seat(seat) if seat in AGENTS else {"state": "app"}
         if not record:
             continue  # nothing known: leave it out rather than show an empty section
+        if record.get("source") == "grok-bot":
+            # One Grok Bot account serves every bot: show its usage once.
+            if shown_account:
+                continue
+            shown_account = True
         d = (record or {}).get("data", {})
         model = dig(d, "model", "display_name") or ""
         title = f"\033[1;38;5;{colour(seat)}m{seat.upper()}\033[0m"
+        if record.get("source") == "grok-bot":
+            title, model = "\033[1mGROK BOT ACCOUNT\033[0m", "all bots"
         lines.append(title + (f" \033[2m· {model}\033[0m" if model else ""))
         pct = context_percent(d)
         size = dig(d, "context_window", "context_window_size")
@@ -1870,6 +1943,15 @@ def usage_panel(width):
             lines.append(f"  Session  {' · '.join(bits)}")
         lines.append(f"\033[2m  updated {ago(time.time() - record.get('time', 0))}\033[0m")
         lines.append("")
+    activity = recent_activity(12)
+    if activity:
+        lines.append("\033[1mACTIVITY\033[0m")
+        lines.append("")
+        for r in activity:
+            seat, st = r["seat"], r["state"]
+            lines.append(f"  \033[2m{time.strftime('%H:%M', time.localtime(r['time']))}\033[0m  "
+                         f"\033[38;5;{colour(seat)}m{seat.title():6}\033[0m "
+                         f"\033[38;5;{STATE_COLOURS.get(st, 245)}m{st}\033[0m")
     return [fit(" " + line, width) for line in lines]
 
 
@@ -1907,6 +1989,9 @@ def chat(history=200, hide_private=False):
             mark = "●" if s["state"] != "away" else "○"
             waiting = len(pending(seat))
             extra = f" ({waiting} waiting)" if waiting else ""
+            since = (read_json(seat_file(seat), {}) or {}).get("since")
+            if since and s["state"] in ("busy", "idle", "away"):
+                extra = f" {ago(time.time() - since).replace(' ago', '')}" + extra
             if waiting and time.time() - float(s.get("held_by_draft") or 0) < 10:
                 extra = f" ({waiting} waiting · unsent text in its window)"
             parts.append(f"\033[1;38;5;{colour(seat)}m{seat.title()}\033[22;39m "
@@ -2647,6 +2732,10 @@ def self_test():
     check("text typed in the normal colour still counts",
           composer_text(drop_placeholders(typed)) == "run the tests", repr(drop_placeholders(typed)))
     app_text = render([{"from": "grok", "to": "alice", "time": "2026-11-24 02:50:00", "text": "hi"}], "alice")
+    run(["hook", "--source", "grok", "--event", "SessionStart"], "grok", "{}", {"GROK_HOOK_EVENT": "session_start"})
+    acts = [json.loads(l) for l in Path(f"{tmp}/data/activity.jsonl").read_text().splitlines()]
+    check("state changes are written to the activity log",
+          any(a["seat"] == "grok" and a["state"] == "idle" for a in acts), str(acts[-3:]))
     check("app seats are told to reply in their chat, not with tools",
           "Reply here in this chat" in app_text and "send_message" not in app_text, app_text)
     check("Grok's Notification hook matches idle_prompt only",
