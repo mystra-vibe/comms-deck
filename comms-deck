@@ -2078,16 +2078,6 @@ def when(ts):
     return time.strftime("%H:%M" if same_day else "%a %H:%M", t)
 
 
-def span(seconds):
-    """A duration for the activity timers: 45s, 12m 05s, 1h 12m."""
-    seconds = int(max(0, seconds))
-    if seconds < 60:
-        return f"{seconds}s"
-    if seconds < 3600:
-        return f"{seconds // 60}m {seconds % 60:02d}s"
-    return f"{seconds // 3600}h {seconds % 3600 // 60:02d}m"
-
-
 def ago(seconds):
     seconds = int(max(0, seconds))
     if seconds < 90:
@@ -2164,8 +2154,8 @@ def usage_panel(width):
             lines.append(f"  Session  {' · '.join(bits)}")
         lines.append(f"\033[2m  updated {ago(time.time() - record.get('time', 0))}\033[0m")
         lines.append("")
-    # ACTIVITY: one row per agent: its state's symbol, the state, and when it
-    # began ("since 03:21"). Nothing ticks. (The history stays in
+    # ACTIVITY: one row per agent: its state's symbol, the state, when it
+    # began, and a blue square per note waiting for it. Nothing ticks. (The history stays in
     # activity.jsonl; the owner asked for just the current picture here.)
     lines.append("\033[1mACTIVITY\033[0m")
     lines.append("")
@@ -2173,10 +2163,13 @@ def usage_panel(width):
         # Static: when the state began, not a ticking timer. A row changes
         # only when that agent's state does, and is rewritten in place.
         shade = STATE_COLOURS.get(st, 245)
-        began = f"since {time.strftime('%H:%M', time.localtime(since))}" if since else ""
+        began = when(since) if since else ""  # "03:27" today, "Fri 18:00" otherwise
+        waiting = len(pending(seat))
+        squares = "■" * min(waiting, 5) + (f"+{waiting - 5}" if waiting > 5 else "")
         lines.append(f"  \033[38;5;{colour(seat)}m{seat.title():8}\033[0m "
                      f"\033[38;5;{shade}m{STATE_MARKS.get(st, '◌')} {st[:13]:13}\033[0m "
-                     f"\033[2m{began}\033[0m")
+                     f"\033[2m{began}\033[0m"
+                     + (f" \033[38;5;33m{squares}\033[0m" if squares else ""))
     return [fit(" " + line, width) for line in lines]
 
 
@@ -2315,7 +2308,7 @@ def chat(history=200, hide_private=False):
         try:
             while True:
                 cols, rows = shutil.get_terminal_size((100, 40))
-                panel_w = max(34, min(52, cols // 3)) if cols >= 90 else 0
+                panel_w = max(40, min(52, cols // 3)) if cols >= 90 else 0  # 40: a full ACTIVITY row fits
                 chat_w = cols - panel_w - (3 if panel_w else 0)
                 changed = False
                 if layout != (cols, rows):  # first time, or the window was resized
