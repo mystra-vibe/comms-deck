@@ -45,8 +45,9 @@
 #      - An agent that is WORKING gets its notes from its own hook. Claude
 #        and Grok get them when a turn is about to end (Stop). Gravity gets
 #        them before the next model call (PreInvocation). With an empty inbox
-#        the hook costs nothing. Stop does not mark Claude or Grok idle;
-#        Grok's idle_prompt does. Gravity's Stop marks idle only when the
+#        the hook costs nothing. Claude is idle once its Stop lets the turn
+#        end (comms-deck's is its only Stop hook); Grok waits for its
+#        idle_prompt notification. Gravity's Stop marks idle only when the
 #        payload says fullyIdle (missing means yes).
 #      - An agent that is IDLE is woken by `comms-deck serve`, which uses
 #        kitty's remote control to paste the note into that agent's exact
