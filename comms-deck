@@ -989,6 +989,7 @@ def agy_hook(event):
             update_seat(seat, state="idle")
 
 
+VIBE_MAX_DENIES = 3  # post_agent denies Vibe 3.1.4 honours per turn (_MAX_POST_AGENT_RETRIES)
 VIBE_HOOK_TYPES = ("session_start", "pre_agent", "post_agent", "notification", "session_end")
 
 
@@ -1011,8 +1012,10 @@ def vibe_hook(event):
                      resets unless the prompt is a note the deck typed.
       post_agent     {turn_id, response_text}: the turn ended. A note waiting:
                      {"decision": "deny", "reason": notes}, and Vibe goes on
-                     with it (Vibe allows 3 of these a turn; the rest wait
-                     for the next idle wake). Otherwise idle.
+                     with it. Vibe 3.1.4 honours only 3 denies a turn and
+                     drops the reason of a 4th, so after 3 handovers in one
+                     turn_id the notes stay in the inbox for the idle wake
+                     (Grok's review of #46). Otherwise idle.
       notification   notification_type turn_completed / turn_failed: idle.
       session_end    away.
     The event comes from hook_event_name when --event is not given.
@@ -1045,10 +1048,16 @@ def vibe_hook(event):
         update_seat(seat, state="busy", woke_at=0, **({} if automatic else {"auto": 0, "paused_notice": False}),
                     **({"doing": describe(prompt)} if prompt and not prompt.lstrip().startswith(MARK) else {}))
     elif event == "post_agent":
+        turn = str(data.get("turn_id") or "")
+        handed = int(state.get("vibe_denies") or 0) if turn and turn == state.get("vibe_turn") else 0
+        if handed >= VIBE_MAX_DENIES:
+            update_seat(seat, state="idle")
+            return  # Vibe would accept and drop a 4th: leave the notes for the idle wake
         if state["auto"] < AUTO_LIMIT or owner_waiting(seat):
             notes = take(seat, include_quiet=False, limit_chars=HANDOVER_MAX)
             if notes:
-                update_seat(seat, state="busy", auto=next_auto(state, notes), doing=describe_notes(notes))
+                update_seat(seat, state="busy", auto=next_auto(state, notes), doing=describe_notes(notes),
+                            vibe_turn=turn, vibe_denies=handed + 1)
                 print(json.dumps({"decision": "deny", "reason": render(notes, seat)}))
                 return
         elif any(not r.get("quiet") for _, r in pending(seat)):
@@ -3753,6 +3762,23 @@ def self_test():
     run(["hook", "--source", "vibe", "--event", "post_agent"], "vibe", '{"response_text": "done"}')
     check("vibe is idle after a post_agent with nothing waiting",
           (read_json(Path(tmp) / "data/seats/vibe.json", {}) or {}).get("state") == "idle")
+    vibe_inbox = Path(tmp) / "data/inbox/vibe"
+    outs = []
+    for i in range(4):  # one note per handover, all in the same turn
+        run(["send", "vibe", f"capped note {i}"], "owner")  # the owner: past the loop guard, so only the cap counts
+        r = run(["hook", "--source", "vibe", "--event", "post_agent"], "vibe", '{"turn_id": "turn-A"}')
+        outs.append(json.loads(r.stdout or "{}"))
+    check("vibe gets 3 denies a turn; the 4th prints nothing and leaves its note in the inbox",
+          [o.get("decision") for o in outs] == ["deny", "deny", "deny", None]
+          and len(list(vibe_inbox.glob("*.json"))) == 1, f"{outs} left={len(list(vibe_inbox.glob('*.json')))}")
+    run(["hook", "--source", "vibe", "--event", "notification"], "vibe",
+        '{"hook_event_name": "notification", "notification_type": "turn_completed"}')
+    check("vibe is idle after turn_completed",
+          (read_json(Path(tmp) / "data/seats/vibe.json", {}) or {}).get("state") == "idle")
+    r = run(["hook", "--source", "vibe", "--event", "post_agent"], "vibe", '{"turn_id": "turn-B"}')
+    out = json.loads(r.stdout or "{}")
+    check("a new turn_id gets denies again, with the note that waited",
+          out.get("decision") == "deny" and "capped note 3" in out.get("reason", ""), r.stdout)
     run(["hook", "--source", "vibe", "--event", "session_end"], "vibe", '{"reason": "exit"}')
     check("vibe is away after session_end",
           (read_json(Path(tmp) / "data/seats/vibe.json", {}) or {}).get("state") == "away")
