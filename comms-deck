@@ -278,14 +278,71 @@ def seat_file(seat):
     return DATA / "seats" / f"{seat}.json"
 
 
+def interactive_agents(seat):
+    """Pids of `seat`'s agent processes that run in a terminal.
+
+    Helpers the agents start in the background (e.g. `claude mcp list`)
+    have no terminal, so they're left out.
+    """
+    want = AGENTS.get(seat)
+    found = []
+    for d in Path("/proc").iterdir():
+        if not d.name.isdigit():
+            continue
+        try:
+            if (d / "comm").read_text().strip() != want:
+                continue
+            fields = (d / "stat").read_text().rsplit(")", 1)[1].split()
+            if int(fields[4]) != 0 and proc_name(int(fields[1])) != want:  # has a tty; not a child of itself
+                found.append(int(d.name))
+        except (OSError, ValueError, IndexError):
+            continue
+    return found
+
+
 def load_seat(seat):
-    """The seat's state dict. 'away' if its agent process has gone."""
+    """The seat's state dict. 'away' if its agent process has gone.
+
+    If the recorded process has gone but exactly one copy of that agent is
+    running in a terminal, that copy is adopted (it was restarted, or the
+    record was stale), so the seat doesn't show away by mistake.
+    """
     state = read_json(seat_file(seat), {}) or {}
-    if state.get("pid") and not pid_alive(state["pid"]):
-        state["state"] = "away"
+    if seat in AGENTS and not (state.get("pid") and pid_alive(state["pid"])):
+        live = interactive_agents(seat)
+        if len(live) == 1:
+            remember_window(seat, live[0])
+            state = read_json(seat_file(seat), {}) or {}
+            if state.get("state") in (None, "away"):
+                state = update_seat(seat, state="idle")
+        elif state.get("pid"):
+            state["state"] = "away"
     state.setdefault("state", "away")
     state.setdefault("auto", 0)
     return state
+
+
+def app_seat_state(seat):
+    """What can be known about an app seat (a Grok Bot bot) without hooks:
+    'connected' if its comms-deck MCP server is running, 'not connected' if
+    the Grok Bot app is open without it, 'away' if the app is closed."""
+    app_open = False
+    for d in Path("/proc").iterdir():
+        if not d.name.isdigit():
+            continue
+        try:
+            comm = (d / "comm").read_text().strip()
+            if comm == "grok-bot":
+                app_open = True
+                continue
+            cmd = (d / "cmdline").read_bytes()
+            if b"comms-deck\0mcp" in cmd or b"launchpad\0mcp" in cmd:
+                env = (d / "environ").read_bytes().split(b"\0")
+                if f"COMMS_DECK_SEAT={seat}".encode() in env or f"LAUNCHPAD_SEAT={seat}".encode() in env:
+                    return "connected"
+        except OSError:
+            continue
+    return "not connected" if app_open else "away"
 
 
 def update_seat(seat, **changes):
@@ -304,7 +361,10 @@ def update_seat(seat, **changes):
 def remember_window(seat, pid):
     """Record which agent process and kitty window `seat` lives in."""
     env = dict(agent_env(pid)) if pid else {}
-    env.update({k: v for k, v in os.environ.items() if k.startswith("KITTY_")})
+    # Our own kitty details only count if we run inside that agent (a hook);
+    # a process elsewhere (the chat screen) has its own window's details.
+    if "KITTY_WINDOW_ID" not in env and find_agent()[1] == pid:
+        env.update({k: v for k, v in os.environ.items() if k.startswith("KITTY_")})
     update_seat(seat, pid=pid or None,
                 kitty_window=env.get("KITTY_WINDOW_ID"),
                 kitty_socket=env.get("KITTY_LISTEN_ON"))
@@ -750,7 +810,7 @@ def watch():
 # a status bar that stays put (an ANSI scroll region), showing each seat.
 
 SEAT_COLOURS = {"claude": 208, "grok": 45, "codex": 78, "owner": 220, "push-courier": 245}
-STATE_COLOURS = {"busy": 208, "idle": 78, "away": 240}
+STATE_COLOURS = {"busy": 208, "idle": 78, "away": 240, "connected": 78, "not connected": 214}
 
 
 def colour(seat):
@@ -835,16 +895,12 @@ def usage_panel(width):
     for seat in tuple(AGENTS) + APP_SEATS:
         record = read_json(DATA / "usage" / f"{seat}.json")
         state = load_seat(seat) if seat in AGENTS else {"state": "app"}
-        if not record and state["state"] == "away" and seat not in ("claude", "grok"):
-            continue
+        if not record:
+            continue  # nothing known: leave it out rather than show an empty section
         d = (record or {}).get("data", {})
         model = dig(d, "model", "display_name") or ""
         title = f"\033[1;38;5;{colour(seat)}m{seat.upper()}\033[0m"
         lines.append(title + (f" \033[2m· {model}\033[0m" if model else ""))
-        if not record:
-            lines.append("\033[2m  no usage data" + (" (Grok Bot app)" if seat in APP_SEATS else " yet") + "\033[0m")
-            lines.append("")
-            continue
         pct = context_percent(d)
         size = dig(d, "context_window", "context_window_size")
         if pct is not None:
@@ -861,8 +917,6 @@ def usage_panel(width):
                 reset = dig(d, "rate_limits", key, "resets_at")
                 if isinstance(reset, (int, float)):
                     lines.append(f"\033[2m           {100 - used:.0f}% left · resets {when(reset)}\033[0m")
-        if dig(d, "rate_limits") is None:
-            lines.append("\033[2m  Plan limits: not reported\033[0m")
         bits = []
         sin, sout = dig(d, "context_window", "session_input_tokens"), dig(d, "context_window", "session_output_tokens")
         if isinstance(sin, (int, float)):
@@ -910,9 +964,10 @@ def chat(history=200, hide_private=False):
 
     def status_bar(cols):
         parts = []
-        for seat in AGENTS:
-            s = load_seat(seat)
-            if s["state"] == "away" and seat not in ("claude", "grok"):
+        seats = [(seat, load_seat(seat)) for seat in AGENTS]
+        seats += [(seat, {"state": app_seat_state(seat)}) for seat in APP_SEATS]
+        for seat, s in seats:
+            if s["state"] == "away" and seat not in ("claude", "grok") + APP_SEATS:
                 continue
             mark = "●" if s["state"] != "away" else "○"
             waiting = len(pending(seat))
