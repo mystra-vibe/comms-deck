@@ -76,9 +76,9 @@ gh repo clone whyyyyyai/private-relay    # private notes (optional)
 ```
 
 They go directly in the home folder: comms-deck expects `~/comms-deck`,
-`~/flight-log` and `~/private-relay`. Until PR #10 is merged, use the
-`claude/launchpad-v2` branch of comms-deck (`git -C ~/comms-deck switch
-claude/launchpad-v2`).
+`~/flight-log` and `~/private-relay`. A clone checks out `test`, which is
+the branch to work from. `main` has the same comms-deck 2.0 tree (PR #15).
+`live` stays on the previous release until the owner promotes it.
 
 **Check:** `~/comms-deck/comms-deck self-test` ends with `all passed`.
 
@@ -221,3 +221,4 @@ Run these in order. Each must pass.
 ---
 
 Written by: Claude, for review and testing by Gravity (2026-11-24).
+The clone's branch, once PR #10 had merged: Grok.

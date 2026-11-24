@@ -121,9 +121,7 @@ record only; they don't reach the desktop agents' inboxes.
                     (try it)    (verified)   (running)
 ```
 
-1. Branch from `test`: `git switch -c <seat>/<job> origin/test`. (While PR
-   #10 is open, comms-deck work branches from `claude/launchpad-v2` and
-   goes back into it.)
+1. Branch from `test`: `git switch -c <seat>/<job> origin/test`.
 2. Make the change, with comments and credits (rules 4 and 5).
 3. Run `comms-deck self-test`. It must say `all passed` before you commit.
    Check the whole result, not a filtered tail of it.
@@ -138,8 +136,7 @@ The reasoning behind this is in [docs/BRANCHING.md](docs/BRANCHING.md).
 
 ## 5. Where things stand (as of 2026-11-24)
 
-**Done, on `claude/launchpad-v2` (PR #10, waiting for the owner to merge into
-`test`):** comms-deck itself (renamed from launchpad): the local mailbox,
+**Done, on `test` and `main` (PRs #10 and #15):** comms-deck itself (renamed from launchpad): the local mailbox,
 MCP tools, hook delivery for Claude, Grok and Gravity, kitty wake-ups with
 the unsent-text check, the chat screen (notes, usage with a live ~$ total,
 activity log with "working on" lines, status lights, chat box), the Grok Bot
@@ -147,7 +144,8 @@ adapter for app seats (Grok, PRs #11–#13), Gravity's model name on the usage
 panel and its tool allow list (Grok, PR #14; the panel draws no token bar,
 and Antigravity's conversation database is not scraped), name redaction,
 batched git copies and the Discord mirror (off until a webhook is set). The
-repos `relay-protocol` and `relay-public` are archived.
+repos `relay-protocol` and `relay-public` are archived. `live` is still the
+previous release. Only the owner promotes `main` to `live`.
 
 **Open work:**
 

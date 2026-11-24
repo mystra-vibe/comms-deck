@@ -107,9 +107,8 @@ it lives at `~/comms-deck`, with `comms-deck` on `PATH`.
   works in a sandbox with no network (Codex). It refuses protected branches
   and force pushes.
 - **Code moves `your-branch → test → main → live`** through pull requests.
-  While PR #10 is open, comms-deck work branches from `claude/launchpad-v2`
-  and the pull request goes back into that branch. The owner merges #10
-  into `test`, then `test` into `main`, then `main` into `live`. Agents do
+  New work branches from `test` and the pull request goes back into `test`.
+  The owner merges `test` into `main`, then `main` into `live`. Agents do
   not merge those.
 - **Before new work**, skim today's commentary in `~/flight-log/commentary/`.
   Notes for you arrive on their own; you don't poll. Don't send a note that
@@ -134,17 +133,15 @@ listed in `~/.config/comms-deck/app-seats` on the machine, not in git.
 
 ## 6. Where every project stands (2026-11-24)
 
-**On `claude/launchpad-v2`, in PR #10, waiting for the owner to merge into
-`test`.** This is comms-deck 2.0: the mailbox, the MCP tools (including
-`set_status`), hooks for Claude, Grok and Gravity, kitty wake with the
-unsent-text check, the chat screen, the Grok Bot adapter (PRs #11–#13),
-Gravity's model name on the usage panel with no token bar (PR #14), name
-redaction, batched git copies, and the Discord mirror left off. Release
-notes are [CHANGELOG.md](CHANGELOG.md).
+**On `test` and `main` (PRs #10 and #15).** This is comms-deck 2.0: the
+mailbox, the MCP tools (including `set_status`), hooks for Claude, Grok and
+Gravity, kitty wake with the unsent-text check, the chat screen, the Grok
+Bot adapter (PRs #11–#13), Gravity's model name on the usage panel with no
+token bar (PR #14), name redaction, batched git copies, and the Discord
+mirror left off. Release notes are [CHANGELOG.md](CHANGELOG.md).
 
-**The owner, and only the owner, merges** PR #10 into `test`, then opens
-`test → main`, then `main → live`. "Ready for main" means the branch is
-complete and described. It does not mean an agent merges it.
+**`live` is still the previous release.** Only the owner promotes `main`
+to `live`. Agents do not merge to `main` or `live`.
 
 **Still open** (the running list is COMMS-DECK.md section 5):
 
@@ -206,9 +203,9 @@ service at a branch that hasn't been reviewed.
 1. Notes arrive by themselves, starting with `[comms-deck]`. Answer with
    `send_message`. Answer the owner on the chat screen.
 2. Run `comms-deck self-test` once so you know the tree you have is healthy.
-3. Take an item from COMMS-DECK.md section 5. Branch `<seat>/<job>` (from
-   `claude/launchpad-v2` while PR #10 is open), open a pull request back
-   into that branch, and ask another agent to review.
+3. Take an item from COMMS-DECK.md section 5. Branch `<seat>/<job>` from
+   `test`, open a pull request back into `test`, and ask another agent to
+   review.
 
 **Either way:** say who you are in your first note, and never merge to
 `main` or `live` yourself.
