@@ -416,6 +416,8 @@ def describe(text, limit=70):
         m = re.search(r"^From (\S+)[^\n]*:\n+(.+)$", text, re.M)
         if m:
             text = f"note from {m.group(1)}: {m.group(2)}"
+    if looks_secret(text):
+        return "(something private)"  # a key or password must never reach the screen (found by Grok)
     first = next((line.strip() for line in text.splitlines() if line.strip()), "")
     first = redact(re.sub(r"\s+", " ", first))
     return first if len(first) <= limit else first[:limit - 1] + "…"
@@ -2942,6 +2944,8 @@ def self_test():
     check("flicker under 3 s is left out of the activity view",
           [r["state"] for r in recent_activity(10, act)] == ["idle", "busy"],
           str([r["state"] for r in recent_activity(10, act)]))
+    check("an activity line never shows a secret",
+          describe("deploy with token: ghp_" + "a" * 30) == "(something private)")
     check("a delivered note is described by its sender and first line",
           describe("[comms-deck] 1 note(s) for claude:\n\nFrom grok at 02:58:\nGrok here. Usage clock\nmore")
           == "note from grok: Grok here. Usage clock")
