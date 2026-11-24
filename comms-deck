@@ -1670,6 +1670,14 @@ def restore_notes(seat, notes):
         write_json(DATA / "inbox" / seat / f"{record['id']}.json", record)
 
 
+def wake_failure_reason(error):
+    """One short line for the service log. The note text is never included."""
+    reason = str(error).splitlines()[0].strip()
+    if not reason or MARK in reason:
+        reason = type(error).__name__
+    return reason[:120]
+
+
 def deliver_app_notes(seat, state, cdp):
     """take() the waiting notes, type them, and put them back if the send fails."""
     snap = app_snapshot(cdp, seat, with_usage=False)
@@ -1709,10 +1717,10 @@ def deliver_app_notes(seat, state, cdp):
                           + json.dumps(marker) + ")))()")
         if not landed:
             raise RuntimeError("the note never reached the chat")
-    except Exception:
+    except Exception as error:
         restore_notes(seat, notes)
         update_seat(seat, state="idle", app_seen=time.time())
-        log(f"couldn't wake {seat}: send failed")
+        log(f"couldn't wake {seat}: send failed: {wake_failure_reason(error)}")
         return False
     log(f"woke {seat} with {len(notes)} note(s)")
     return True
@@ -2940,6 +2948,10 @@ def self_test():
     check("a delivered note is described by its sender and first line",
           describe("[comms-deck] 1 note(s) for claude:\n\nFrom grok at 02:58:\nGrok here. Usage clock\nmore")
           == "note from grok: Grok here. Usage clock")
+    check("a failed app-seat send logs its reason and drops the note text",
+          wake_failure_reason(RuntimeError("no composer")) == "no composer"
+          and wake_failure_reason(RuntimeError(MARK + " 1 note(s) for alice:\nhello")) == "RuntimeError"
+          and wake_failure_reason(RuntimeError("line one\nline two")) == "line one")
     check("app seats are told to reply in their chat, not with tools",
           "Reply here in this chat" in app_text and "send_message" not in app_text, app_text)
     check("Grok's Notification hook matches idle_prompt only",
