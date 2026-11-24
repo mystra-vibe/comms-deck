@@ -503,6 +503,14 @@ def render(records, seat):
     senders = sorted({r["from"] for r in records} & set(SEATS))
     reply = (f"\n\nReply with the send_message tool (to: {senders[0]})"
              f" or `comms-deck send {senders[0]} \"...\"`." if senders else "")
+    if seat in APP_SEATS:
+        # An app seat reads this in its own chat and has no comms-deck tools:
+        # its chat reply is picked up and filed, so tell it how that works.
+        who = senders[0] if senders else "owner"
+        return (f"{MARK} {len(records)} note(s) for {seat}:\n\n" + "\n\n".join(lines)
+                + f"\n\nReply here in this chat. Your reply goes to {'the owner' if who == 'owner' else who}"
+                  " on the comms-deck screen; start it with @claude, @grok or another seat to send it"
+                  " to that agent instead. Say \"the owner\", never a name.")
     if "owner" in senders:
         reply = ("\n\nThe owner sent this from the comms-deck chat screen and reads the answer "
                  "there, not in this window. Answer with the send_message tool, to: owner "
@@ -2605,6 +2613,9 @@ def self_test():
           composer_text(drop_placeholders(suggested)) == "", repr(drop_placeholders(suggested)))
     check("text typed in the normal colour still counts",
           composer_text(drop_placeholders(typed)) == "run the tests", repr(drop_placeholders(typed)))
+    app_text = render([{"from": "grok", "to": "alice", "time": "2026-11-24 02:50:00", "text": "hi"}], "alice")
+    check("app seats are told to reply in their chat, not with tools",
+          "Reply here in this chat" in app_text and "send_message" not in app_text, app_text)
     check("Grok's Notification hook matches idle_prompt only",
           grok_hooks("comms-deck")["hooks"]["Notification"][0].get("matcher") == "idle_prompt")
     code = "\n".join([
