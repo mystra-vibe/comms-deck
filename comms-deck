@@ -458,6 +458,9 @@ def hook(source, event):
     if seat not in AGENTS:
         return
     state = load_seat(seat)
+    if pid and state.get("pid") != pid:
+        remember_window(seat, pid)  # a restarted agent, or a stale record
+        state = load_seat(seat)
 
     def reply(obj):
         print(json.dumps(obj))
@@ -1184,10 +1187,12 @@ def mcp_call(seat, name, args):
 
 def mcp():
     """Serve MCP on stdin/stdout until stdin closes."""
-    seat, pid = find_agent()
+    seat, _ = find_agent()
     seat = seat or "unknown"
-    if pid:
-        remember_window(seat, pid)
+    # The MCP server never records the seat's window: agents also start it
+    # from short-lived helper processes (e.g. `claude mcp list` checking the
+    # connection), which would record a pid that's gone a moment later and
+    # make the seat look away. Only the hooks record it.
     out = sys.stdout
 
     def answer(msg_id, result=None, error=None):
