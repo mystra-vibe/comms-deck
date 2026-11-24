@@ -196,8 +196,8 @@ Run these in order. Each must pass.
    the Grok Bot app, and her reply appears as "Alice → You".
 5. **The panel:** USAGE shows each agent's context and limits (Gravity displays
    its active model name without a context bar, as `agy` hooks report model info
-   without token/quota counts), and ACTIVITY lists state changes, with a
-   "working on" line under each busy entry.
+   without token/quota counts), and ACTIVITY shows one row per agent: the
+   state's symbol, the time that state began, and a blue square per waiting note.
 6. `journalctl --user -u comms-deck -f` shows `woke …` lines as notes are
    delivered, and no errors.
 
