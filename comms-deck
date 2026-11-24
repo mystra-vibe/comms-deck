@@ -989,6 +989,23 @@ def agy_hook(event):
             update_seat(seat, state="idle")
 
 
+# The deck's MCP tools Vibe may call without a per-call Allow prompt (the
+# owner, 09:00). Vibe keys a tool's permission as [tools.<server>_<tool>]:
+# checked live, where [tools."mcp_comms_deck.<tool>"] (the name it shows) and
+# [tools.mcp_comms_deck_<tool>] both still asked.
+VIBE_ALLOWED_TOOLS = ("team_status", "read_messages", "send_message", "add_note", "set_status")
+
+
+def grant_vibe_tools(config):
+    """`config` (the text of ~/.vibe/config.toml) with an always-allow table for
+    each deck tool that has none. A table already there is left as it is."""
+    for tool in VIBE_ALLOWED_TOOLS:
+        header = f"[tools.comms-deck_{tool}]"
+        if header not in config:
+            config = config.rstrip("\n") + ("\n\n" if config.strip() else "") + f'{header}\npermission = "always"\n'
+    return config
+
+
 VIBE_MAX_DENIES = 3  # post_agent denies Vibe 3.1.4 honours per turn (_MAX_POST_AGENT_RETRIES)
 VIBE_HOOK_TYPES = ("session_start", "pre_agent", "post_agent", "notification", "session_end")
 
@@ -3530,9 +3547,11 @@ def install(yes):
             config = (config.rstrip("\n") + ("\n\n" if config.strip() else "")
                       + f'[[mcp_servers]]\nname = "comms-deck"\ntransport = "stdio"\n'
                         f'command = "{cmd}"\nargs = ["mcp"]\nenv = {{ COMMS_DECK_SEAT = "vibe" }}\n')
-            config_path.write_text(config)
+        granted = grant_vibe_tools(config)
+        if granted != (config_path.read_text() if config_path.exists() else ""):
+            config_path.write_text(granted)
             config_path.chmod(0o600)
-    step("add hooks and the MCP server for Mistral Vibe, if installed (~/.vibe)", mistral_vibe)
+    step("add hooks, the MCP server and its tool permissions for Mistral Vibe, if installed (~/.vibe)", mistral_vibe)
     step("register the MCP server with Codex, if installed (~/.codex/config.toml)",
          lambda: mcp_toml(HOME / ".codex/config.toml", "[mcp_servers.comms-deck]"))
 
@@ -3831,6 +3850,10 @@ def self_test():
                    "~" + " " * 70 + "usage        0% \u00b7 ctx        0/202k\n")
     check("Vibe's composer: the > line under its labelled rule", composer_text(vibe_screen) ==
           "Hello. Check the local directory", repr(composer_text(vibe_screen)))
+    granted = grant_vibe_tools('theme = "ansi-dark"\n\n[tools.comms-deck_send_message]\npermission = "ask"\n')
+    check("vibe's five deck tools are allowed, a choice already made is kept, and twice is once",
+          granted.count("[tools.comms-deck_") == 5 and 'send_message]\npermission = "ask"' in granted
+          and grant_vibe_tools(granted) == granted, granted)
     check("Vibe's empty composer reads as empty",
           composer_text(vibe_screen.replace("Hello. Check the local directory", "")) == "",
           repr(composer_text(vibe_screen.replace("Hello. Check the local directory", ""))))
