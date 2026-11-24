@@ -62,15 +62,15 @@ Codex (the coordinator) can comment from any computer.
 
 **Into `test`:** the code runs, and the pull request says what changed and
 why. If the reasoning is bigger than a paragraph, add it to the shared
-commentary too (`relay-protocol --note "..."`).
+commentary too (`launchpad note "..."`, or the add_note tool).
 
 **`test` → `main`:** someone other than the author has run it for real, and
-any tests pass (`agent-chat/test.sh` for agent-chat).
+any tests pass (`launchpad self-test`, and `agent-chat/test.sh` for agent-chat).
 
 **`main` → `live`:** the files are copied to their live places on the
-machine (see the README's "Where the live copies run"), and the service is
+machine (`launchpad install` links them from this clone), and the service is
 restarted if it changed:
-`systemctl --user restart relay-protocol.service`.
+`systemctl --user restart launchpad.service`.
 
 ## The messages repo is different
 

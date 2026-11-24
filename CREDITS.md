@@ -12,21 +12,16 @@ agents, and no agent claims them alone.
 
 | File | Written by | Notes |
 | --- | --- | --- |
-| [`relay-protocol`](relay-protocol) | **Joint: Grok, Codex, Claude** | The relay itself was built together before 2026-11-20. On 2026-11-20 Claude added the explanatory comments (no behaviour changed), the rename from `other-brain`, GitHub sync, the commentary, and public-by-default with `--private`. On 2026-11-21 Codex tested the GitHub sync for real. |
+| [`launchpad`](launchpad), [`systemd/launchpad.service`](systemd/launchpad.service) | Claude (2026-11-24) | launchpad 2. Replaces `relay-protocol` (joint: Grok, Codex, Claude), `scheduler` and `relay-watch` (Claude), which are in the git history. Keeps their message file format, the public/private split and the secret patterns. |
 | [`agent-chat/agent-chat`](agent-chat/agent-chat) | **Joint: Grok, Codex, Claude** | Built together before 2026-11-20. Claude added the comments on 2026-11-20, with no code changes. |
 | [`agent-chat/install.sh`](agent-chat/install.sh), [`agent-chat/test.sh`](agent-chat/test.sh) | **Joint: Grok, Codex, Claude** | Claude added the header comments on 2026-11-21. |
-| [`relay-watch`](relay-watch) | Claude (2026-11-20) | |
-| [`push-courier`](push-courier), [`systemd/push-courier.service`](systemd/push-courier.service) | Claude (2026-11-21) | Reviewed by Grok (2026-11-22); its findings were fixed before it landed here. |
-| [`scheduler`](scheduler) | Claude (2026-11-21), from the owner's design | Reuses the joint `relay-protocol` code. Codex has proposed a different back-off on her branch `codex/chat-log-sync`. |
-| [`systemd/relay-protocol.service`](systemd/relay-protocol.service) | **Joint: Grok, Codex, Claude** | Claude added the comments on 2026-11-21. |
-| [`systemd/relay-scheduler.service`](systemd/relay-scheduler.service) | Claude (2026-11-21) | |
+| [`push-courier`](push-courier), [`systemd/push-courier.service`](systemd/push-courier.service) | Claude (2026-11-21) | Reviewed by Grok (2026-11-22); its findings were fixed before it landed here. On 2026-11-24 Claude moved it onto launchpad 2's mailbox and paths. |
 
 ## The docs
 
 | File | Written by |
 | --- | --- |
 | [`README.md`](README.md) | Joint: Grok, Codex, Claude (Claude wrote the current text) |
-| [`docs/RELAY-PROTOCOL.md`](docs/RELAY-PROTOCOL.md) | Joint: Grok, Codex, Claude, before 2026-11-20 (partly out of date) |
 | [`agent-chat/README.md`](agent-chat/README.md), [`agent-chat/AGENTS.md`](agent-chat/AGENTS.md) | Joint: Grok, Codex, Claude |
 | [`docs/BRANCHING.md`](docs/BRANCHING.md) | Claude (2026-11-20), from the owner's plan for test → main → live |
 | `CREDITS.md` (this file) | Claude (2026-11-21) |

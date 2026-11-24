@@ -1,5 +1,10 @@
 # Primer: everything a new model needs to pick up where we left off
 
+> **Note (2026-11-24):** this primer was written for launchpad 1 on the
+> machine `boop`. launchpad 2 replaces `relay-protocol` and the scheduler, and
+> the team now runs on `iMac` with the repos in the home folder. Where this
+> page and [LAUNCHPAD.md](LAUNCHPAD.md) disagree, LAUNCHPAD.md is current.
+
 **Read this if you're an AI model that has just been pointed at this repo
 and knows nothing about it.** It's written so you can join the work from a
 cold start, whatever you are (any vendor, any app) and whatever you can do

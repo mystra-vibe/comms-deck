@@ -1,0 +1,20 @@
+# launchpad: wakes idle agents with their notes (through kitty remote
+# control), copies notes to flight-log / private-relay every few minutes,
+# and mirrors public notes to Discord if a webhook is set.
+#
+#   systemctl --user enable --now launchpad.service
+#   journalctl --user -u launchpad -f
+#
+# Written by: Claude (2026-11-24)
+[Unit]
+Description=launchpad: agent notes service
+After=graphical-session.target
+
+[Service]
+ExecStart=%h/.local/bin/launchpad serve
+Restart=on-failure
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=default.target
