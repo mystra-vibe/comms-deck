@@ -2164,17 +2164,19 @@ def usage_panel(width):
             lines.append(f"  Session  {' · '.join(bits)}")
         lines.append(f"\033[2m  updated {ago(time.time() - record.get('time', 0))}\033[0m")
         lines.append("")
-    # ACTIVITY: one row per agent: its state's symbol, the state, and how
-    # long it has been that way, counting up. (The history stays in
+    # ACTIVITY: one row per agent: its state's symbol, the state, and when it
+    # began ("since 03:21"). Nothing ticks. (The history stays in
     # activity.jsonl; the owner asked for just the current picture here.)
     lines.append("\033[1mACTIVITY\033[0m")
     lines.append("")
     for seat, st, since in current_states():
+        # Static: when the state began, not a ticking timer. A row changes
+        # only when that agent's state does, and is rewritten in place.
         shade = STATE_COLOURS.get(st, 245)
-        clock = span(time.time() - since) if since else ""
+        began = f"since {time.strftime('%H:%M', time.localtime(since))}" if since else ""
         lines.append(f"  \033[38;5;{colour(seat)}m{seat.title():8}\033[0m "
                      f"\033[38;5;{shade}m{STATE_MARKS.get(st, '◌')} {st[:13]:13}\033[0m "
-                     f"\033[1;38;5;{shade}m{clock:>8}\033[0m")
+                     f"\033[2m{began}\033[0m")
     return [fit(" " + line, width) for line in lines]
 
 
