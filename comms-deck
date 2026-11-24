@@ -254,7 +254,9 @@ def append_log(record):
 
 
 def notify(title, body):
-    """Show a desktop notification. Never fails."""
+    """Show a desktop notification. Never fails. Off under the self-test."""
+    if setting("NO_NOTIFY"):
+        return
     try:
         subprocess.run(["notify-send", "-a", "comms-deck", title, body[:400]],
                        timeout=5, capture_output=True)
@@ -2606,7 +2608,8 @@ def usage_panel(width):
     # from activity_view, which can say spent (a full plan limit, from the
     # agent's meter or a mark set with `comms-deck spent`) or stuck (idle
     # with notes waiting) while the seat file stays as it was. Spent beats
-    # stuck. Under the row, one line lists notes still in the inbox. Only a
+    # stuck. The blue squares count the notes waiting (the owner asked for no
+    # line of note text under the row). Only a
     # spent row counts down to its reset. Seconds show only in the last hour,
     # so only then does the screen redraw every second; otherwise every 2 s,
     # as before. (The history stays in activity.jsonl.)
@@ -2633,9 +2636,6 @@ def usage_panel(width):
         lines.append(f"  \033[38;5;{colour(seat)}m{seat.title():8}\033[0m "
                      f"\033[38;5;{shade}m{state_text}\033[0m"
                      + (f" \033[38;5;33m{squares}\033[0m" if squares else ""))
-        summary = waiting_summary(notes)
-        if summary:
-            lines.append(f"    \033[2m{summary}\033[0m")
     return [fit(" " + line, width) for line in lines]
 
 
@@ -3334,6 +3334,7 @@ def install(yes):
 def self_test():
     """Check the mailbox, hooks, loop guard and MCP server. Exit 1 on failure."""
     tmp = tempfile.mkdtemp(prefix="comms-deck-test-")
+    os.environ["COMMS_DECK_NO_NOTIFY"] = "1"  # test notes to the owner must not pop up on the desktop
     env = dict(os.environ, COMMS_DECK_HOME=f"{tmp}/data", COMMS_DECK_CONFIG=f"{tmp}/config",
                COMMS_DECK_AUTO_LIMIT="2")
     me = str(Path(__file__).resolve())
