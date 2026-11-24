@@ -2358,8 +2358,9 @@ def usage_panel(width):
     # agent's meter or a mark set with `comms-deck spent`) or stuck (idle
     # with notes waiting) while the seat file stays as it was. Spent beats
     # stuck. Under the row, one line lists notes still in the inbox. Only a
-    # spent row ticks: it counts down to the reset, and the screen redraws
-    # every second while one is shown. (The history stays in activity.jsonl.)
+    # spent row counts down to its reset. Seconds show only in the last hour,
+    # so only then does the screen redraw every second; otherwise every 2 s,
+    # as before. (The history stays in activity.jsonl.)
     lines.append("\033[1mACTIVITY\033[0m")
     lines.append("")
     usage_panel.ticking = False
@@ -2369,9 +2370,10 @@ def usage_panel(width):
         waiting = len(notes)
         mark, word, shade = activity_view(st, usage, waiting=waiting, marked=spent_mark(seat))
         if word == "spent":
-            usage_panel.ticking = True
             reset = spent_reset(usage, spent_mark(seat))
             began = countdown(reset)
+            if reset is not None and reset - time.time() < 3600:
+                usage_panel.ticking = True  # seconds are shown only in the last hour
         else:
             began = when(since) if since else ""  # static: "03:27" today, "Fri 18:00" otherwise
         squares = "■" * min(waiting, 5) + (f"+{waiting - 5}" if waiting > 5 else "")
