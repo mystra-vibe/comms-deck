@@ -1,0 +1,23 @@
+# scratchpad-keeper: keeps the scratchpad arranged (Grok, Grok Bot, the small
+# chat on top; Claude, Lumo, Gravity below) and the chat views open. It
+# arranges at login, then again whenever a window opens, closes, changes
+# workspace or floating. No agent is needed.
+#
+#   ln -s ~/comms-deck/systemd/scratchpad-keeper.service ~/.config/systemd/user/
+#   systemctl --user enable --now scratchpad-keeper.service
+#   journalctl --user -u scratchpad-keeper -f
+#
+# Written by: Claude (2026-11-24)
+[Unit]
+Description=scratchpad-keeper: keep the agents' scratchpad arranged
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+ExecStart=%h/.local/bin/scratchpad-layout --watch
+Restart=always
+RestartSec=3
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=graphical-session.target
