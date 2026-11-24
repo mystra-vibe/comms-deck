@@ -1,0 +1,20 @@
+# comms-deck: wakes idle agents with their notes (through kitty remote
+# control), copies notes to flight-log / private-relay every few minutes,
+# and mirrors public notes to Discord if a webhook is set.
+#
+#   systemctl --user enable --now comms-deck.service
+#   journalctl --user -u comms-deck -f
+#
+# Written by: Claude (2026-11-24)
+[Unit]
+Description=comms-deck: agent notes service
+After=graphical-session.target
+
+[Service]
+ExecStart=%h/.local/bin/comms-deck serve
+Restart=on-failure
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,3279 @@
+#!/usr/bin/env python3
+"""comms-deck: messages between the AI agents on this desktop.
+
+  comms-deck send <to> <text...> [--quiet] [--private]   send a note ("-" reads stdin)
+  comms-deck read [--peek]                               show (and take) your notes
+  comms-deck note <text...>                              add to the running commentary
+  comms-deck status                                      who is busy, idle or away
+  comms-deck watch                                       print notes as they are sent
+  comms-deck chat [--hide-private]                       full-screen live view of the notes
+  comms-deck serve                                       the background service
+  comms-deck mcp                                         MCP server (send/read as tools)
+  comms-deck hook --source <claude|grok>                 called by the agents' hooks
+  comms-deck statusline --source <claude|grok>           the agents' status line (feeds the usage panel)
+  comms-deck install [--yes]                             set this machine up
+  comms-deck self-test                                   run the tests in a temp folder
+"""
+
+# =============================================================================
+# comms-deck: how this program works (read this first)
+# =============================================================================
+#
+# THE PROBLEM
+#   Several AI agents (Claude Code, the Grok CLI, Codex) each run in their
+#   own kitty window and can't see each other. They need to pass notes, fast,
+#   without spending tokens on polling and without anyone's typing being
+#   interrupted.
+#
+# THE DESIGN, IN FOUR PARTS
+#   1. A MAILBOX ON DISK. Sending a note writes one JSON file into the
+#      recipient's inbox, ~/.local/share/comms-deck/inbox/<seat>/. Nothing
+#      touches the network to deliver it. A note is "taken" by renaming its
+#      file into delivered/<seat>/. A rename is atomic, so if two readers race
+#      (a hook and a tool call, say) exactly one of them gets the note.
+#
+#   2. TOOLS, NOT TYPING. `comms-deck mcp` is an MCP server. Claude, Grok and
+#      Codex all load it, so each has send_message / read_messages /
+#      add_note / team_status as built-in tools.
+#
+#   3. DELIVERY WITHOUT POLLING.
+#      - An agent that is WORKING gets its notes from its own Stop hook: when
+#        it is about to end a turn and a note is waiting, the hook hands the
+#        note over and the agent carries on. With an empty inbox the hook
+#        costs nothing. Stop does not decide idle; Grok's idle_prompt does.
+#      - An agent that is IDLE is woken by `comms-deck serve`, which uses
+#        kitty's remote control to paste the note into that agent's exact
+#        window. Focus never moves. If the owner is in that window, or a draft
+#        is already typed there, nothing is pasted: the note waits, and is
+#        handed over with the owner's next prompt (Claude) or at the end of
+#        that turn (any agent).
+#      - Hooks keep a small state file per seat (busy / idle, and which kitty
+#        window it lives in), so the service knows who can be woken.
+#      - An app seat that lives in the Grok Bot window has no hook. The service
+#        reads that chat through the app's debugging port, which has to be on
+#        127.0.0.1, and types a waiting note when the seat is idle, the
+#        composer is empty and the window is not focused. New replies are
+#        filed as notes. Other app seats are left alone.
+#
+#   4. RECORDS, BATCHED. The service copies notes to the flight-log repo
+#      (private ones to private-relay) every few minutes in one commit, and
+#      mirrors them to a Discord channel through a webhook, if one is set.
+#
+# WHO IS SENDING? (seat detection)
+#   Every command works out its seat by walking up its parent processes until
+#   it finds `claude`, `grok` or `codex`. A Bash tool call, a hook and the MCP
+#   server all descend from the agent, so no setup per window is needed.
+#   $COMMS_DECK_SEAT overrides it (`--from` on the command line, too).
+#
+#   Grok also reads hooks from ~/.claude/settings.json. Each hook is installed
+#   with --source, and a hook whose source doesn't match the agent running it
+#   exits at once, so Grok never runs Claude's hook as well as its own.
+#
+# THE LOOP GUARD
+#   Two agents that answer each other can talk forever, burning tokens. Every
+#   automatic hand-over (Stop hook or wake) counts against the seat; a prompt
+#   the owner types resets the count. Past AUTO_LIMIT (20) automatic
+#   hand-overs in a row, auto-delivery to that seat pauses, the owner gets a
+#   desktop notification, and notes wait until the owner types something.
+#
+# THE OWNER
+#   `owner` is a seat too: a note to it becomes a desktop notification (and
+#   goes to Discord). Never write the owner's name anywhere; say "the owner".
+#
+# FILES (all under $COMMS_DECK_HOME, default ~/.local/share/comms-deck)
+#   inbox/<seat>/<id>.json      notes waiting for that seat
+#   delivered/<seat>/<id>.json  notes it has taken
+#   seats/<seat>.json           busy/idle, agent pid, kitty window, loop count
+#   log.jsonl                   every note and commentary entry, in order
+#   queue/sync/, queue/discord/ records waiting to be copied out
+#   push/                       push-courier's request and answer folders
+#   ~/.config/comms-deck/discord-webhook   the webhook address (mode 600), if any
+#
+# SECTIONS: search for "SECTION" to jump between them.
+#   1 settings  2 small helpers  3 seats  4 the mailbox  5 delivery text
+#   6 hooks  7 kitty wake  7b grok-bot page  8 records (git, Discord)
+#   9 the service  10 MCP server  11 install  12 self-test  13 command line
+#
+# Standard library only. Python 3.9+.
+#
+# Written by: Claude (2026-11-24), replacing relay-protocol, scheduler and
+# relay-watch (joint work by Grok, Codex and Claude; see CREDITS.md).
+# Hook idle rules, promptId, and the kitty draft check: Grok (2026-11-24).
+# Grok Bot page adapter: Grok (2026-11-24).
+
+import argparse
+import base64
+import fcntl
+import hashlib
+import json
+import os
+import re
+import secrets
+import shutil
+import socket
+import struct
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+# -----------------------------------------------------------------------------
+# SECTION 1: settings
+# -----------------------------------------------------------------------------
+
+HOME = Path.home()
+
+
+def setting(name, default=None):
+    """$COMMS_DECK_<name>, or the older $LAUNCHPAD_<name>, or `default`."""
+    return os.environ.get(f"COMMS_DECK_{name}") or os.environ.get(f"LAUNCHPAD_{name}") or default
+
+
+DATA = Path(setting("HOME") or HOME / ".local/share/comms-deck")
+CONFIG = Path(setting("CONFIG") or HOME / ".config/comms-deck")
+WEBHOOK_FILE = CONFIG / "discord-webhook"
+
+# Agent seats: the process name each one runs as. Extra seats can be added
+# with COMMS_DECK_SEATS="name:process,name2:process2".
+AGENTS = {"claude": "claude", "grok": "grok", "codex": "codex", "gravity": "agy"}  # gravity: the Antigravity CLI, whose program is agy
+for _pair in filter(None, setting("SEATS", "").split(",")):
+    _name, _, _proc = _pair.partition(":")
+    AGENTS[_name.strip()] = (_proc or _name).strip()
+# App seats: bots with no hooks and no kitty window. One name per line in
+# ~/.config/comms-deck/app-seats ("#" starts a comment). A seat that appears
+# in the Grok Bot window is woken from that chat (section 7b). Any other app
+# seat is left to its own connector.
+_app_file = CONFIG / "app-seats"
+APP_PROCESS = {}  # seat -> the app it lives in; "name:app" in the file, default grok-bot
+HIDDEN_SEATS = set()  # "name hidden": works as a seat, but not shown in the status bar or chat box
+for _line in (_app_file.read_text().splitlines() if _app_file.exists() else []):
+    _line = _line.split("#")[0].strip()
+    if _line:
+        _words = _line.split()
+        _name, _, _app = _words[0].partition(":")
+        APP_PROCESS[_name.strip()] = _app.strip() or "grok-bot"
+        if "hidden" in _words[1:]:
+            HIDDEN_SEATS.add(_name.strip())
+APP_SEATS = tuple(APP_PROCESS)
+SEATS = tuple(AGENTS) + APP_SEATS + ("owner",)
+
+# The repos the notes are copied to. A missing clone just means no copy.
+PUBLIC_REPO = Path(setting("PUBLIC_REPO") or HOME / "flight-log")
+PRIVATE_REPO = Path(setting("PRIVATE_REPO") or HOME / "private-relay")
+
+SYNC_EVERY = int(setting("SYNC_EVERY", "300"))   # seconds between git copies
+AUTO_LIMIT = int(setting("AUTO_LIMIT", "20"))    # loop guard
+HANDOVER_MAX = 8000          # characters handed over at once (Grok clips at 10,000)
+MARK = "[comms-deck]"         # every typed wake starts with this
+MACHINE = (Path("/etc/hostname").read_text().strip()
+           if Path("/etc/hostname").exists() else os.uname().nodename)
+
+# Anything that looks like a secret is made private, and is never sent to
+# Discord. Same list the old relay used.
+SECRET_PATTERNS = [
+    re.compile(r"\b(gh[opusr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})"),
+    re.compile(r"\bsk-[A-Za-z0-9_-]{20,}"),
+    re.compile(r"\bxai-[A-Za-z0-9]{20,}"),
+    re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
+    re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----"),
+    re.compile(r"\b[A-Z0-9]{4}-[A-Z0-9]{4}\b"),
+    re.compile(r"https://(?:\w+\.)?discord(?:app)?\.com/api/webhooks/\S+"),
+    re.compile(r"(?i)\b(password|passwd|passphrase|api[_ -]?key|secret|token)\s*[:=]\s*\S+"),
+]
+
+# -----------------------------------------------------------------------------
+# SECTION 2: small helpers
+# -----------------------------------------------------------------------------
+
+
+def now():
+    """The local time as text, for records."""
+    return time.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def looks_secret(text):
+    """True if `text` matches a SECRET_PATTERN."""
+    return any(p.search(text) for p in SECRET_PATTERNS)
+
+
+def write_json(path, data):
+    """Write `data` to `path` atomically: a reader never sees half a file."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=".tmp-")
+    with os.fdopen(fd, "w") as f:
+        json.dump(data, f, ensure_ascii=False)
+    os.replace(tmp, path)
+
+
+def read_json(path, default=None):
+    """Read a JSON file, or return `default` if it's missing or broken."""
+    try:
+        return json.loads(Path(path).read_text())
+    except (OSError, ValueError):
+        return default
+
+
+def append_log(record):
+    """Add one record to log.jsonl, under a lock so lines never interleave."""
+    DATA.mkdir(parents=True, exist_ok=True)
+    with open(DATA / "log.jsonl", "a") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+def notify(title, body):
+    """Show a desktop notification. Never fails."""
+    try:
+        subprocess.run(["notify-send", "-a", "comms-deck", title, body[:400]],
+                       timeout=5, capture_output=True)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
+def pid_alive(pid):
+    """True if process `pid` exists."""
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except (OSError, ValueError, TypeError):
+        return False
+
+
+# -----------------------------------------------------------------------------
+# SECTION 3: seats - who is who, and what state each agent is in
+# -----------------------------------------------------------------------------
+
+
+def proc_name(pid):
+    """The short process name of `pid` (from /proc), or ''."""
+    try:
+        return Path(f"/proc/{pid}/comm").read_text().strip()
+    except OSError:
+        return ""
+
+
+def parent_of(pid):
+    """The parent pid of `pid`, or 0."""
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text()
+        return int(stat.rsplit(")", 1)[1].split()[1])
+    except (OSError, ValueError, IndexError):
+        return 0
+
+
+def find_agent():
+    """Walk up from this process to the nearest agent. Return (seat, pid).
+
+    $COMMS_DECK_SEAT wins if set. Returns (None, 0) outside any agent, e.g.
+    in a plain terminal.
+    """
+    forced = setting("SEAT")
+    if forced:
+        return forced, 0
+    by_proc = {proc: seat for seat, proc in AGENTS.items()}
+    pid = os.getppid()
+    for _ in range(40):
+        if pid <= 1:
+            break
+        seat = by_proc.get(proc_name(pid))
+        if seat:
+            return seat, pid
+        pid = parent_of(pid)
+    return None, 0
+
+
+def agent_env(pid):
+    """The environment of process `pid`, as a dict (empty if unreadable)."""
+    try:
+        raw = Path(f"/proc/{pid}/environ").read_bytes()
+    except OSError:
+        return {}
+    pairs = (item.split(b"=", 1) for item in raw.split(b"\0") if b"=" in item)
+    return {k.decode(errors="replace"): v.decode(errors="replace") for k, v in pairs}
+
+
+def seat_file(seat):
+    return DATA / "seats" / f"{seat}.json"
+
+
+def interactive_agents(seat):
+    """Pids of `seat`'s agent processes that run in a terminal.
+
+    Helpers the agents start in the background (e.g. `claude mcp list`)
+    have no terminal, so they're left out.
+    """
+    want = AGENTS.get(seat)
+    found = []
+    for d in Path("/proc").iterdir():
+        if not d.name.isdigit():
+            continue
+        try:
+            if (d / "comm").read_text().strip() != want:
+                continue
+            fields = (d / "stat").read_text().rsplit(")", 1)[1].split()
+            if int(fields[4]) != 0 and proc_name(int(fields[1])) != want:  # has a tty; not a child of itself
+                found.append(int(d.name))
+        except (OSError, ValueError, IndexError):
+            continue
+    return found
+
+
+def load_seat(seat):
+    """The seat's state dict. 'away' if its agent process has gone.
+
+    If the recorded process has gone but exactly one copy of that agent is
+    running in a terminal, that copy is adopted (it was restarted, or the
+    record was stale), so the seat doesn't show away by mistake.
+    """
+    state = read_json(seat_file(seat), {}) or {}
+    if seat in AGENTS and not (state.get("pid") and pid_alive(state["pid"])):
+        live = interactive_agents(seat)
+        if len(live) == 1:
+            remember_window(seat, live[0])
+            state = read_json(seat_file(seat), {}) or {}
+            if state.get("state") in (None, "away"):
+                state = update_seat(seat, state="idle")
+        elif state.get("pid"):
+            state["state"] = "away"
+    state.setdefault("state", "away")
+    state.setdefault("auto", 0)
+    return state
+
+
+def app_seat_state(seat):
+    """Busy or idle when the Grok Bot page was just read. Otherwise
+    'connected' if a comms-deck MCP server is running for this seat,
+    'not connected' if the Grok Bot app is open without one, 'away' if closed."""
+    state = read_json(seat_file(seat), {}) or {}
+    seen = float(state.get("app_seen") or 0)
+    if time.time() - seen < 15 and state.get("state") in (
+            "busy", "idle", "away", "not connected", "chat not open", "no chat yet"):
+        return state["state"]
+    if APP_PROCESS.get(seat, "grok-bot") != "grok-bot":
+        # Not a Grok Bot seat: it can only connect through its own app's MCP.
+        for d in Path("/proc").iterdir():
+            try:
+                cmd = (d / "cmdline").read_bytes()
+                if b"comms-deck\0mcp" in cmd and f"COMMS_DECK_SEAT={seat}".encode() in \
+                        (d / "environ").read_bytes().split(b"\0"):
+                    return "connected"
+            except OSError:
+                continue
+        return "not set up"
+    app_open = False
+    for d in Path("/proc").iterdir():
+        if not d.name.isdigit():
+            continue
+        try:
+            comm = (d / "comm").read_text().strip()
+            if comm == "grok-bot":
+                app_open = True
+                continue
+            cmd = (d / "cmdline").read_bytes()
+            if b"comms-deck\0mcp" in cmd or b"launchpad\0mcp" in cmd:
+                env = (d / "environ").read_bytes().split(b"\0")
+                if f"COMMS_DECK_SEAT={seat}".encode() in env or f"LAUNCHPAD_SEAT={seat}".encode() in env:
+                    return "connected"
+        except OSError:
+            continue
+    return "not connected" if app_open else "away"
+
+
+def update_seat(seat, **changes):
+    """Change some fields of a seat's state file, under a lock."""
+    path = seat_file(seat)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path.with_suffix(".lock"), "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        state = read_json(path, {}) or {}
+        before, doing_before = state.get("state"), state.get("doing")
+        state.update(changes)
+        state["updated"] = time.time()
+        if state.get("state") != "busy" and "doing" not in changes:
+            state["doing"] = ""  # a finished turn is no longer working on anything
+        moved = "state" in changes and changes["state"] != before
+        new_task = state.get("state") == "busy" and state.get("doing") != doing_before
+        if moved:
+            state["since"] = time.time()
+        if moved or new_task:
+            record_activity(seat, state["state"], state.get("doing") if state["state"] == "busy" else "")
+        write_json(path, state)
+        return state
+
+
+def describe(text, limit=70):
+    """A few words for the activity log: what started this turn.
+
+    A delivered note ("[comms-deck] 1 note(s)... From grok at 02:58: ...")
+    becomes "note from grok: <its first line>"; anything else is its own
+    first line. Private names are redacted.
+    """
+    # Claude Code wraps a pasted note in <pasted_content ...> tags before its
+    # hook sees the prompt; those aren't part of the text.
+    text = re.sub(r"</?pasted_content[^>]*>", "", str(text or "")).strip()
+    if text.startswith(MARK):
+        m = re.search(r"^From (\S+)[^\n]*:\n+(.+)$", text, re.M)
+        if m:
+            text = f"note from {m.group(1)}: {m.group(2)}"
+    if looks_secret(text):
+        return "(something private)"  # a key or password must never reach the screen (found by Grok)
+    first = next((line.strip() for line in text.splitlines() if line.strip()), "")
+    first = redact(re.sub(r"\s+", " ", first))
+    return first if len(first) <= limit else first[:limit - 1] + "…"
+
+
+def describe_notes(notes):
+    """A few words for notes being handed over."""
+    if not notes:
+        return ""
+    first = notes[0]
+    more = f" (+{len(notes) - 1} more)" if len(notes) > 1 else ""
+    return describe(f"note from {first['from']}: {first.get('text', '')}", 70 - len(more)) + more
+
+
+def record_activity(seat, new_state, doing=""):
+    """Add one line to activity.jsonl: a seat changed state. Kept to 2000 lines."""
+    path = DATA / "activity.jsonl"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "a+") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        f.write(json.dumps({"time": time.time(), "seat": seat, "state": new_state,
+                            "doing": doing or ""}) + "\n")
+        f.flush()
+        if f.tell() > 400_000:
+            f.seek(0)
+            keep = f.readlines()[-2000:]
+            f.seek(0)
+            f.truncate()
+            f.writelines(keep)
+
+
+def recent_activity(limit, path=None):
+    """The newest `limit` state changes, newest first, with repeats folded."""
+    try:
+        lines = Path(path or DATA / "activity.jsonl").read_text().splitlines()[-400:]
+    except OSError:
+        return []
+    rows = []
+    for line in lines:
+        try:
+            rows.append(json.loads(line))
+        except ValueError:
+            continue
+    # A state that lasted under 3 s is flicker (a page's typing signal, say):
+    # leave it out of the view. The file keeps everything.
+    next_time = {}
+    keep = []
+    for r in reversed(rows):
+        later = next_time.get(r["seat"])
+        next_time[r["seat"]] = r["time"]
+        if later is not None and later - r["time"] < 3:
+            continue
+        keep.append(r)
+    # Fold repeats, then give each entry its duration: until that seat's next
+    # change, or (the newest one per seat) until now, marked live.
+    folded = []
+    for r in reversed(keep):  # oldest first
+        if folded and any(f["seat"] == r["seat"] for f in folded):
+            last = next(f for f in reversed(folded) if f["seat"] == r["seat"])
+            if last["state"] == r["state"] and last.get("doing", "") == r.get("doing", ""):
+                continue
+        folded.append(dict(r))
+    ends = {}
+    for r in reversed(folded):  # newest first
+        r["live"] = r["seat"] not in ends
+        r["duration"] = (time.time() if r["live"] else ends[r["seat"]]) - r["time"]
+        ends[r["seat"]] = r["time"]
+    return list(reversed(folded))[:limit]
+
+
+def remember_window(seat, pid):
+    """Record which agent process and kitty window `seat` lives in."""
+    env = dict(agent_env(pid)) if pid else {}
+    # Our own kitty details only count if we run inside that agent (a hook);
+    # a process elsewhere (the chat screen) has its own window's details.
+    if "KITTY_WINDOW_ID" not in env and find_agent()[1] == pid:
+        env.update({k: v for k, v in os.environ.items() if k.startswith("KITTY_")})
+    update_seat(seat, pid=pid or None,
+                kitty_window=env.get("KITTY_WINDOW_ID"),
+                kitty_socket=env.get("KITTY_LISTEN_ON"))
+
+
+# -----------------------------------------------------------------------------
+# SECTION 4: the mailbox
+# -----------------------------------------------------------------------------
+
+
+def new_id():
+    """A unique note id: <nanoseconds>-<machine>-<pid>. Sorts by time."""
+    return f"{time.time_ns()}-{MACHINE}-{os.getpid()}"
+
+
+def send(sender, to, text, quiet=False, private=False):
+    """Send a note. Returns (record, warning or None).
+
+    `to` is a seat, several seats ("claude, grok", "claude+grok" or a list),
+    or "all" (every agent seat except the sender). Several seats make one
+    note with several recipients, so it's shown and logged once.
+    """
+    text = text.strip()
+    if not text:
+        raise ValueError("the note is empty")
+    names = to if isinstance(to, (list, tuple)) else re.split(r"[\s,+]+", str(to).strip().lower())
+    names = list(dict.fromkeys(n.strip().lstrip("@") for n in names if n.strip()))
+    unknown = [n for n in names if n not in SEATS and n != "all"]
+    if unknown or not names:
+        raise ValueError(f"unknown seat {(unknown or [to])[0]!r}; seats are: {', '.join(SEATS)}, all")
+    if "all" in names:
+        to, targets = "all", [s for s in tuple(AGENTS) + APP_SEATS if s != sender]
+    else:
+        targets = names
+        to = "+".join(names)
+    warning = None
+    if looks_secret(text) and not private:
+        private = True
+        warning = "That note looks like it holds a secret, so it was made private."
+    record = {"kind": "message", "id": new_id(), "from": sender or "unknown",
+              "to": to, "time": now(), "machine": MACHINE,
+              "quiet": bool(quiet), "private": bool(private), "text": text}
+    for seat in targets:
+        if seat == "owner":
+            notify(f"Note from {record['from']}", text)
+        else:
+            write_json(DATA / "inbox" / seat / f"{record['id']}.json", record)
+    queue_out(record)
+    append_log(record)
+    return record, warning
+
+
+def add_note(sender, text):
+    """Add a commentary entry: what was done and why."""
+    text = text.strip()
+    if not text:
+        raise ValueError("the note is empty")
+    record = {"kind": "commentary", "id": new_id(), "from": sender or "unknown",
+              "time": now(), "machine": MACHINE, "private": looks_secret(text),
+              "text": text}
+    queue_out(record)
+    append_log(record)
+    return record
+
+
+PRIVATE_NAMES_FILE = CONFIG / "private-names"
+
+
+def redact(text):
+    """`text` with every private name replaced by "the owner".
+
+    Names live in ~/.config/comms-deck/private-names, one per line, on this
+    machine only: never in this repo. Whole words, any case. Applied to
+    every copy that leaves the machine (git, Discord); the local log keeps
+    the original.
+    """
+    try:
+        names = [n.strip() for n in PRIVATE_NAMES_FILE.read_text().splitlines()
+                 if n.strip() and not n.strip().startswith("#")]
+    except OSError:
+        return text
+    for name in sorted(names, key=len, reverse=True):
+        text = re.sub(rf"(?<!\w){re.escape(name)}(?!\w)", "the owner", text, flags=re.IGNORECASE)
+    return text
+
+
+def queue_out(record):
+    """Queue a record for the git copy, and for Discord if it's public.
+
+    Both copies leave the machine, so private names are redacted first.
+    """
+    out = dict(record, text=redact(record["text"]))
+    write_json(DATA / "queue/sync" / f"{record['id']}.json", out)
+    if not record["private"] and WEBHOOK_FILE.exists():
+        write_json(DATA / "queue/discord" / f"{record['id']}.json", out)
+
+
+def pending(seat):
+    """The notes waiting for `seat`, oldest first, as (path, record)."""
+    box = DATA / "inbox" / seat
+    if not box.is_dir():
+        return []
+    out = []
+    for path in sorted(box.glob("*.json")):
+        record = read_json(path)
+        if record:
+            out.append((path, record))
+    return out
+
+
+def take(seat, include_quiet=True, limit_chars=None):
+    """Take notes from `seat`'s inbox. Returns the records taken.
+
+    Taking is a rename into delivered/, so a note is only ever taken once
+    even if two processes try at the same moment. `include_quiet=False`
+    leaves quiet notes unless a normal note is being taken anyway (then they
+    ride along). `limit_chars` stops before the hand-over gets too long.
+    """
+    waiting = pending(seat)
+    if not include_quiet and not any(not r.get("quiet") for _, r in waiting):
+        return []
+    taken, size = [], 0
+    done = DATA / "delivered" / seat
+    done.mkdir(parents=True, exist_ok=True)
+    for path, record in waiting:
+        size += len(record.get("text", "")) + 80
+        if limit_chars and taken and size > limit_chars:
+            break
+        try:
+            os.rename(path, done / path.name)
+        except OSError:
+            continue  # someone else took it
+        taken.append(record)
+    return taken
+
+
+# -----------------------------------------------------------------------------
+# SECTION 5: delivery text - what the agent actually reads
+# -----------------------------------------------------------------------------
+
+
+def render(records, seat):
+    """Turn notes into one block of text for `seat` to read."""
+    lines = []
+    for r in records:
+        tags = [t for t, on in (("quiet", r.get("quiet")), ("private", r.get("private"))) if on]
+        to = "" if r.get("to") == seat else f" (to {str(r.get('to')).replace('+', ', ')})"
+        tag = f" [{', '.join(tags)}]" if tags else ""
+        lines.append(f"From {r['from']}{to} at {r['time'][11:16]}{tag}:\n{r['text']}")
+    senders = sorted({r["from"] for r in records} & set(SEATS))
+    reply = (f"\n\nReply with the send_message tool (to: {senders[0]})"
+             f" or `comms-deck send {senders[0]} \"...\"`." if senders else "")
+    if seat in APP_SEATS:
+        # An app seat reads this in its own chat and has no comms-deck tools:
+        # its chat reply is picked up and filed, so tell it how that works.
+        who = senders[0] if senders else "owner"
+        return (f"{MARK} {len(records)} note(s) for {seat}:\n\n" + "\n\n".join(lines)
+                + f"\n\nReply here in this chat. Your reply goes to {'the owner' if who == 'owner' else who}"
+                  " on the comms-deck screen; start it with @claude, @grok or another seat to send it"
+                  " to that agent instead. Say \"the owner\", never a name.")
+    if "owner" in senders:
+        reply = ("\n\nThe owner sent this from the comms-deck chat screen and reads the answer "
+                 "there, not in this window. Answer with the send_message tool, to: owner "
+                 "(or `comms-deck send owner \"...\"`). Anything you say only in this window, "
+                 "the owner won't see.")
+    return f"{MARK} {len(records)} note(s) for {seat}:\n\n" + "\n\n".join(lines) + reply
+
+
+# -----------------------------------------------------------------------------
+# SECTION 6: hooks - called by Claude Code and the Grok CLI
+# -----------------------------------------------------------------------------
+#
+# Events used, and what each does:
+#   SessionStart       remember the window; Claude is told about waiting notes
+#   UserPromptSubmit   mark busy; record promptId; reset the loop count if the
+#                      owner typed it. Claude also gets waiting notes.
+#   Stop               hand over a waiting note and keep working. Never marks
+#                      idle. channel_closed / shutdown mark away.
+#   StopCancelled      a late cancel can arrive after the next prompt, so this
+#                      does not mark idle. Older promptIds are ignored on Stop.
+#   Notification       idle_prompt only: mark idle. StopFailure is not hooked:
+#                      idle_prompt also fires after an errored turn.
+#   SessionEnd         mark away
+#
+# A child session's events carry subagentType. They are not this seat's.
+
+
+def event_prompt_id(data):
+    """The turn id on a hook payload, or None. Grok's field is promptId."""
+    value = data.get("promptId")
+    if value is None or value == "":
+        return None
+    return str(value)
+
+
+def turn_relation(state, data):
+    """How this event sits against the newest promptId for the seat.
+
+    'session' has no promptId (idle_prompt, a session-end Stop): act on it.
+    'older' belongs to a turn that UserPromptSubmit has already moved past.
+    'current' is the newest turn, or the first id this seat has seen.
+    """
+    pid = event_prompt_id(data)
+    if pid is None:
+        return "session"
+    newest = state.get("prompt_id")
+    if newest and pid != str(newest):
+        return "older"
+    return "current"
+
+
+def paused_for_background(data):
+    """True if this Stop is a pause for work that will wake the session."""
+    return bool(data.get("backgroundTasks") or data.get("sessionCrons"))
+
+
+def hook(source, event):
+    """Handle one hook event (JSON on stdin). Prints the reply, if any."""
+    if source == "agy":
+        return agy_hook(event)
+    running_in = "grok" if os.environ.get("GROK_HOOK_EVENT") else "claude"
+    if source != running_in:
+        return  # e.g. Grok reading Claude's settings file: not our hook here
+    try:
+        data = json.loads(sys.stdin.read() or "{}")
+    except ValueError:
+        data = {}
+    event = event or data.get("hook_event_name") or ""
+    if data.get("subagentType"):
+        return
+    seat, pid = find_agent()
+    if seat not in AGENTS:
+        return
+    state = load_seat(seat)
+    if pid and state.get("pid") != pid:
+        remember_window(seat, pid)  # a restarted agent, or a stale record
+        state = load_seat(seat)
+
+    def reply(obj):
+        print(json.dumps(obj))
+
+    if event == "SessionStart":
+        remember_window(seat, pid)
+        update_seat(seat, state="idle", auto=0, prompt_id=None)
+        count = len(pending(seat))
+        if count and source == "claude":
+            reply({"hookSpecificOutput": {"hookEventName": "SessionStart",
+                   "additionalContext": f"{MARK} {count} note(s) are waiting for you "
+                                        f"({seat}). Read them with read_messages."}})
+    elif event == "UserPromptSubmit":
+        # The text field is `prompt`. A missing key must not look like the
+        # owner typed something, or the loop guard resets on every such event.
+        if "prompt" in data and data.get("prompt") is not None:
+            prompt = str(data.get("prompt"))
+            woke = time.time() - float(state.get("woke_at") or 0) < 10
+            automatic = prompt.lstrip().startswith(MARK) or woke
+            auto = state["auto"] if automatic else 0
+            owner_typed = not automatic
+        else:
+            auto = state["auto"]
+            owner_typed = False
+        changes = {"state": "busy", "auto": auto, "woke_at": 0}
+        if "prompt" in data and data.get("prompt"):
+            changes["doing"] = describe(data.get("prompt"))
+        if auto == 0:
+            changes["paused_notice"] = False
+        prompt_id = event_prompt_id(data)
+        if prompt_id:
+            changes["prompt_id"] = prompt_id
+        update_seat(seat, **changes)
+        if source == "claude" and owner_typed:
+            notes = take(seat, limit_chars=HANDOVER_MAX)
+            if notes:
+                reply({"hookSpecificOutput": {"hookEventName": "UserPromptSubmit",
+                       "additionalContext": render(notes, seat)}})
+    elif event == "Stop":
+        if data.get("reason") in ("channel_closed", "shutdown"):
+            update_seat(seat, state="away")
+            return
+        if turn_relation(state, data) == "older":
+            return
+        if paused_for_background(data):
+            return  # the session will wake itself; leave the notes
+        if state["auto"] < AUTO_LIMIT or owner_waiting(seat):
+            notes = take(seat, include_quiet=False, limit_chars=HANDOVER_MAX)
+            if notes:
+                new_auto = next_auto(state, notes)
+                changes = {"state": "busy", "auto": new_auto, "doing": describe_notes(notes)}
+                if new_auto == 0:
+                    changes["paused_notice"] = False
+                update_seat(seat, **changes)
+                reply({"decision": "block", "reason": render(notes, seat)})
+                return
+        elif any(not r.get("quiet") for _, r in pending(seat)):
+            pause_notice(seat)
+        if source == "claude":
+            # On Claude an allowed Stop is the end of the turn (comms-deck's
+            # is the only Stop hook), so idle now rather than waiting the
+            # minute for idle_prompt. Grok settles idle on idle_prompt only.
+            update_seat(seat, state="idle")
+    elif event == "StopCancelled":
+        # Idle waits for idle_prompt. An older cancel must not touch the seat:
+        # Grok can deliver it after the next turn's UserPromptSubmit.
+        return
+    elif event == "Notification":
+        # Claude's hook is installed with matcher idle_prompt, so whatever
+        # reaches it is idle; Grok's payload is checked field by field.
+        if source == "grok" and data.get("notification_type") != "idle_prompt":
+            return
+        if turn_relation(state, data) == "older":
+            return
+        update_seat(seat, state="idle")
+    elif event == "SessionEnd":
+        update_seat(seat, state="away")
+
+
+def owner_waiting(seat):
+    """True if a note from the owner is in `seat`'s inbox. The owner always gets through."""
+    return any(r.get("from") == "owner" for _, r in pending(seat))
+
+
+def next_auto(state, notes):
+    """The loop count after handing `notes` over: reset by the owner, else one more."""
+    if any(r.get("from") == "owner" for r in notes):
+        return 0
+    return state["auto"] + 1
+
+
+def remember_gravity_model(data):
+    """Save the model name from a PreInvocation hook, for the usage panel.
+
+    The payload has modelName and no token or quota figures, so the panel
+    names the model and draws no bar. A repeat of the same name inside a
+    minute does not rewrite the file.
+    """
+    model = str(data.get("modelName") or "").strip()
+    if not model:
+        return
+    path = DATA / "usage" / "gravity.json"
+    prev = read_json(path) or {}
+    same = (prev.get("source") == "gravity-hook"
+            and dig(prev, "data", "model", "display_name") == model)
+    if same and time.time() - float(prev.get("time") or 0) < 60:
+        return
+    write_json(path, {"time": time.time(), "source": "gravity-hook",
+                      "data": {"model": {"display_name": model}}})
+
+
+def agy_hook(event):
+    """Hooks for the Antigravity CLI (program agy, seat gravity). Its events and replies differ:
+
+      SessionStart   remember the window; say how many notes wait (injectSteps)
+      PreInvocation  runs before every model call. Call 0 is a new turn: mark
+                     busy, and reset the loop guard if the owner typed it.
+                     Waiting notes are handed over here as a system message,
+                     so they arrive mid-turn, not only at the end.
+      Stop           a note waiting: {"decision": "continue", "reason": notes}.
+                     Otherwise idle once fullyIdle says nothing is still running.
+    Payload fields are camelCase (lastUserInput, invocationNum, fullyIdle).
+    """
+    try:
+        data = json.loads(sys.stdin.read() or "{}")
+    except ValueError:
+        data = {}
+    seat, pid = find_agent()
+    if seat != "gravity":
+        return  # not running inside agy: not this hook's business
+    state = load_seat(seat)
+    if pid and state.get("pid") != pid:
+        remember_window(seat, pid)
+        state = load_seat(seat)
+
+    def system(text):
+        return {"injectSteps": [{"systemMessage": {"systemMessage": text}}]}
+
+    if event == "SessionStart":
+        remember_window(seat, pid)
+        update_seat(seat, state="idle", auto=0)
+        count = len(pending(seat))
+        if count:
+            print(json.dumps(system(f"{MARK} {count} note(s) are waiting for you (gravity). "
+                                    "Read them with the read_messages tool.")))
+    elif event == "PreInvocation":
+        remember_gravity_model(data)
+        if int(data.get("invocationNum") or 0) == 0:
+            typed = str(data.get("lastUserInput") or "")
+            woke = time.time() - float(state.get("woke_at") or 0) < 10
+            automatic = typed.lstrip().startswith(MARK) or woke or "lastUserInput" not in data
+            update_seat(seat, state="busy", woke_at=0, **({} if automatic else {"auto": 0}),
+                        **({"doing": describe(typed)} if typed and not typed.lstrip().startswith(MARK) else {}))
+            state = load_seat(seat)
+        if state["auto"] < AUTO_LIMIT or owner_waiting(seat):
+            notes = take(seat, limit_chars=HANDOVER_MAX)
+            if notes:
+                update_seat(seat, auto=next_auto(state, notes), doing=describe_notes(notes))
+                print(json.dumps(system(render(notes, seat))))
+    elif event == "Stop":
+        if state["auto"] < AUTO_LIMIT or owner_waiting(seat):
+            notes = take(seat, include_quiet=False, limit_chars=HANDOVER_MAX)
+            if notes:
+                update_seat(seat, state="busy", auto=next_auto(state, notes), doing=describe_notes(notes))
+                print(json.dumps({"decision": "continue", "reason": render(notes, seat)}))
+                return
+        elif any(not r.get("quiet") for _, r in pending(seat)):
+            pause_notice(seat)
+        if data.get("fullyIdle", True):
+            update_seat(seat, state="idle")
+
+
+# Tools Gravity may call without a per-call Allow prompt. install adds any
+# that are missing and leaves the rest of agy's settings file alone.
+GRAVITY_MCP_ALLOW = (
+    "mcp(comms-deck/team_status)",
+    "mcp(comms-deck/read_messages)",
+    "mcp(comms-deck/send_message)",
+    "mcp(comms-deck/add_note)",
+    "mcp(comms-deck/set_status)",
+)
+
+
+def grant_gravity_tools(settings):
+    """Add the comms-deck MCP tools to agy's allow list. Other settings stay."""
+    settings = dict(settings or {})
+    permissions = dict(settings.get("permissions") or {})
+    allow = list(permissions.get("allow") or [])
+    for entry in GRAVITY_MCP_ALLOW:
+        if entry not in allow:
+            allow.append(entry)
+    permissions["allow"] = allow
+    settings["permissions"] = permissions
+    return settings
+
+
+def agy_hooks(cmd):
+    """The hooks file for ~/.gemini/config/hooks.json (Antigravity)."""
+    return {"comms-deck": {event: [{"type": "command", "timeout": 10,
+                                    "command": f"{cmd} hook --source agy --event {event}"}]
+                           for event in ("SessionStart", "PreInvocation", "Stop")}}
+
+
+def pause_notice(seat):
+    """Tell the owner (once) that the loop guard paused `seat`."""
+    state = load_seat(seat)
+    if not state.get("paused_notice"):
+        update_seat(seat, paused_notice=True)
+        notify("comms-deck paused", f"{seat} has had {AUTO_LIMIT} notes handed over in a row "
+               "with no prompt from you. Notes are waiting; type in its window to resume.")
+
+
+# -----------------------------------------------------------------------------
+# SECTION 7: kitty wake - paste a note into an idle agent's window
+# -----------------------------------------------------------------------------
+#
+# Needs kitty remote control, which `comms-deck install` turns on:
+#   allow_remote_control socket-only
+#   listen_on unix:${XDG_RUNTIME_DIR}/kitty
+# The socket sits in the owner's private runtime folder (mode 700).
+
+
+def kitty(socket, *args, data=None):
+    """Run `kitten @ --to <socket> ...`. Returns stdout, or raises."""
+    result = subprocess.run(["kitten", "@", "--to", socket, *args], input=data,
+                            capture_output=True, text=True, timeout=10)
+    if result.returncode:
+        raise RuntimeError(result.stderr.strip() or "kitten @ failed")
+    return result.stdout
+
+
+def window_focused(socket, window_id):
+    """True/False if that kitty window has focus. None if it's gone."""
+    for os_window in json.loads(kitty(socket, "ls")):
+        for tab in os_window.get("tabs", []):
+            for win in tab.get("windows", []):
+                if str(win.get("id")) == str(window_id):
+                    return bool(win.get("is_focused") and os_window.get("is_focused"))
+    return None
+
+
+def _is_hbar(line):
+    """True if `line` is a horizontal rule (Claude's composer border)."""
+    text = line.strip()
+    return len(text) >= 8 and set(text) <= set("─━═-")
+
+
+def _after_marker(line):
+    """Text typed after a ❯ or '>' prompt marker, with the box drawing removed."""
+    text = line.replace("│", " ").replace("\u00a0", " ").strip()
+    for marker in ("❯", ">"):
+        if text.startswith(marker):
+            return text[len(marker):].strip()
+    return text
+
+
+SGR = re.compile(r"\033\[([0-9;:]*)m")
+STRUCTURE = set("❯>│─━═╭╮╰╯-|")
+
+
+def drop_placeholders(ansi_screen):
+    """The screen as plain text, with greyed-out text blanked.
+
+    Agents draw hints in the prompt in grey or dim text: Claude Code's
+    suggested next prompt, Grok's placeholder. Typed text is drawn in the
+    normal colour. So grey or dim characters, apart from the box drawing and
+    prompt markers the composer is found by, become spaces, and only what
+    the owner really typed is left for composer_text().
+    """
+    out, pos, dim, grey = [], 0, False, False
+
+    def is_grey(params):
+        nums = [int(n) for n in re.split(r"[;:]", params) if n.isdigit()]
+        for i, n in enumerate(nums):
+            if n == 38 and i + 1 < len(nums):
+                if nums[i + 1] == 5 and i + 2 < len(nums):
+                    c = nums[i + 2]
+                    return c in (8, 59, 102, 145) or 237 <= c <= 250
+                if nums[i + 1] == 2 and i + 4 < len(nums):
+                    r, g, b = nums[i + 2:i + 5]
+                    return max(r, g, b) - min(r, g, b) <= 12 and max(r, g, b) <= 200
+            if n == 90:
+                return True
+        return None  # no colour change in this code
+
+    for m in SGR.finditer(ansi_screen):
+        for ch in ansi_screen[pos:m.start()]:
+            muted = (dim or grey) and ch not in STRUCTURE and not ch.isspace()
+            out.append(" " if muted else ch)
+        params = m.group(1)
+        codes = [c for c in re.split(r"[;:]", params) if c] or ["0"]
+        if "0" in codes and params.split(";")[0] in ("", "0"):
+            dim = grey = False
+        if "2" in codes and params.split(";")[0] == "2":
+            dim = True
+        if "22" in codes:
+            dim = False
+        if "39" in codes:
+            grey = False
+        g = is_grey(params)
+        if g is not None:
+            grey = g
+        pos = m.end()
+    for ch in ansi_screen[pos:]:
+        muted = (dim or grey) and ch not in STRUCTURE and not ch.isspace()
+        out.append(" " if muted else ch)
+    return re.sub(r"\033\[[0-9;:?]*[A-Za-z]", "", "".join(out))
+
+
+def composer_text(screen):
+    """Text already typed in an agent's composer, or None if it can't be seen.
+
+    Grok's composer is the last `│ ❯ … │` line of the input box, plus any
+    wrapped lines before the box closes. Claude Code's is the `❯` line between
+    the two rules at the bottom of the screen. Antigravity's is a `>` between
+    two rules, with a hint such as "? for shortcuts" under the bottom rule;
+    that hint is not part of the draft. A bare `>` marker uses the next line
+    (Claude Code's composer when the marker sits on its own line).
+    An empty string means the composer is on screen and has no draft.
+    """
+    # Only the bottom of the window: the composer always sits there, while
+    # the scrollback above can hold anything (a quoted "> " line, a copy of
+    # another agent's screen) that would look like a prompt.
+    lines = screen.rstrip("\n").splitlines()[-15:]
+    box = None
+    for i, line in enumerate(lines):
+        if "❯" in line and "│" in line:
+            box = i
+    if box is not None:
+        parts = [_after_marker(lines[box])]
+        for line in lines[box + 1:]:
+            if "╰" in line or "╭" in line:
+                break
+            if "│" in line:
+                parts.append(line.replace("│", "").replace("\u00a0", " ").strip())
+            else:
+                break
+        return "\n".join(part for part in parts if part).strip()
+
+    rules = [i for i, line in enumerate(lines) if _is_hbar(line)]
+    if len(rules) >= 2:
+        start, end = rules[-2], rules[-1]
+        middle = lines[start + 1:end]
+        if 0 < end - start <= 8 and any(
+                line.strip().startswith("❯") or line.strip().startswith(">") for line in middle):
+            parts = []
+            for line in middle:
+                stripped = line.strip()
+                if stripped.startswith("❯") or stripped.startswith(">"):
+                    parts.append(_after_marker(line))
+                else:
+                    parts.append(line.replace("\u00a0", " ").strip())
+            return "\n".join(part for part in parts if part).strip()
+
+    marker = None
+    for i, line in enumerate(lines):
+        stripped = line.strip().replace("\u00a0", " ")
+        if stripped.startswith("❯") or stripped == ">" or stripped.startswith("> "):
+            marker = i
+    if marker is None:
+        return None
+    typed = _after_marker(lines[marker])
+    if typed:
+        return typed
+    if marker + 1 >= len(lines):
+        return ""
+    nxt = lines[marker + 1]
+    if _is_hbar(nxt) or "╰" in nxt:
+        return ""
+    return nxt.replace("│", "").replace("\u00a0", " ").strip()
+
+
+def try_wake(seat):
+    """If `seat` is idle with a normal note waiting, paste it in. True if done."""
+    state = load_seat(seat)
+    socket, window = state.get("kitty_socket"), state.get("kitty_window")
+    if state["state"] != "idle" or not socket or not window:
+        return False
+    if not any(not r.get("quiet") for _, r in pending(seat)):
+        return False
+    if state["auto"] >= AUTO_LIMIT and not owner_waiting(seat):
+        pause_notice(seat)
+        return False
+    try:
+        focused = window_focused(socket, window)
+    except (RuntimeError, OSError, ValueError, subprocess.SubprocessError):
+        return False
+    if focused is None:
+        update_seat(seat, state="away")
+        return False
+    if focused:
+        return False  # the owner may be typing there: wait
+    try:
+        screen = drop_placeholders(kitty(socket, "get-text", "--match", f"id:{window}", "--ansi"))
+    except (RuntimeError, OSError, subprocess.SubprocessError) as error:
+        log(f"not waking {seat}: couldn't read the window ({error})")
+        return False
+    typed = composer_text(screen)
+    if typed is None:
+        log(f"not waking {seat}: couldn't see the prompt line")
+        return False
+    if typed:
+        if not state.get("held_by_draft"):
+            log(f"not waking {seat}: a draft is already in the prompt: {typed[:60]!r}")
+        update_seat(seat, held_by_draft=time.time())
+        return False
+    if state.get("held_by_draft"):
+        update_seat(seat, held_by_draft=0)
+    notes = take(seat, include_quiet=False, limit_chars=HANDOVER_MAX)
+    if not notes:
+        return False
+    text = render(notes, seat)
+    update_seat(seat, state="busy", auto=next_auto(state, notes), woke_at=time.time(),
+                doing=describe_notes(notes))
+    try:
+        match = f"id:{window}"
+        kitty(socket, "send-text", "--match", match, "--bracketed-paste=enable",
+              "--stdin", data=text)
+        time.sleep(0.3)
+        kitty(socket, "send-text", "--match", match, "\r")
+    except (RuntimeError, OSError, subprocess.SubprocessError) as error:
+        for r in notes:  # put them back so nothing is lost
+            write_json(DATA / "inbox" / seat / f"{r['id']}.json", r)
+        update_seat(seat, state="idle")
+        log(f"couldn't wake {seat}: {error}")
+        return False
+    log(f"woke {seat} with {len(notes)} note(s)")
+    return True
+
+
+def log(text):
+    """A line on the service's log (journalctl --user -u comms-deck)."""
+    print(f"{now()} {text}", flush=True)
+
+
+# -----------------------------------------------------------------------------
+# SECTION 7b: Grok Bot page - type a note into an app seat's own chat
+# -----------------------------------------------------------------------------
+#
+# The Grok Bot app can listen on 127.0.0.1:9222. This client speaks only to
+# that loopback debugger: a page whose url is not on this machine is refused.
+# It never reads cookies, storage or tokens. Note text is typed in and not
+# written to the service log.
+#
+# A seat is driven only when its name is a chat in that window. Seats that
+# live in another app (lumo, for one) are not touched.
+
+
+GROK_BOT_PORT = 9222
+
+
+def GROK_BOT_SEATS():
+    """The app seats that live in the Grok Bot app."""
+    return [seat for seat in APP_SEATS if APP_PROCESS.get(seat, "grok-bot") == "grok-bot"]
+GROK_BOT_PAGE = "renderer/index.html"
+APP_USAGE_EVERY = 60
+_WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+_SCROLL_JS = r"""(() => {
+  const views = [...document.querySelectorAll(".ui-scroll-area__viewport")];
+  let best = null;
+  for (const view of views) {
+    if (view.querySelector(".sand-virtual-transcript__inner, .sand-message")
+        && (!best || view.scrollHeight > best.scrollHeight)) best = view;
+  }
+  if (best) best.scrollTop = best.scrollHeight;
+  return true;
+})()"""
+
+_SNAP_JS = r"""(() => {
+  try {
+    const seat = __SEAT__;
+    const withUsage = __USAGE__;
+    const clean = (s) => (s || "").replace(/\u00a0/g, " ").replace(/\u200b/g, "").trim();
+    const buttons = [...document.querySelectorAll("button")];
+    const seatBtn = buttons.find(b =>
+      ((b.getAttribute("aria-label") || "").split(",")[0].trim().toLowerCase()) === String(seat).toLowerCase());
+    const titleBtn = buttons.find(b => (b.getAttribute("aria-label") || "") === "View conversation details");
+    const openName = titleBtn ? clean(titleBtn.innerText).toLowerCase() : "";
+    const open = !!(seatBtn && seatBtn.getAttribute("aria-selected") === "true")
+      || openName === String(seat).toLowerCase();
+    const replying = buttons.some(b => (b.getAttribute("aria-label") || "") === "Stop")
+      || !!document.querySelector('[data-row-key="sand-typing-indicator"]');
+    const composerEl = document.querySelector("div.sand-prompt-field");
+    const composer = composerEl ? clean(composerEl.innerText) : null;
+    const messages = [];
+    for (const row of document.querySelectorAll(".sand-virtual-transcript__row")) {
+      const key = row.getAttribute("data-row-key") || "";
+      if (!key.startsWith("t")) continue;
+      const msg = row.querySelector(".sand-message");
+      if (!msg) continue;
+      messages.push({
+        key: key,
+        role: msg.getAttribute("data-role") || "",
+        text: clean(msg.innerText),
+        continued: row.getAttribute("data-continued-next") === "true"
+          || msg.getAttribute("data-continued-next") === "true"
+      });
+    }
+    let usage = null;
+    if (withUsage) {
+      const root = document.getElementById("root");
+      const key = root && Object.keys(root).find(k => k.startsWith("__reactContainer"));
+      let fiber = key ? root[key] : null;
+      if (fiber && fiber.current) fiber = fiber.current;
+      else if (fiber && fiber.stateNode && fiber.stateNode.current) fiber = fiber.stateNode.current;
+      const queue = fiber ? [fiber] : [];
+      const seen = new Set();
+      const seenObj = new Set();
+      const skip = new Set(["child", "sibling", "return", "alternate", "elementType", "type", "ref", "dependencies", "_owner", "_store"]);
+      const hunt = (obj, depth) => {
+        if (usage || !obj || typeof obj !== "object" || depth > 5 || obj.nodeType) return;
+        if (typeof obj.percentUsed === "number" && typeof obj.nextResetMs === "number") {
+          usage = {used_percentage: obj.percentUsed, resets_at: obj.nextResetMs};
+          return;
+        }
+        if (seenObj.has(obj)) return;
+        seenObj.add(obj);
+        let n = 0;
+        for (const name of Object.keys(obj)) {
+          if (skip.has(name) || n++ > 30) continue;
+          const value = obj[name];
+          if (value && typeof value === "object") hunt(value, depth + 1);
+        }
+      };
+      let n = 0;
+      while (queue.length && n < 2000 && !usage) {
+        const node = queue.shift();
+        if (!node || seen.has(node)) continue;
+        seen.add(node);
+        n++;
+        if (node.child) queue.push(node.child);
+        if (node.sibling) queue.push(node.sibling);
+        let hook = node.memoizedState;
+        for (let i = 0; hook && i < 20 && !usage; i++) {
+          hunt(hook.memoizedState, 0);
+          hunt(hook.baseState, 0);
+          hook = hook.next;
+        }
+      }
+    }
+    return {open: open, has_row: !!seatBtn, composer: composer, replying: replying,
+            messages: messages, usage: usage};
+  } catch (e) {
+    return {error: "page"};
+  }
+})()"""
+
+_CLICK_JS = r"""(() => {
+  const seat = __SEAT__;
+  const btn = [...document.querySelectorAll("button")].find(b =>
+    ((b.getAttribute("aria-label") || "").split(",")[0].trim().toLowerCase()) === String(seat).toLowerCase());
+  if (!btn) return false;
+  btn.click();
+  return true;
+})()"""
+
+_FOCUS_JS = r"""(() => {
+  const el = document.querySelector("div.sand-prompt-field");
+  if (!el) return false;
+  el.focus();
+  return true;
+})()"""
+
+_COMPOSER_JS = r"""(() => {
+  const el = document.querySelector("div.sand-prompt-field");
+  if (!el) return null;
+  return (el.innerText || "").replace(/\u00a0/g, " ").replace(/\u200b/g, "").trim();
+})()"""
+
+
+def ws_mask(payload, mask):
+    """XOR `payload` with the 4-byte websocket mask. Applying it twice is the identity."""
+    return bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+
+
+def ws_client_frame(opcode, payload, mask):
+    """One masked client frame. The server rejects an unmasked client frame."""
+    n = len(payload)
+    head = bytes([0x80 | (opcode & 0x0F)])
+    if n < 126:
+        head += bytes([0x80 | n])
+    elif n < 65536:
+        head += bytes([0x80 | 126]) + struct.pack("!H", n)
+    else:
+        head += bytes([0x80 | 127]) + struct.pack("!Q", n)
+    return head + mask + ws_mask(payload, mask)
+
+
+def ws_parse_frame(buf):
+    """Parse one frame from `buf`. Returns (fin, opcode, payload, rest), or None if short."""
+    if len(buf) < 2:
+        return None
+    fin = bool(buf[0] & 0x80)
+    opcode = buf[0] & 0x0F
+    masked = buf[1] & 0x80
+    length = buf[1] & 0x7F
+    i = 2
+    if length == 126:
+        if len(buf) < 4:
+            return None
+        length = struct.unpack("!H", buf[2:4])[0]
+        i = 4
+    elif length == 127:
+        if len(buf) < 10:
+            return None
+        length = struct.unpack("!Q", buf[2:10])[0]
+        i = 10
+    if length > 4_000_000:
+        raise RuntimeError("websocket frame too large")
+    mask = b""
+    if masked:
+        if len(buf) < i + 4:
+            return None
+        mask = buf[i:i + 4]
+        i += 4
+    if len(buf) < i + length:
+        return None
+    payload = buf[i:i + length]
+    if masked:
+        payload = ws_mask(payload, mask)
+    return fin, opcode, payload, buf[i + length:]
+
+
+class Cdp:
+    """A small Chrome DevTools Protocol client over one websocket."""
+
+    def __init__(self, sock, leftover=b""):
+        self.sock = sock
+        self.buf = leftover
+        self.next_id = 0
+
+    def close(self):
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+
+    def send_frame(self, opcode, payload):
+        self.sock.sendall(ws_client_frame(opcode, payload, secrets.token_bytes(4)))
+
+    def _read_more(self):
+        chunk = self.sock.recv(65536)
+        if not chunk:
+            raise RuntimeError("websocket closed")
+        self.buf += chunk
+
+    def read_message(self):
+        """The next data message, answering ping frames on the way."""
+        parts = []
+        opcode = None
+        while True:
+            parsed = ws_parse_frame(self.buf)
+            while parsed is None:
+                self._read_more()
+                parsed = ws_parse_frame(self.buf)
+            fin, op, payload, self.buf = parsed
+            if op == 9:  # ping
+                self.send_frame(10, payload)
+                continue
+            if op == 8:
+                raise RuntimeError("websocket closed")
+            if op == 10 or op not in (0, 1, 2):
+                continue
+            if op != 0:
+                opcode = op
+                parts = [payload]
+            else:
+                parts.append(payload)
+            if fin:
+                return opcode, b"".join(parts)
+
+    def call(self, method, params=None, timeout=8):
+        self.next_id += 1
+        mid = self.next_id
+        self.send_frame(1, json.dumps({"id": mid, "method": method, "params": params or {}}).encode())
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            self.sock.settimeout(max(0.2, deadline - time.time()))
+            opcode, payload = self.read_message()
+            if opcode != 1:
+                continue
+            try:
+                msg = json.loads(payload.decode())
+            except ValueError:
+                continue
+            if msg.get("id") != mid:
+                continue
+            if "error" in msg:
+                raise RuntimeError("cdp call failed")
+            return msg.get("result")
+        raise TimeoutError(method)
+
+
+def cdp_connect(ws_url):
+    """Open a debugger websocket. The host must be loopback."""
+    match = re.match(r"^ws://([^/:]+)(?::(\d+))?(/.*)$", ws_url)
+    if not match:
+        raise RuntimeError("refusing debugger url")
+    host, port, path = match.group(1), int(match.group(2) or 80), match.group(3)
+    if host not in ("127.0.0.1", "localhost"):
+        raise RuntimeError("refusing debugger host")
+    sock = socket.create_connection(("127.0.0.1", port), timeout=5)
+    sock.settimeout(5)
+    key = base64.b64encode(secrets.token_bytes(16)).decode()
+    req = (f"GET {path} HTTP/1.1\r\nHost: {host}:{port}\r\nUpgrade: websocket\r\n"
+           f"Connection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n")
+    sock.sendall(req.encode())
+    data = b""
+    while b"\r\n\r\n" not in data:
+        chunk = sock.recv(4096)
+        if not chunk:
+            break
+        data += chunk
+        if len(data) > 8192:
+            break
+    head, _, leftover = data.partition(b"\r\n\r\n")
+    accept = base64.b64encode(hashlib.sha1((key + _WS_GUID).encode()).digest()).decode()
+    if b" 101 " not in head.split(b"\r\n", 1)[0] or accept.encode() not in head:
+        sock.close()
+        raise RuntimeError("debugger refused the websocket")
+    return Cdp(sock, leftover)
+
+
+def open_grok_bot_page():
+    """The Grok Bot renderer page on 127.0.0.1, or raise if it isn't there."""
+    req = urllib.request.Request(f"http://127.0.0.1:{GROK_BOT_PORT}/json/list")
+    with urllib.request.urlopen(req, timeout=2) as resp:
+        targets = json.loads(resp.read().decode())
+    for target in targets:
+        url = target.get("url") or ""
+        ws = target.get("webSocketDebuggerUrl") or ""
+        if target.get("type") == "page" and GROK_BOT_PAGE in url and ws.startswith("ws://"):
+            return cdp_connect(ws)
+    raise RuntimeError("no grok-bot page")
+
+
+def cdp_eval(cdp, expression):
+    result = cdp.call("Runtime.evaluate", {"expression": expression, "returnByValue": True})
+    if not isinstance(result, dict) or result.get("exceptionDetails"):
+        raise RuntimeError("page script failed")
+    return (result.get("result") or {}).get("value")
+
+
+def page_script(template, seat):
+    return template.replace("__SEAT__", json.dumps(seat))
+
+
+def app_snapshot(cdp, seat, with_usage):
+    script = _SNAP_JS.replace("__SEAT__", json.dumps(seat)).replace(
+        "__USAGE__", "true" if with_usage else "false")
+    snap = cdp_eval(cdp, script)
+    if not isinstance(snap, dict) or snap.get("error"):
+        raise RuntimeError("page script failed")
+    return snap
+
+
+def row_key_order(key):
+    """Sort a transcript row key. The number after @ is the message order."""
+    match = re.search(r"@(\d+)", key or "")
+    return (int(match.group(1)) if match else 0, key or "")
+
+
+def join_assistant(messages):
+    """Assistant bubbles, with rows marked continued-next joined into one."""
+    groups, buf, key, start = [], [], None, None
+
+    def flush():
+        nonlocal buf, key, start
+        text = "\n".join(part for part in buf if part).strip()
+        if key and text:
+            groups.append({"key": key, "text": text, "start": start})
+        buf, key, start = [], None, None
+
+    for msg in messages:
+        if not str(msg.get("key") or "").startswith("t"):
+            continue
+        if msg.get("role") != "assistant":
+            flush()
+            continue
+        if start is None:
+            start = msg.get("key")
+        buf.append(msg.get("text") or "")
+        key = msg.get("key")
+        if not msg.get("continued"):
+            flush()
+    flush()
+    return groups
+
+
+def new_assistant_replies(messages, cursor):
+    """Assistant bubbles newer than `cursor`. The first sight files nothing.
+
+    Returns (replies, new cursor). `new cursor` is None when there is nothing
+    on the page yet, so the baseline waits until a row is actually visible.
+    """
+    keys = [m.get("key") for m in messages or [] if str(m.get("key") or "").startswith("t")]
+    newest = max(keys, key=row_key_order) if keys else None
+    if not cursor:
+        return [], newest
+    fresh = []
+    for group in join_assistant(messages or []):
+        if row_key_order(group["key"]) > row_key_order(cursor) and row_key_order(group["start"]) > row_key_order(cursor):
+            fresh.append({"key": group["key"], "text": group["text"]})
+    new_cursor = cursor
+    if newest and row_key_order(newest) > row_key_order(cursor):
+        new_cursor = newest
+    return fresh, new_cursor
+
+
+def reply_target(text):
+    """Where an app seat's reply goes: a seat named at the start, or the owner."""
+    match = re.match(r"\s*@([A-Za-z][\w-]*)", text or "")
+    if match:
+        name = match.group(1).lower()
+        if name in SEATS and name != "owner":
+            return name
+    return "owner"
+
+
+def app_delivery_allowed(snapshot, focused, state, seat):
+    """True when a note may be typed into this chat right now."""
+    if not snapshot.get("open") or snapshot.get("replying"):
+        return False
+    if snapshot.get("composer") is None or snapshot.get("composer"):
+        return False
+    if focused is None or focused:
+        return False
+    if state.get("auto", 0) >= AUTO_LIMIT and not owner_waiting(seat):
+        return False
+    return True
+
+
+def usage_record(usage, now_ts=None):
+    """The chat panel's usage file for one reading of the account weekly limit."""
+    if not isinstance(usage, dict):
+        return None
+    pct = usage.get("used_percentage")
+    reset = usage.get("resets_at")
+    if not isinstance(pct, (int, float)) or isinstance(pct, bool):
+        return None
+    if not isinstance(reset, (int, float)) or isinstance(reset, bool):
+        return None
+    reset = int(reset / 1000) if reset > 1e12 else int(reset)
+    return {
+        "time": time.time() if now_ts is None else now_ts,
+        "source": "grok-bot",
+        "data": {
+            "model": {"display_name": "account usage, shared by all bots"},
+            "rate_limits": {"seven_day": {"used_percentage": pct, "resets_at": reset}},
+        },
+    }
+
+
+def write_app_usage(seat, usage):
+    """Save the weekly account usage. Skip a repeat inside a minute."""
+    record = usage_record(usage)
+    if not record:
+        return False
+    path = DATA / "usage" / f"{seat}.json"
+    prev = read_json(path) or {}
+    prev_week = dig(prev, "data", "rate_limits", "seven_day") or {}
+    week = record["data"]["rate_limits"]["seven_day"]
+    if (prev.get("source") == "grok-bot" and prev_week.get("resets_at") == week["resets_at"]
+            and isinstance(prev_week.get("used_percentage"), (int, float))
+            and abs(prev_week["used_percentage"] - week["used_percentage"]) < 0.05
+            and time.time() - float(prev.get("time") or 0) < APP_USAGE_EVERY):
+        return False
+    write_json(path, record)
+    return True
+
+
+def app_window_focused():
+    """True when the Grok Bot window is focused, or when focus can't be read."""
+    try:
+        result = subprocess.run(["hyprctl", "activewindow", "-j"],
+                                capture_output=True, text=True, timeout=2)
+        if result.returncode != 0 or not result.stdout.strip():
+            return True
+        return json.loads(result.stdout).get("class") == "grok-bot"
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return True
+
+
+def grok_bot_open():
+    """True when a grok-bot process is running."""
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            if (entry / "comm").read_text().strip() == "grok-bot":
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def mark_app_down(seat, state):
+    """The page can't be read. Remember that, and say so once when it changes."""
+    new = "not connected" if grok_bot_open() else "away"
+    if state.get("state") != new:
+        log(f"app seat {seat}: {new}")
+    update_seat(seat, state=new, app_seen=time.time(), app_page="grok-bot")
+
+
+def reply_already_logged(seat, text):
+    """True when this seat already filed the same words, so a chat copy is not sent again."""
+    needle = (text or "").strip()
+    path = DATA / "log.jsonl"
+    if not needle or not path.exists():
+        return False
+    try:
+        blob = path.read_bytes()[-200000:]
+    except OSError:
+        return False
+    for line in blob.splitlines()[-40:]:
+        try:
+            record = json.loads(line)
+        except ValueError:
+            continue
+        if record.get("from") == seat and (record.get("text") or "").strip() == needle:
+            return True
+    return False
+
+
+def file_app_replies(seat, state, snap):
+    """File assistant bubbles newer than the cursor.
+
+    The first sight only stores the newest row. The second sight catches the
+    cursor up again and still files nothing, so rows that appear once the
+    transcript has scrolled are not posted as new replies. After that, assistant
+    text is filed. Nothing is filed or moved while a reply is still being written,
+    so a growing bubble is posted once, when it finishes.
+    """
+    if snap.get("replying"):
+        return
+    fresh, cursor = new_assistant_replies(snap.get("messages") or [], state.get("app_cursor"))
+    if not state.get("app_cursor"):
+        if cursor:
+            update_seat(seat, app_cursor=cursor)
+        return
+    if not state.get("app_primed"):
+        update_seat(seat, app_cursor=cursor or state.get("app_cursor"), app_primed=True)
+        return
+    for reply in fresh:
+        if reply_already_logged(seat, reply["text"]):
+            continue
+        send(seat, reply_target(reply["text"]), reply["text"])
+    if cursor and cursor != state.get("app_cursor"):
+        update_seat(seat, app_cursor=cursor)
+
+
+def app_key(cdp, kind, key, code, vk, modifiers=0, text=None):
+    params = {"type": kind, "key": key, "code": code, "windowsVirtualKeyCode": vk,
+              "nativeVirtualKeyCode": vk, "modifiers": modifiers}
+    if text is not None:
+        params["text"] = text
+    cdp.call("Input.dispatchKeyEvent", params)
+
+
+def app_press_enter(cdp):
+    app_key(cdp, "keyDown", "Enter", "Enter", 13, text="\r")
+    app_key(cdp, "keyUp", "Enter", "Enter", 13)
+
+
+def app_click_send_button(cdp):
+    """Click Send at its on-screen point. A DOM click does not submit this composer."""
+    box = cdp_eval(cdp, r"""(() => {
+      const button = document.querySelector('button[aria-label="Send message"]');
+      if (!button) return null;
+      const rect = button.getBoundingClientRect();
+      if (rect.width < 1 || rect.height < 1) return null;
+      return {x: rect.x + rect.width / 2, y: rect.y + rect.height / 2};
+    })()""")
+    if not isinstance(box, dict):
+        return False
+    for kind in ("mousePressed", "mouseReleased"):
+        cdp.call("Input.dispatchMouseEvent", {
+            "type": kind, "x": box["x"], "y": box["y"], "button": "left", "clickCount": 1})
+    return True
+
+
+def app_clear_composer(cdp):
+    app_key(cdp, "keyDown", "a", "KeyA", 65, modifiers=2)
+    app_key(cdp, "keyUp", "a", "KeyA", 65, modifiers=2)
+    app_key(cdp, "keyDown", "Backspace", "Backspace", 8)
+    app_key(cdp, "keyUp", "Backspace", "Backspace", 8)
+
+
+def composer_text_now(cdp):
+    value = cdp_eval(cdp, _COMPOSER_JS)
+    return None if value is None else str(value)
+
+
+def restore_notes(seat, notes):
+    for record in notes:
+        write_json(DATA / "inbox" / seat / f"{record['id']}.json", record)
+
+
+def wake_failure_reason(error):
+    """One short line for the service log. The note text is never included."""
+    reason = str(error).splitlines()[0].strip()
+    if not reason or MARK in reason:
+        reason = type(error).__name__
+    return reason[:120]
+
+
+def deliver_app_notes(seat, state, cdp):
+    """take() the waiting notes, type them, and put them back if the send fails."""
+    snap = app_snapshot(cdp, seat, with_usage=False)
+    if not app_delivery_allowed(snap, app_window_focused(), state, seat):
+        return False
+    notes = take(seat, include_quiet=False, limit_chars=HANDOVER_MAX)
+    if not notes:
+        return False
+    text = render(notes, seat)
+    marker = text[:120]
+    update_seat(seat, state="busy", auto=next_auto(state, notes), woke_at=time.time(),
+                app_seen=time.time(), app_page="grok-bot", doing=describe_notes(notes))
+    try:
+        if not cdp_eval(cdp, _FOCUS_JS):
+            raise RuntimeError("no composer")
+        cdp.call("Input.insertText", {"text": text})
+        if marker in (composer_text_now(cdp) or ""):
+            if not app_click_send_button(cdp):
+                app_press_enter(cdp)
+            time.sleep(0.4)
+        if marker in (composer_text_now(cdp) or ""):
+            app_press_enter(cdp)
+            time.sleep(0.3)
+        deadline = time.time() + 1.5
+        while marker in (composer_text_now(cdp) or "") and time.time() < deadline:
+            time.sleep(0.2)
+        if marker in (composer_text_now(cdp) or ""):
+            cdp_eval(cdp, _FOCUS_JS)
+            app_clear_composer(cdp)
+            time.sleep(0.2)
+            raise RuntimeError("composer still holds the note")
+        cdp_eval(cdp, _SCROLL_JS)
+        time.sleep(0.2)
+        # The bubble has to be a user message. An empty composer alone can mean the insert missed.
+        landed = cdp_eval(cdp, "(() => [...document.querySelectorAll('.sand-message')]"
+                          ".some(m => m.getAttribute('data-role')==='user' && (m.innerText||'').includes("
+                          + json.dumps(marker) + ")))()")
+        if not landed:
+            raise RuntimeError("the note never reached the chat")
+    except Exception as error:
+        restore_notes(seat, notes)
+        update_seat(seat, state="idle", app_seen=time.time())
+        log(f"couldn't wake {seat}: send failed: {wake_failure_reason(error)}")
+        return False
+    log(f"woke {seat} with {len(notes)} note(s)")
+    return True
+
+
+def drive_app_seat(seat, cdp, focused):
+    """Read one app seat's chat, file new replies, and type a waiting note."""
+    state = load_seat(seat)
+    prev_usage = read_json(DATA / "usage" / f"{seat}.json") or {}
+    with_usage = time.time() - float(prev_usage.get("time") or 0) >= APP_USAGE_EVERY
+    snap = app_snapshot(cdp, seat, with_usage)
+    if not snap.get("has_row"):
+        update_seat(seat, state="no chat yet", app_seen=time.time(), app_page="grok-bot")
+        return False  # this seat has no chat in the Grok Bot window
+    if with_usage:
+        write_app_usage(seat, snap.get("usage"))
+    if not snap.get("open"):
+        waiting = any(not record.get("quiet") for _, record in pending(seat))
+        if waiting and not focused and not snap.get("replying"):
+            cdp_eval(cdp, page_script(_CLICK_JS, seat))
+        update_seat(seat, state="chat not open", app_seen=time.time(), app_page="grok-bot")
+        return False
+    file_app_replies(seat, state, snap)
+    page_state = "busy" if snap.get("replying") else "idle"
+    update_seat(seat, state=page_state, app_seen=time.time(), app_page="grok-bot")
+    if not any(not record.get("quiet") for _, record in pending(seat)):
+        return False
+    if state.get("auto", 0) >= AUTO_LIMIT and not owner_waiting(seat):
+        pause_notice(seat)
+        return False
+    if not app_delivery_allowed(snap, focused, state, seat):
+        return False
+    return deliver_app_notes(seat, state, cdp)
+
+
+def try_app_seats():
+    """One pass over the Grok Bot window for every app seat that lives there."""
+    if not APP_SEATS:
+        return
+    if not GROK_BOT_SEATS():
+        return
+    focused = app_window_focused()
+    try:
+        cdp = open_grok_bot_page()
+    except (OSError, RuntimeError, TimeoutError, ValueError, urllib.error.URLError):
+        for seat in GROK_BOT_SEATS():
+            state = load_seat(seat)
+            if state.get("app_page") == "grok-bot":
+                mark_app_down(seat, state)
+        return
+    try:
+        cdp_eval(cdp, _SCROLL_JS)
+        time.sleep(0.2)
+        for seat in GROK_BOT_SEATS():
+            try:
+                drive_app_seat(seat, cdp, focused)
+            except Exception as error:
+                log(f"app seat {seat} failed: {type(error).__name__}")
+    finally:
+        cdp.close()
+
+
+# -----------------------------------------------------------------------------
+# SECTION 8: records - git copies and the Discord mirror
+# -----------------------------------------------------------------------------
+
+
+def git(repo, *args, timeout=120):
+    result = subprocess.run(["git", "-C", str(repo), *args], capture_output=True,
+                            text=True, timeout=timeout)
+    if result.returncode:
+        raise RuntimeError(f"git {args[0]}: {(result.stderr or result.stdout).strip()}")
+    return result.stdout
+
+
+def message_file(r):
+    """The note in the flight-log's file format, and its path in the repo."""
+    day, clock = r["time"][:10], r["time"][11:].replace(":", "")
+    path = Path("messages") / day / f"{clock}-{r['from']}-to-{r['to']}-{r['id']}.txt"
+    body = (f"From: {r['from']}\nTo: {r['to']}\nTime: {r['time']}\nMachine: {r['machine']}\n"
+            f"Quiet: {'yes' if r['quiet'] else 'no'}\n"
+            f"Visibility: {'private' if r['private'] else 'public'}\nId: {r['id']}\n\n{r['text']}\n")
+    return path, body
+
+
+def sync_records():
+    """Copy queued records into the git repos: one commit and push per repo."""
+    queue = DATA / "queue/sync"
+    files = sorted(queue.glob("*.json")) if queue.is_dir() else []
+    if not files:
+        return
+    by_repo = {}
+    for path in files:
+        r = read_json(path)
+        if not r:
+            path.unlink(missing_ok=True)
+            continue
+        repo = PRIVATE_REPO if r["private"] else PUBLIC_REPO
+        by_repo.setdefault(repo, []).append((path, r))
+    for repo, items in by_repo.items():
+        if not (repo / ".git").exists():
+            continue  # no clone here: the records wait until there is one
+        try:
+            git(repo, "pull", "--rebase", "--autostash", "-q")
+            for _, r in items:
+                if r["kind"] == "message":
+                    rel, body = message_file(r)
+                    (repo / rel).parent.mkdir(parents=True, exist_ok=True)
+                    (repo / rel).write_text(body)
+                else:
+                    rel = Path("commentary") / f"{r['time'][:10]}.md"
+                    (repo / rel).parent.mkdir(parents=True, exist_ok=True)
+                    with open(repo / rel, "a") as f:
+                        if f.tell() == 0:
+                            f.write(f"# Commentary for {r['time'][:10]}\n")
+                        f.write(f"\n### {r['time'][11:]} · {r['from']} ({r['machine']})\n\n{r['text']}\n")
+            build = repo / "tools/build-log"
+            if build.exists():
+                subprocess.run([sys.executable, str(build)], cwd=repo, capture_output=True, timeout=60)
+            git(repo, "add", "-A", "messages", "commentary", *(["LOG.md"] if (repo / "LOG.md").exists() else []))
+            if git(repo, "status", "--porcelain").strip():
+                git(repo, "commit", "-q", "-m", f"relay messages from {MACHINE}")
+                git(repo, "push", "-q")
+            for path, _ in items:
+                path.unlink(missing_ok=True)
+            log(f"copied {len(items)} record(s) to {repo.name}")
+        except (RuntimeError, OSError, subprocess.SubprocessError) as error:
+            log(f"couldn't copy to {repo.name} (will retry): {error}")
+
+
+def post_discord():
+    """Post queued public records to the Discord webhook. Returns seconds to wait."""
+    queue = DATA / "queue/discord"
+    if not queue.is_dir() or not WEBHOOK_FILE.exists():
+        return 0
+    url = WEBHOOK_FILE.read_text().strip()
+    for path in sorted(queue.glob("*.json"))[:5]:
+        r = read_json(path)
+        if not r or r.get("private") or looks_secret(r.get("text", "")):
+            path.unlink(missing_ok=True)
+            continue
+        who = r["from"].title()
+        to_names = "Everyone" if r["to"] == "all" else ", ".join(t.title() for t in r["to"].split("+"))
+        name = f"{who} → {to_names}" if r["kind"] == "message" else f"{who} (commentary)"
+        text = r["text"] if len(r["text"]) <= 1900 else r["text"][:1900] + " …"
+        body = json.dumps({"username": name[:80], "content": text,
+                           "allowed_mentions": {"parse": []}}).encode()
+        req = urllib.request.Request(url, data=body, headers={
+            "Content-Type": "application/json", "User-Agent": "comms-deck (relay mirror)"})
+        try:
+            urllib.request.urlopen(req, timeout=15).close()
+            path.unlink(missing_ok=True)
+        except urllib.error.HTTPError as error:
+            if error.code == 429:
+                try:
+                    return float(json.loads(error.read()).get("retry_after", 5)) + 0.5
+                except ValueError:
+                    return 5
+            log(f"Discord refused a post ({error.code}); dropping it")
+            path.unlink(missing_ok=True)
+        except (urllib.error.URLError, OSError) as error:
+            log(f"Discord unreachable (will retry): {error}")
+            return 30
+        time.sleep(1)
+    return 0
+
+
+# -----------------------------------------------------------------------------
+# SECTION 9: the service
+# -----------------------------------------------------------------------------
+
+
+def serve():
+    """Run forever: wake idle agents, copy records, mirror to Discord."""
+    log(f"comms-deck serving on {MACHINE}; data in {DATA}")
+    last_sync, discord_wait_until, last_usage = 0.0, 0.0, 0.0
+    while True:
+        for seat in AGENTS:
+            try:
+                try_wake(seat)
+            except Exception as error:  # one bad seat must not stop the service
+                log(f"wake check for {seat} failed: {error}")
+        try:
+            try_app_seats()
+        except Exception as error:
+            log(f"app seat check failed: {type(error).__name__}")
+        if time.time() - last_usage >= 30:
+            last_usage = time.time()
+            try:
+                refresh_grok_usage()
+            except Exception as error:  # usage is a nicety; never stop the service for it
+                log(f"couldn't read Grok's usage: {error}")
+        if time.time() - last_sync >= SYNC_EVERY:
+            last_sync = time.time()
+            sync_records()
+        if time.time() >= discord_wait_until:
+            discord_wait_until = time.time() + post_discord()
+        time.sleep(1)
+
+
+def watch():
+    """Print every record as it's added to the log, like `tail -f`."""
+    path = DATA / "log.jsonl"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.touch()
+    with open(path) as f:
+        f.seek(0, 2)
+        while True:
+            line = f.readline()
+            if not line:
+                time.sleep(0.5)
+                continue
+            r = json.loads(line)
+            head = f"{r['from']} → {r['to']}" if r["kind"] == "message" else f"{r['from']} (commentary)"
+            print(f"\n{r['time']}  {head}\n{r['text']}", flush=True)
+
+
+# The live chat view (`comms-deck chat`): a full-screen log for a spare
+# workspace. Notes scroll in the top part of the terminal; the bottom line is
+# a status bar that stays put (an ANSI scroll region), showing each seat.
+
+SEAT_COLOURS = {"claude": 208, "grok": 45, "codex": 78, "owner": 220, "push-courier": 245}
+# One symbol per state, so busy and idle differ at a glance (not by colour alone).
+STATE_MARKS = {"busy": "●", "idle": "○", "away": "·"}
+STATE_COLOURS = {"busy": 208, "idle": 78, "away": 240, "connected": 78, "not connected": 214,
+                 "chat not open": 214, "no chat yet": 240, "not set up": 240}
+
+
+def colour(seat):
+    """A 256-colour code for `seat` (stable for seats without one)."""
+    return SEAT_COLOURS.get(seat, 140 + sum(map(ord, seat)) % 40)
+
+
+def chat_lines(r, width):
+    """The terminal lines for one record, wrapped to `width`."""
+    import textwrap
+    esc = "\033["
+    name = lambda seat: "You" if seat == "owner" else seat.title()
+    who = f"{esc}1;38;5;{colour(r['from'])}m{name(r['from'])}{esc}0m"
+    if r["kind"] == "message":
+        to = "everyone" if r["to"] == "all" else ", ".join(name(t) for t in r["to"].split("+"))
+        head = f"{who} {esc}2m→{esc}0m {esc}38;5;{colour(r['to'])}m{to}{esc}0m"
+        tags = "".join(f"  {esc}2m{t}{esc}0m" for t, on in
+                       (("quiet", r.get("quiet")), ("private", r.get("private"))) if on)
+        body_style = ""
+    else:
+        head, tags, body_style = f"{who} {esc}2mcommentary{esc}0m", "", f"{esc}3;2m"
+    lines = [f"{esc}2m{r['time'][11:16]}{esc}0m  {head}{tags}"]
+    for para in r["text"].splitlines() or [""]:
+        for line in textwrap.wrap(para, max(20, width - 9)) or [""]:
+            lines.append(f"       {body_style}{line}{esc}0m")
+    return lines + [""]
+
+
+ANSI = re.compile(r"\033\[[0-9;?]*[A-Za-z]")
+
+
+def visible_len(text):
+    """Length of `text` on screen, ignoring colour codes."""
+    return len(ANSI.sub("", text))
+
+
+def fit(text, width):
+    """Pad or cut `text` to exactly `width` columns on screen."""
+    n = visible_len(text)
+    if n <= width:
+        return text + " " * (width - n) + "\033[0m"
+    return ANSI.sub("", text)[:max(0, width - 1)] + "…"
+
+
+def bar(pct, width):
+    """A coloured bar for a 0-100 percentage."""
+    pct = max(0.0, min(100.0, float(pct)))
+    full = round(width * pct / 100)
+    shade = 78 if pct < 60 else 214 if pct < 85 else 196
+    return f"\033[38;5;{shade}m{'█' * full}\033[38;5;238m{'░' * (width - full)}\033[0m"
+
+
+def short_tokens(n):
+    """1234567 -> '1.2M', 228000 -> '228k'."""
+    n = float(n)
+    for unit, size in (("M", 1e6), ("k", 1e3)):
+        if n >= size:
+            return f"{n / size:.1f}{unit}".replace(".0" + unit, unit)
+    return f"{n:.0f}"
+
+
+def when(ts):
+    """A reset time as 'at 03:00' today, or 'Fri 18:00' later on."""
+    t = time.localtime(ts)
+    same_day = time.strftime("%Y%m%d", t) == time.strftime("%Y%m%d")
+    return time.strftime("%H:%M" if same_day else "%a %H:%M", t)
+
+
+def span(seconds):
+    """A duration for the activity timers: 45s, 12m 05s, 1h 12m."""
+    seconds = int(max(0, seconds))
+    if seconds < 60:
+        return f"{seconds}s"
+    if seconds < 3600:
+        return f"{seconds // 60}m {seconds % 60:02d}s"
+    return f"{seconds // 3600}h {seconds % 3600 // 60:02d}m"
+
+
+def ago(seconds):
+    seconds = int(max(0, seconds))
+    if seconds < 90:
+        return f"{seconds}s ago"
+    if seconds < 5400:
+        return f"{seconds // 60}m ago"
+    return f"{seconds // 3600}h ago"
+
+
+def usage_panel(width):
+    """The lines of the right-hand panel: context, limits and cost per seat."""
+    inner = width - 2
+    bar_w = max(6, inner - 16)
+    # A running total of the session costs the agents report themselves
+    # (Claude Code's estimate at Anthropic's API list prices; Grok's own cost
+    # ledger). Recomputed on every redraw. Seats that report no dollars (the
+    # Grok Bot account gives only a % of its weekly limit) aren't counted.
+    total, counted = 0.0, []
+    for seat in tuple(AGENTS) + APP_SEATS:
+        cost = dig((read_json(DATA / "usage" / f"{seat}.json", {}) or {}).get("data", {}),
+                   "cost", "total_cost_usd")
+        if isinstance(cost, (int, float)) and cost > 0:
+            total += cost
+            counted.append(seat.title())
+    head = "\033[1mUSAGE\033[0m"
+    if counted:
+        money = f"~${total:,.2f} est."
+        gap = max(1, inner - 5 - len(money))
+        head += " " * gap + f"\033[1;38;5;220m{money}\033[0m"
+    lines = [head, ""]  # where the figures come from is in the README, not on screen
+    shown_account = False
+    for seat in tuple(AGENTS) + APP_SEATS:
+        record = read_json(DATA / "usage" / f"{seat}.json")
+        state = load_seat(seat) if seat in AGENTS else {"state": "app"}
+        if not record:
+            continue  # nothing known: leave it out rather than show an empty section
+        if record.get("source") == "grok-bot":
+            # One Grok Bot account serves every bot: show its usage once.
+            if shown_account:
+                continue
+            shown_account = True
+        d = (record or {}).get("data", {})
+        model = dig(d, "model", "display_name") or ""
+        title = f"\033[1;38;5;{colour(seat)}m{seat.upper()}\033[0m"
+        if record.get("source") == "grok-bot":
+            title, model = "\033[1mGROK BOT ACCOUNT\033[0m", "all bots"
+        lines.append(title + (f" \033[2m· {model}\033[0m" if model else ""))
+        pct = context_percent(d)
+        size = dig(d, "context_window", "context_window_size")
+        if pct is not None:
+            lines.append(f"  Context  {bar(pct, bar_w)} {pct:3.0f}%")
+            used = dig(d, "context_window", "context_tokens")
+            if used is None and isinstance(size, (int, float)):
+                used = size * pct / 100
+            if isinstance(used, (int, float)) and isinstance(size, (int, float)):
+                lines.append(f"\033[2m           {short_tokens(used)} of {short_tokens(size)} tokens\033[0m")
+        for label, key in (("5-hour", "five_hour"), ("Weekly", "seven_day")):
+            used = dig(d, "rate_limits", key, "used_percentage")
+            if isinstance(used, (int, float)):
+                lines.append(f"  {label:7}  {bar(used, bar_w)} {used:3.0f}%")
+                reset = dig(d, "rate_limits", key, "resets_at")
+                if isinstance(reset, (int, float)):
+                    lines.append(f"\033[2m           {100 - used:.0f}% left · resets {when(reset)}\033[0m")
+        bits = []
+        sin, sout = dig(d, "context_window", "session_input_tokens"), dig(d, "context_window", "session_output_tokens")
+        if isinstance(sin, (int, float)):
+            bits.append(f"in {short_tokens(sin)}")
+        if isinstance(sout, (int, float)):
+            bits.append(f"out {short_tokens(sout)}")
+        cost = dig(d, "cost", "total_cost_usd")
+        if isinstance(cost, (int, float)):
+            bits.append(f"${cost:.2f}" + (" est." if dig(d, "rate_limits") is not None else ""))
+        if bits:
+            lines.append(f"  Session  {' · '.join(bits)}")
+        lines.append(f"\033[2m  updated {ago(time.time() - record.get('time', 0))}\033[0m")
+        lines.append("")
+    # ACTIVITY: one row per agent: its state's symbol, the state, and how
+    # long it has been that way, counting up. (The history stays in
+    # activity.jsonl; the owner asked for just the current picture here.)
+    lines.append("\033[1mACTIVITY\033[0m")
+    lines.append("")
+    for seat, st, since in current_states():
+        shade = STATE_COLOURS.get(st, 245)
+        clock = span(time.time() - since) if since else ""
+        lines.append(f"  \033[38;5;{colour(seat)}m{seat.title():8}\033[0m "
+                     f"\033[38;5;{shade}m{STATE_MARKS.get(st, '◌')} {st[:13]:13}\033[0m "
+                     f"\033[1;38;5;{shade}m{clock:>8}\033[0m")
+    return [fit(" " + line, width) for line in lines]
+
+
+def current_states():
+    """(seat, state, since) for every seat shown on the chat screen.
+
+    Terminal agents that are away are left out, except Claude and Grok;
+    hidden app seats are never shown.
+    """
+    out = []
+    for seat in AGENTS:
+        st = load_seat(seat)
+        if st["state"] == "away" and seat not in ("claude", "grok"):
+            continue
+        out.append((seat, st["state"], st.get("since")))
+    for seat in APP_SEATS:
+        if seat in HIDDEN_SEATS:
+            continue
+        since = (read_json(seat_file(seat), {}) or {}).get("since")
+        out.append((seat, app_seat_state(seat), since))
+    return out
+
+
+MENTION = re.compile(r"(?<![\w@])@([A-Za-z][\w-]*)")
+
+
+def route(text):
+    """Who the owner's chat-box line goes to: (seats, error or None).
+
+    @seat names a seat (several are fine); @all, or no @ at all, is everyone.
+    """
+    names = [m.lower() for m in MENTION.findall(text)]
+    if not names or "all" in names:
+        return ["all"], None
+    unknown = [n for n in names if n not in SEATS or n == "owner"]
+    if unknown:
+        return [], f"no seat called @{unknown[0]}; try " + " ".join(f"@{s}" for s in SEATS if s != "owner" and s not in HIDDEN_SEATS) + " @all"
+    return list(dict.fromkeys(names)), None
+
+
+def chat(history=200, hide_private=False):
+    """Full-screen live view: notes on the left, usage on the right, status at the bottom."""
+    path = DATA / "log.jsonl"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.touch()
+    out = sys.stdout
+
+    # The chat box: the owner types on the line above the status bar.
+    tty = sys.stdin.isatty()
+    typed, notice, notice_until = "", "", 0.0
+    decoder = __import__("codecs").getincrementaldecoder("utf-8")(errors="ignore")
+    pending_esc = ""
+    in_paste = False
+    saved_tty = None
+    if tty:
+        import termios
+        import tty as tty_mod
+        saved_tty = termios.tcgetattr(sys.stdin)
+        tty_mod.setcbreak(sys.stdin)
+        out.write("\033[?2004h")  # bracketed paste: a pasted newline doesn't send
+
+    def submit(line):
+        nonlocal notice, notice_until
+        line = line.strip()
+        if not line:
+            return
+        seats, error = route(line)
+        if error:
+            notice, notice_until = error, time.time() + 6
+            return False
+        record, _ = send("owner", seats, line)
+        notice, notice_until = "sent to " + record["to"].replace("+", ", "), time.time() + 4
+        return True
+
+    def handle_keys():
+        """Read whatever was typed. Returns True if the screen should redraw."""
+        nonlocal typed, pending_esc, in_paste
+        import select
+        if not tty or not select.select([sys.stdin], [], [], 0)[0]:
+            return False
+        chars = pending_esc + decoder.decode(os.read(sys.stdin.fileno(), 4096))
+        pending_esc = ""
+        i = 0
+        while i < len(chars):
+            c = chars[i]
+            if c == "\033":
+                m = re.match(r"\033\[[0-9;?]*[ -/]*[@-~]", chars[i:])
+                if m:
+                    seq = m.group(0)
+                    in_paste = {"\033[200~": True, "\033[201~": False}.get(seq, in_paste)
+                    i += len(seq)
+                    continue
+                if i + 1 >= len(chars) or chars[i + 1] == "[":
+                    pending_esc = chars[i:]  # sequence split across reads
+                    break
+                typed = ""  # Esc on its own clears the line
+            elif c in "\r\n":
+                if in_paste:
+                    typed += " "
+                elif submit(typed) is not False:
+                    typed = ""
+            elif c in "\x7f\x08":
+                typed = typed[:-1]
+            elif c == "\x15":
+                typed = ""
+            elif c == "\x17":
+                typed = typed.rstrip().rsplit(" ", 1)[0] + " " if " " in typed.rstrip() else ""
+            elif c >= " ":
+                typed += c
+            i += 1
+        return True
+
+    def input_line(cols):
+        if not tty:
+            return ""
+        if typed:
+            shown_text = typed[-(cols - 12):]
+            highlighted = MENTION.sub(lambda m: f"\033[1;38;5;{colour(m.group(1).lower())}m@{m.group(1)}\033[0m", shown_text)
+            line = f"  \033[1;38;5;{colour('owner')}myou ›\033[0m {highlighted}\033[7m \033[0m"
+        else:
+            line = (f"  \033[1;38;5;{colour('owner')}myou ›\033[0m \033[7m \033[0m\033[2m type a note · "
+                    + " ".join(f"@{s}" for s in SEATS if s != "owner" and s not in HIDDEN_SEATS) + " · no @ = everyone\033[0m")
+        if notice and time.time() < notice_until:
+            line += f"   \033[38;5;{196 if notice.startswith('no seat') else 78}m{notice}\033[0m"
+        return line
+
+    records = []
+    with open(path) as f:
+        for line in f:
+            try:
+                records.append(json.loads(line))
+            except ValueError:
+                pass
+        out.write("\033[?25l\033[2J")
+        shown, layout, last_draw = [], None, 0.0
+        try:
+            while True:
+                cols, rows = shutil.get_terminal_size((100, 40))
+                panel_w = max(34, min(52, cols // 3)) if cols >= 90 else 0
+                chat_w = cols - panel_w - (3 if panel_w else 0)
+                changed = False
+                if layout != (cols, rows):  # first time, or the window was resized
+                    layout, changed = (cols, rows), True
+                    shown = [f"\033[1mcomms-deck\033[0m \033[2m· live notes on {MACHINE}\033[0m", ""]
+                    for r in records[-history:]:
+                        if not (hide_private and r.get("private")):
+                            shown += chat_lines(r, chat_w)
+                line = f.readline()
+                while line:
+                    try:
+                        r = json.loads(line)
+                        records.append(r)
+                        if not (hide_private and r.get("private")):
+                            shown += chat_lines(r, chat_w)
+                            changed = True
+                    except ValueError:
+                        pass
+                    line = f.readline()
+                shown = shown[-2000:]
+                if handle_keys():
+                    changed = True
+                if changed or time.time() - last_draw >= 2:
+                    body = rows - (1 if tty else 0)  # the chat box is the last line
+                    left = shown[-body:]
+                    left = [""] * (body - len(left)) + left
+                    right = usage_panel(panel_w) if panel_w else []
+                    right = (right + [""] * body)[:body]
+                    screen = ["\033[H"]
+                    for i in range(body):
+                        row = fit(left[i], chat_w)
+                        if panel_w:
+                            row += f" \033[38;5;238m│\033[0m " + fit(right[i], panel_w)
+                        screen.append(row + ("\n" if i < body - 1 or tty else ""))
+                    if tty:
+                        screen.append(f"\033[48;5;234m{fit(input_line(cols), cols)}")
+                    out.write("".join(screen))
+                    out.flush()
+                    last_draw = time.time()
+                if tty:
+                    import select
+                    select.select([sys.stdin], [], [], 0.25)
+                else:
+                    time.sleep(0.25)
+        finally:
+            if saved_tty is not None:
+                import termios
+                termios.tcsetattr(sys.stdin, termios.TCSADRAIN, saved_tty)
+                out.write("\033[?2004l")
+            out.write("\033[0m\033[2J\033[H\033[?25h")
+            out.flush()
+
+
+# The status line (`comms-deck statusline --source <agent>`): Claude Code and
+# Grok both pipe their session details (model, context, cost, and for Claude
+# plan limits) to a status line command as JSON. This saves that JSON as
+# usage/<seat>.json for the chat view's usage panel, and prints a short row
+# for the agent's own window.
+
+
+def statusline(source):
+    """Save the agent's status JSON and print a one-line summary."""
+    try:
+        data = json.loads(sys.stdin.read() or "{}")
+    except ValueError:
+        data = {}
+    seat = setting("SEAT") or source
+    write_json(DATA / "usage" / f"{seat}.json", {"time": time.time(), "source": source, "data": data})
+    parts = [dig(data, "model", "display_name")]
+    pct = context_percent(data)
+    if pct is not None:
+        parts.append(f"ctx {pct:.0f}%")
+    cost = dig(data, "cost", "total_cost_usd")
+    if isinstance(cost, (int, float)) and cost >= 0.005:
+        parts.append(f"${cost:.2f}")
+    five = dig(data, "rate_limits", "five_hour", "used_percentage")
+    if isinstance(five, (int, float)):
+        parts.append(f"5h {five:.0f}%")
+    waiting = len(pending(seat))
+    if waiting:
+        parts.append(f"{waiting} note(s) waiting")
+    print(" · ".join(str(p) for p in parts if p))
+
+
+def grok_usage_from_session():
+    """Grok's usage, read from its own session files, as a status-line-shaped dict.
+
+    Grok's status line only runs while its UI is set to show one, so the
+    service also reads what Grok writes for every session anyway:
+    ~/.grok/active_sessions.json names the live session, its signals.json has
+    the context size and window, and each turn_completed event in its
+    updates.jsonl has that turn's tokens and cost. Returns (time, data) or None.
+    """
+    try:
+        active = json.loads((HOME / ".grok/active_sessions.json").read_text())
+    except (OSError, ValueError):
+        return None
+    live = [a for a in active if pid_alive(a.get("pid"))]
+    if not live:
+        return None
+    session = live[-1]
+    folder = HOME / ".grok/sessions" / session.get("cwd", "").replace("/", "%2F") / session["session_id"]
+    data, newest, context_time = {"model": {}, "context_window": {}, "cost": {}}, 0.0, 0.0
+    try:
+        sig = json.loads((folder / "signals.json").read_text())
+        newest = (folder / "signals.json").stat().st_mtime
+        model = sig.get("primaryModelId")
+        if model:
+            data["model"] = {"id": model, "display_name": model.replace("grok-", "Grok ")}
+        if sig.get("contextWindowTokens"):
+            data["context_window"]["context_window_size"] = sig["contextWindowTokens"]
+        if sig.get("contextTokensUsed") is not None:
+            data["context_window"]["context_tokens"] = sig["contextTokensUsed"]
+        context_time = newest
+    except (OSError, ValueError):
+        pass
+    cost_ticks, sin, sout = 0, 0, 0
+    try:
+        with open(folder / "updates.jsonl", "rb") as f:
+            for line in f:
+                if b"turn_completed" not in line and b"auto_compact_completed" not in line:
+                    continue
+                try:
+                    r = json.loads(line)
+                except ValueError:
+                    continue
+                u = (r.get("params") or {}).get("update") or {}
+                when = (r.get("timestamp_us") or 0) / 1e6
+                if u.get("sessionUpdate") == "turn_completed":
+                    usage = u.get("usage") or {}
+                    cost_ticks += usage.get("costUsdTicks") or 0
+                    sin += usage.get("inputTokens") or 0
+                    sout += usage.get("outputTokens") or 0
+                    # Every finished turn moves the clock: the session totals
+                    # changed. Its inputTokens sum all of the turn's model
+                    # calls, so they're not the context size; that comes from
+                    # signals.json or a compaction. (Review by Grok.)
+                    newest = max(newest, when)
+                elif u.get("sessionUpdate") == "auto_compact_completed" and when >= context_time:
+                    data["context_window"]["context_tokens"] = u.get("tokens_after")
+                    context_time = when
+                    newest = max(newest, when)
+    except OSError:
+        pass
+    if sin:
+        data["context_window"]["session_input_tokens"] = sin
+        data["context_window"]["session_output_tokens"] = sout
+    if cost_ticks:
+        data["cost"]["total_cost_usd"] = cost_ticks / 1e10  # Grok counts cost in 1e-10 USD ticks
+    return (newest, data) if newest else None
+
+
+def refresh_grok_usage():
+    """Write usage/grok.json from Grok's session files when they're newer."""
+    found = grok_usage_from_session()
+    if not found:
+        return
+    when, data = found
+    current = read_json(DATA / "usage" / "grok.json", {}) or {}
+    if when > float(current.get("time") or 0):
+        write_json(DATA / "usage" / "grok.json", {"time": when, "source": "grok-session", "data": data})
+
+
+def dig(data, *keys):
+    """data[k1][k2]... or None if any step is missing."""
+    for key in keys:
+        if not isinstance(data, dict):
+            return None
+        data = data.get(key)
+    return data
+
+
+def context_percent(data):
+    """How full the context window is, 0-100, or None if unknown."""
+    pct = dig(data, "context_window", "used_percentage")
+    if isinstance(pct, (int, float)):
+        return float(pct)
+    used, size = dig(data, "context_window", "context_tokens"), dig(data, "context_window", "context_window_size")
+    if isinstance(used, (int, float)) and isinstance(size, (int, float)) and size:
+        return 100.0 * used / size
+    return None
+
+
+def status_text():
+    """A short table of every agent seat."""
+    rows = []
+    for seat in AGENTS:
+        s = load_seat(seat)
+        wake = "can wake" if s.get("kitty_socket") and s.get("kitty_window") else "no wake"
+        paused = ", PAUSED (loop guard)" if s["auto"] >= AUTO_LIMIT else ""
+        rows.append(f"{seat:8} {s['state']:5}  {len(pending(seat))} waiting  {wake}{paused}")
+    for seat in APP_SEATS:
+        rows.append(f"{seat:8} {app_seat_state(seat):14} {len(pending(seat))} waiting")
+    hook_state = "Discord mirror: on" if WEBHOOK_FILE.exists() else "Discord mirror: off"
+    return "\n".join(rows + [hook_state])
+
+
+# -----------------------------------------------------------------------------
+# SECTION 10: MCP server - send/read as built-in tools
+# -----------------------------------------------------------------------------
+#
+# Newline-delimited JSON-RPC 2.0 on stdin/stdout (the MCP stdio transport).
+
+MCP_TOOLS = [
+    {"name": "send_message",
+     "description": "Send a note to another agent on this desktop. It's delivered within "
+                    "seconds: at the end of their current turn, or typed into their window "
+                    "if they're idle. Use quiet for FYIs that shouldn't wake anyone.",
+     "inputSchema": {"type": "object", "required": ["to", "text"], "properties": {
+         "to": {"type": "string",
+                "description": "A seat, several seats separated by commas (e.g. 'claude, grok'), "
+                               "'owner', or 'all'. Seats: " + ", ".join(SEATS) + "."},
+         "text": {"type": "string"},
+         "quiet": {"type": "boolean", "description": "Don't wake them; they get it next time."},
+         "private": {"type": "boolean", "description": "Keep out of the public log and Discord."}}}},
+    {"name": "read_messages",
+     "description": "Take and show every note waiting for you, including quiet ones.",
+     "inputSchema": {"type": "object", "properties": {}}},
+    {"name": "add_note",
+     "description": "Add to the team's running commentary: what you did and why.",
+     "inputSchema": {"type": "object", "required": ["text"],
+                     "properties": {"text": {"type": "string"}}}},
+    {"name": "set_status",
+     "description": "Say in a few words what you're working on (e.g. 'reviewing PR #12'). "
+                    "Shown in the activity log on the owner's chat screen until your turn ends.",
+     "inputSchema": {"type": "object", "required": ["text"],
+                     "properties": {"text": {"type": "string", "description": "Under 70 characters."}}}},
+    {"name": "team_status",
+     "description": "Which agents are busy, idle or away, and how many notes wait for each.",
+     "inputSchema": {"type": "object", "properties": {}}},
+]
+
+
+def mcp_call(seat, name, args):
+    """Run one MCP tool. Returns (text, is_error)."""
+    if name == "send_message":
+        record, warning = send(seat, str(args.get("to", "")), str(args.get("text", "")),
+                               bool(args.get("quiet")), bool(args.get("private")))
+        return (f"Sent to {record['to']}." + (f" {warning}" if warning else "")), False
+    if name == "read_messages":
+        notes = take(seat)
+        return (render(notes, seat) if notes else "No notes waiting."), False
+    if name == "add_note":
+        add_note(seat, str(args.get("text", "")))
+        return "Added to the commentary.", False
+    if name == "set_status":
+        update_seat(seat, state="busy", doing=describe(args.get("text", "")))
+        return "Status set.", False
+    if name == "team_status":
+        return status_text(), False
+    return f"Unknown tool {name}", True
+
+
+def mcp():
+    """Serve MCP on stdin/stdout until stdin closes."""
+    seat, _ = find_agent()
+    seat = seat or "unknown"
+    # The MCP server never records the seat's window: agents also start it
+    # from short-lived helper processes (e.g. `claude mcp list` checking the
+    # connection), which would record a pid that's gone a moment later and
+    # make the seat look away. Only the hooks record it.
+    out = sys.stdout
+
+    def answer(msg_id, result=None, error=None):
+        reply = {"jsonrpc": "2.0", "id": msg_id}
+        reply.update({"error": error} if error else {"result": result})
+        out.write(json.dumps(reply) + "\n")
+        out.flush()
+
+    for line in sys.stdin:
+        try:
+            msg = json.loads(line)
+        except ValueError:
+            continue
+        method, msg_id = msg.get("method"), msg.get("id")
+        if msg_id is None:
+            continue  # a notification, e.g. notifications/initialized
+        if method == "initialize":
+            answer(msg_id, {
+                "protocolVersion": (msg.get("params") or {}).get("protocolVersion", "2025-06-18"),
+                "capabilities": {"tools": {}},
+                "serverInfo": {"name": "comms-deck", "version": "2.0"},
+                "instructions": f"You are the '{seat}' seat. Notes from other agents arrive "
+                                f"on their own, starting with {MARK}. Use send_message to reply."})
+        elif method == "tools/list":
+            answer(msg_id, {"tools": MCP_TOOLS})
+        elif method == "tools/call":
+            params = msg.get("params") or {}
+            try:
+                text, failed = mcp_call(seat, params.get("name"), params.get("arguments") or {})
+            except ValueError as error:
+                text, failed = str(error), True
+            answer(msg_id, {"content": [{"type": "text", "text": text}], "isError": failed})
+        elif method == "ping":
+            answer(msg_id, {})
+        else:
+            answer(msg_id, error={"code": -32601, "message": f"no method {method}"})
+
+
+# -----------------------------------------------------------------------------
+# SECTION 11: install - set this machine up (safe to run again)
+# -----------------------------------------------------------------------------
+
+KITTY_BLOCK = """
+# >>> comms-deck: lets the agents' notes reach their own window without moving focus
+allow_remote_control socket-only
+listen_on unix:${XDG_RUNTIME_DIR}/kitty
+# <<< comms-deck
+"""
+
+
+def claude_hooks(cmd):
+    """The hooks block for ~/.claude/settings.json."""
+    def entry(event, matcher=None):
+        h = {"hooks": [{"type": "command", "command": f"{cmd} hook --source claude --event {event}",
+                        "timeout": 10}]}
+        if matcher:
+            h["matcher"] = matcher
+        return h
+    return {e: [entry(e)] for e in ("SessionStart", "UserPromptSubmit", "Stop", "SessionEnd")} | {
+        "Notification": [entry("Notification", "idle_prompt")]}
+
+
+def grok_hooks(cmd):
+    """The hooks file for ~/.grok/hooks/comms-deck.json.
+
+    Notification is matched on idle_prompt only. StopFailure is left out:
+    idle_prompt also fires after an errored turn, and that is what marks idle.
+    """
+    def entry(event, matcher=None):
+        group = {"hooks": [{"type": "command", "timeout": 10,
+                            "command": f"{cmd} hook --source grok --event {event}"}]}
+        if matcher:
+            group["matcher"] = matcher
+        return group
+    events = ("SessionStart", "UserPromptSubmit", "Stop", "StopCancelled", "SessionEnd")
+    hooks = {event: [entry(event)] for event in events}
+    hooks["Notification"] = [entry("Notification", "idle_prompt")]
+    return {"hooks": hooks}
+
+
+def install(yes):
+    """Set up: command link, hooks, MCP, kitty, services. Prints each step."""
+    here = Path(__file__).resolve().parent
+    bin_dir = HOME / ".local/bin"
+    cmd = str(bin_dir / "comms-deck")
+    steps = []
+
+    def step(text, action):
+        steps.append((text, action))
+
+    def link(name, target):
+        dest = bin_dir / name
+        if dest.is_symlink() or not dest.exists():
+            dest.unlink(missing_ok=True)
+            dest.symlink_to(target)
+
+    def migrate():
+        """Move launchpad's data and config to the comms-deck names, leaving
+        links behind so anything still running under the old name keeps
+        working until it restarts."""
+        for old, new in ((HOME / ".local/share/launchpad", DATA), (HOME / ".config/launchpad", CONFIG)):
+            if old.is_dir() and not old.is_symlink() and not new.exists():
+                new.parent.mkdir(parents=True, exist_ok=True)
+                old.rename(new)
+                old.symlink_to(new)
+    step("move ~/.local/share/launchpad and ~/.config/launchpad to the comms-deck names", migrate)
+
+    step(f"link {bin_dir}/comms-deck (and the old name, launchpad) and push-courier to this repo",
+         lambda: (bin_dir.mkdir(parents=True, exist_ok=True), link("comms-deck", here / "comms-deck"),
+                  link("launchpad", here / "comms-deck"), link("push-courier", here / "push-courier")))
+
+    def claude_settings():
+        path = HOME / ".claude/settings.json"
+        settings = read_json(path, {}) or {}
+        if path.exists():
+            shutil.copy(path, path.with_suffix(".json.comms-deck-backup"))
+        hooks = settings.setdefault("hooks", {})
+        for event, entries in claude_hooks(cmd).items():
+            kept = [e for e in hooks.get(event, [])
+                    if "comms-deck hook" not in json.dumps(e) and "launchpad hook" not in json.dumps(e)]
+            hooks[event] = kept + entries
+        line = str((settings.get("statusLine") or {}).get("command", ""))
+        if not line or "launchpad statusline" in line or "comms-deck statusline" in line:
+            settings["statusLine"] = {"type": "command", "command": f"{cmd} statusline --source claude",
+                                      "padding": 0}
+        path.write_text(json.dumps(settings, indent=2) + "\n")
+    step("add comms-deck hooks and status line to ~/.claude/settings.json (backup kept)", claude_settings)
+
+    def grok_files():
+        (HOME / ".grok/hooks/launchpad.json").unlink(missing_ok=True)
+        write_json(HOME / ".grok/hooks/comms-deck.json", grok_hooks(cmd))
+    step("write ~/.grok/hooks/comms-deck.json (replacing launchpad.json)", grok_files)
+
+    def mcp_claude():
+        if shutil.which("claude"):
+            for name in ("launchpad", "comms-deck"):
+                subprocess.run(["claude", "mcp", "remove", "-s", "user", name], capture_output=True)
+            subprocess.run(["claude", "mcp", "add", "-s", "user", "comms-deck", "--", cmd, "mcp"],
+                           check=True, capture_output=True)
+    step("register the MCP server with Claude Code (user scope)", mcp_claude)
+
+    def mcp_toml(path, header, status_line=False):
+        if not path.parent.exists():
+            return
+        text = path.read_text() if path.exists() else ""
+        # Drop the old [mcp_servers.launchpad] table (header and its key lines).
+        text = re.sub(r"\n*\[mcp_servers\.launchpad\]\n(?:[a-z_]+ = .*\n?)*", "\n", text)
+        text = re.sub(r"[^\"\s]*launchpad statusline", f"{cmd} statusline", text)
+        if header not in text:
+            text = text.rstrip("\n") + f"\n\n{header}\ncommand = \"{cmd}\"\nargs = [\"mcp\"]\n"
+        if status_line and "[ui.status_line]" not in text:
+            text += (f"\n[ui.status_line]\ntype = \"command\"\n"
+                     f"command = \"{cmd} statusline --source grok\"\nrefresh_interval = 60\n")
+        path.write_text(text)
+    step("register the MCP server and status line with Grok (~/.grok/config.toml)",
+         lambda: mcp_toml(HOME / ".grok/config.toml", "[mcp_servers.comms-deck]", status_line=True))
+    def desktop():
+        """The chat screen's launcher, the scratchpad layout, an app menu
+        entry, and (for a Lua Hyprland config) the rule that puts the chat
+        screen fullscreen on workspace 5."""
+        for name in ("comms-deck-chat", "scratchpad-layout"):
+            link(name, here / "desktop" / name)
+        apps = HOME / ".local/share/applications"
+        apps.mkdir(parents=True, exist_ok=True)
+        (apps / "comms-deck-chat.desktop").write_text(
+            "[Desktop Entry]\nType=Application\nName=comms-deck chat\n"
+            "Comment=Live view of the agents' notes, with usage and a chat box\n"
+            f"Exec={bin_dir / 'comms-deck-chat'}\nIcon=utilities-terminal\nTerminal=false\n"
+            "Categories=Utility;\n")
+        lua = HOME / ".config/hypr/hyprland.lua"
+        if lua.exists() and "comms-deck-chat" not in lua.read_text():
+            with open(lua, "a") as f:
+                f.write('\n-- comms-deck chat: the agents\' live notes, fullscreen on workspace 5.\n'
+                        'hl.window_rule({\n    name       = "comms-deck-chat",\n'
+                        '    match      = { class = "^comms-deck-chat$" },\n'
+                        '    workspace  = "5 silent",\n    fullscreen = true,\n})\n')
+            subprocess.run(["hyprctl", "reload"], capture_output=True)
+    step("link the chat screen launcher and scratchpad-layout, add an app menu entry, "
+         "and the Hyprland rule for workspace 5 (Lua config)", desktop)
+
+    def antigravity():
+        if not (HOME / ".local/bin/agy").exists() and not shutil.which("agy"):
+            return
+        folder = HOME / ".gemini/config"
+        folder.mkdir(parents=True, exist_ok=True)
+        hooks_path = folder / "hooks.json"
+        hooks = read_json(hooks_path, {}) or {}
+        hooks.update(agy_hooks(cmd))
+        hooks_path.write_text(json.dumps(hooks, indent=2) + "\n")
+        mcp_path = folder / "mcp_config.json"
+        config = read_json(mcp_path, {}) or {}
+        config.setdefault("mcpServers", {})["comms-deck"] = {
+            "command": cmd, "args": ["mcp"], "env": {"COMMS_DECK_SEAT": "gravity"}}
+        mcp_path.write_text(json.dumps(config, indent=2) + "\n")
+        settings_path = HOME / ".gemini/antigravity-cli/settings.json"
+        settings_path.parent.mkdir(parents=True, exist_ok=True)
+        current = read_json(settings_path, {}) or {}
+        updated = grant_gravity_tools(current)
+        if updated != current:
+            settings_path.write_text(json.dumps(updated, indent=2) + "\n")
+    step("add hooks and the MCP server for Antigravity, if installed (~/.gemini/config)", antigravity)
+    step("register the MCP server with Codex, if installed (~/.codex/config.toml)",
+         lambda: mcp_toml(HOME / ".codex/config.toml", "[mcp_servers.comms-deck]"))
+
+    def kitty_conf():
+        path = HOME / ".config/kitty/kitty.conf"
+        text = path.read_text() if path.exists() else ""
+        if "# >>> launchpad" in text:
+            text = text.replace("# >>> launchpad", "# >>> comms-deck").replace("# <<< launchpad", "# <<< comms-deck")
+            path.write_text(text)
+        if "# >>> comms-deck" not in text:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with open(path, "a") as f:
+                f.write(KITTY_BLOCK)
+    step("turn on kitty remote control (~/.config/kitty/kitty.conf, new windows only)", kitty_conf)
+
+    def services():
+        unit_dir = HOME / ".config/systemd/user"
+        unit_dir.mkdir(parents=True, exist_ok=True)
+        for unit in ("comms-deck.service", "push-courier.service"):
+            link_path = unit_dir / unit
+            link_path.unlink(missing_ok=True)
+            link_path.symlink_to(here / "systemd" / unit)
+        for old in ("relay-protocol.service", "relay-scheduler.service", "launchpad.service"):
+            subprocess.run(["systemctl", "--user", "disable", "--now", old], capture_output=True)
+            (unit_dir / old).unlink(missing_ok=True)
+        subprocess.run(["systemctl", "--user", "daemon-reload"], check=True)
+        subprocess.run(["systemctl", "--user", "enable", "--now", "comms-deck.service",
+                        "push-courier.service"], check=True, capture_output=True)
+    step("install and start comms-deck.service and push-courier.service", services)
+
+    for text, _ in steps:
+        print(f"  - {text}")
+    if not yes:
+        print("\nNothing changed yet. Run `comms-deck install --yes` to do the above.")
+        return
+    for text, action in steps:
+        action()
+        print(f"done: {text}")
+    print("\nOpen new kitty windows for the agents so they pick up remote control.")
+
+
+# -----------------------------------------------------------------------------
+# SECTION 12: self-test - runs in a throwaway folder, touches nothing real
+# -----------------------------------------------------------------------------
+
+
+def self_test():
+    """Check the mailbox, hooks, loop guard and MCP server. Exit 1 on failure."""
+    tmp = tempfile.mkdtemp(prefix="comms-deck-test-")
+    env = dict(os.environ, COMMS_DECK_HOME=f"{tmp}/data", COMMS_DECK_CONFIG=f"{tmp}/config",
+               COMMS_DECK_AUTO_LIMIT="2")
+    me = str(Path(__file__).resolve())
+    failures = []
+
+    def run(args, seat, stdin="", extra=None):
+        e = dict(env, COMMS_DECK_SEAT=seat, **(extra or {}))
+        return subprocess.run([sys.executable, me, *args], input=stdin, env=e,
+                              capture_output=True, text=True, timeout=30)
+
+    def check(name, ok, detail=""):
+        print(("ok   " if ok else "FAIL ") + name)
+        if not ok:
+            failures.append(name)
+            print("     " + detail.strip().replace("\n", "\n     "))
+
+    r = run(["send", "grok", "hello grok"], "claude")
+    check("send", r.returncode == 0, r.stderr)
+    r = run(["read", "--peek"], "grok")
+    check("peek leaves the note", "hello grok" in r.stdout and
+          len(list(Path(f"{tmp}/data/inbox/grok").glob("*.json"))) == 1, r.stdout + r.stderr)
+    r = run(["hook", "--source", "grok", "--event", "Stop"], "grok", "{}", {"GROK_HOOK_EVENT": "stop"})
+    reply = json.loads(r.stdout or "{}")
+    check("Stop hook hands the note over", reply.get("decision") == "block" and
+          "hello grok" in reply.get("reason", ""), r.stdout + r.stderr)
+    r = run(["hook", "--source", "grok", "--event", "Stop"], "grok", "{}", {"GROK_HOOK_EVENT": "stop"})
+    check("empty inbox: Stop hook stays silent", r.stdout.strip() == "", r.stdout)
+    r = run(["hook", "--source", "claude", "--event", "Stop"], "grok", "{}", {"GROK_HOOK_EVENT": "stop"})
+    check("Claude's hook does nothing inside Grok", r.stdout.strip() == "", r.stdout)
+    run(["send", "grok", "--quiet", "fyi only"], "claude")
+    r = run(["hook", "--source", "grok", "--event", "Stop"], "grok", "{}", {"GROK_HOOK_EVENT": "stop"})
+    check("a quiet note doesn't keep the agent working", r.stdout.strip() == "", r.stdout)
+    run(["send", "grok", "second"], "claude")
+    r = run(["hook", "--source", "grok", "--event", "Stop"], "grok", "{}", {"GROK_HOOK_EVENT": "stop"})
+    check("the quiet note rides along with a normal one", "fyi only" in r.stdout and "second" in r.stdout,
+          r.stdout)
+    run(["send", "grok", "third"], "claude")
+    r = run(["hook", "--source", "grok", "--event", "Stop"], "grok", "{}", {"GROK_HOOK_EVENT": "stop"})
+    check("loop guard pauses after the limit", r.stdout.strip() == "", r.stdout)
+    run(["hook", "--source", "grok", "--event", "UserPromptSubmit"], "grok",
+        '{"prompt": "carry on"}', {"GROK_HOOK_EVENT": "user_prompt_submit"})
+    r = run(["hook", "--source", "grok", "--event", "Stop"], "grok", "{}", {"GROK_HOOK_EVENT": "stop"})
+    check("an owner prompt resets the loop guard", "third" in r.stdout, r.stdout)
+    run(["send", "grok", "fourth"], "claude")
+    run(["send", "grok", "fifth"], "claude")
+    run(["hook", "--source", "grok", "--event", "Stop"], "grok", "{}", {"GROK_HOOK_EVENT": "stop"})
+    run(["hook", "--source", "grok", "--event", "Stop"], "grok", "{}", {"GROK_HOOK_EVENT": "stop"})
+    run(["--from", "owner", "send", "grok", "from the owner"], "owner")
+    r = run(["hook", "--source", "grok", "--event", "Stop"], "grok", "{}", {"GROK_HOOK_EVENT": "stop"})
+    check("an owner note gets through a paused loop guard", "from the owner" in r.stdout, r.stdout)
+    code = ("import importlib.machinery as m, importlib.util as u, sys\n"
+            f"l = m.SourceFileLoader('lp', {me!r}); s = u.spec_from_loader('lp', l)\n"
+            "x = u.module_from_spec(s); l.exec_module(x)\n"
+            "print(x.route('@grok hi')[0], x.route('hi @Claude and @grok')[0], x.route('@all go')[0],"
+            " bool(x.route('@bob hi')[1]), x.route('no mention')[0] == ['all'], x.MENTION.findall('mail a@grok.com') == [])")
+    r = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True, timeout=30)
+    check("chat box routing (@seat, several, @all, unknown, no @ = all, not emails)",
+          r.stdout.strip() == "['grok'] ['claude', 'grok'] ['all'] True True True", r.stdout + r.stderr)
+    run(["send", "claude", "for claude"], "grok")
+    r = run(["hook", "--source", "claude", "--event", "UserPromptSubmit"], "claude", '{"prompt": "hi"}')
+    check("Claude gets notes with the owner's prompt", "for claude" in r.stdout, r.stdout + r.stderr)
+    run(["hook", "--source", "claude", "--event", "Stop"], "claude", "{}")
+    check("Claude is idle after an allowed Stop",
+          (read_json(Path(tmp) / "data/seats/claude.json", {}) or {}).get("state") == "idle")
+    r = run(["send", "grok", "token: abc123secret"], "claude")
+    check("secret-looking notes go private", "private" in r.stdout and
+          not list(Path(f"{tmp}/data").glob("queue/discord/*")), r.stdout)
+    Path(f"{tmp}/config").mkdir(parents=True, exist_ok=True)
+    Path(f"{tmp}/config/private-names").write_text("# local only\nZanzibar\n")
+    run(["send", "grok", "zanzibar asked; Zanzibarish stays"], "claude")
+    queued = [read_json(q) for q in Path(f"{tmp}/data/queue/sync").glob("*.json")]
+    logged = (Path(f"{tmp}/data/log.jsonl")).read_text()
+    check("private names are redacted in copies that leave the machine",
+          any(q and q["text"] == "the owner asked; Zanzibarish stays" for q in queued)
+          and "zanzibar asked" in logged, str([q["text"] for q in queued if q])[-200:])
+    r = run(["send", "grok, gravity", "for two"], "claude")
+    two = [json.loads(l) for l in Path(f"{tmp}/data/log.jsonl").read_text().splitlines()][-1]
+    check("a note to several seats is one note, in each inbox",
+          two["to"] == "grok+gravity" and list(Path(f"{tmp}/data/inbox/gravity").glob(f"{two['id']}.json"))
+          and list(Path(f"{tmp}/data/inbox/grok").glob(f"{two['id']}.json")), str(two))
+    r = run(["send", "nobody", "x"], "claude")
+    check("unknown seat is refused", r.returncode != 0)
+    rpc = "\n".join(json.dumps(m) for m in [
+        {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18"}},
+        {"jsonrpc": "2.0", "method": "notifications/initialized"},
+        {"jsonrpc": "2.0", "id": 2, "method": "tools/list"},
+        {"jsonrpc": "2.0", "id": 3, "method": "tools/call",
+         "params": {"name": "send_message", "arguments": {"to": "claude", "text": "via mcp"}}},
+    ]) + "\n"
+    r = run(["mcp"], "grok", rpc)
+    replies = [json.loads(line) for line in r.stdout.splitlines()]
+    check("MCP server answers initialize, tools/list and tools/call",
+          len(replies) == 3 and replies[1]["result"]["tools"][0]["name"] == "send_message"
+          and not replies[2]["result"]["isError"], r.stdout + r.stderr)
+    r = run(["read"], "claude")
+    check("note sent over MCP arrives", "via mcp" in r.stdout, r.stdout)
+
+    def seat(name="grok"):
+        return read_json(Path(tmp) / "data" / "seats" / f"{name}.json", {}) or {}
+
+    grok_env = {"GROK_HOOK_EVENT": "stop"}
+    run(["read"], "grok")
+    run(["hook", "--source", "grok", "--event", "UserPromptSubmit"], "grok",
+        '{"prompt": "reset"}', {"GROK_HOOK_EVENT": "user_prompt_submit"})
+    run(["send", "grok", "loop-a"], "claude")
+    run(["hook", "--source", "grok", "--event", "Stop"], "grok", "{}", grok_env)
+    run(["send", "grok", "loop-b"], "claude")
+    run(["hook", "--source", "grok", "--event", "Stop"], "grok", "{}", grok_env)
+    run(["send", "grok", "loop-c"], "claude")
+    run(["hook", "--source", "grok", "--event", "UserPromptSubmit"], "grok",
+        '{"promptId": "keep"}', {"GROK_HOOK_EVENT": "user_prompt_submit"})
+    check("a missing prompt keeps the loop count",
+          seat().get("auto") == 2 and seat().get("prompt_id") == "keep", str(seat()))
+    r = run(["hook", "--source", "grok", "--event", "Stop"], "grok", "{}", grok_env)
+    check("a missing prompt does not lift the loop guard", "loop-c" not in r.stdout, r.stdout)
+    check("Stop does not mark the seat idle", seat().get("state") != "idle", str(seat()))
+    run(["hook", "--source", "grok", "--event", "Notification"], "grok",
+        '{"notification_type": "permission_prompt", "type": "idle_prompt", "message": "idle now"}',
+        {"GROK_HOOK_EVENT": "notification"})
+    check("only notification_type idle_prompt counts", seat().get("state") != "idle", str(seat()))
+    run(["hook", "--source", "grok", "--event", "Notification"], "grok",
+        '{"notification_type": "idle_prompt"}', {"GROK_HOOK_EVENT": "notification"})
+    check("idle_prompt marks the seat idle", seat().get("state") == "idle", str(seat()))
+    run(["hook", "--source", "grok", "--event", "UserPromptSubmit"], "grok",
+        '{"prompt": "next", "promptId": "new"}', {"GROK_HOOK_EVENT": "user_prompt_submit"})
+    check("an owner prompt records promptId and resets the count",
+          seat().get("auto") == 0 and seat().get("prompt_id") == "new"
+          and seat().get("state") == "busy", str(seat()))
+    run(["send", "grok", "for-new"], "claude")
+    r = run(["hook", "--source", "grok", "--event", "Stop"], "grok",
+            '{"promptId": "old"}', grok_env)
+    check("an older Stop does not take the note",
+          "for-new" not in r.stdout and seat().get("state") == "busy", r.stdout + str(seat()))
+    run(["hook", "--source", "grok", "--event", "StopCancelled"], "grok",
+        '{"promptId": "old"}', {"GROK_HOOK_EVENT": "stop_cancelled"})
+    check("an older StopCancelled does not mark idle", seat().get("state") == "busy", str(seat()))
+    r = run(["hook", "--source", "grok", "--event", "Stop"], "grok",
+            '{"promptId": "new", "backgroundTasks": [{"id": "t", "type": "shell"}]}', grok_env)
+    check("Stop leaves notes while background work is in flight",
+          "for-new" not in r.stdout, r.stdout)
+    r = run(["hook", "--source", "grok", "--event", "Stop"], "grok",
+            '{"promptId": "new", "subagentType": "explore"}', grok_env)
+    check("a subagent Stop does not take the note", "for-new" not in r.stdout, r.stdout)
+    r = run(["hook", "--source", "grok", "--event", "Stop"], "grok", '{"promptId": "new"}', grok_env)
+    handed = {}
+    try:
+        handed = json.loads(r.stdout or "{}")
+    except ValueError:
+        pass
+    check("the current Stop hands the note over and stays busy",
+          handed.get("decision") == "block" and "for-new" in r.stdout
+          and seat().get("state") == "busy", r.stdout + str(seat()))
+    run(["hook", "--source", "grok", "--event", "StopCancelled"], "grok",
+        '{"promptId": "new"}', {"GROK_HOOK_EVENT": "stop_cancelled"})
+    check("StopCancelled leaves idle to idle_prompt", seat().get("state") != "idle", str(seat()))
+    run(["hook", "--source", "grok", "--event", "Stop"], "grok",
+        '{"reason": "channel_closed"}', grok_env)
+    check("a session-end Stop marks the seat away", seat().get("state") == "away", str(seat()))
+    run(["hook", "--source", "grok", "--event", "SessionEnd"], "grok", "{}",
+        {"GROK_HOOK_EVENT": "session_end"})
+    check("SessionEnd marks the seat away", seat().get("state") == "away", str(seat()))
+    grok_empty = "╭──╮\n│ ❯" + " " * 8 + "│\n╰──╯\n"
+    grok_draft = "╭──╮\n│ ❯ remember the milk │\n╰──╯\n"
+    grok_wrap = "╭──╮\n│ ❯" + " " * 8 + "│\n│ second line │\n╰──╯\n"
+    claude_empty = "─" * 20 + "\n❯\u00a0\n" + "─" * 20 + "\n"
+    claude_draft = "─" * 20 + "\n❯\u00a0fix the hook\n" + "─" * 20 + "\n"
+    check("an empty Grok composer is safe to paste into", composer_text(grok_empty) == "")
+    check("a Grok draft blocks the paste", composer_text(grok_draft) == "remember the milk")
+    check("a wrapped Grok draft blocks the paste", composer_text(grok_wrap) == "second line")
+    check("an empty Claude composer is safe to paste into", composer_text(claude_empty) == "")
+    check("a Claude draft blocks the paste", composer_text(claude_draft) == "fix the hook")
+    check("Claude's bare > marker uses the next line",
+          composer_text("> \nfix the hook\n") == "fix the hook")
+    check("a screen with no composer is left alone", composer_text("no prompt here\n") is None)
+    scrollback = ("│ ❯ old text from another screen │\n> a quoted line in a reply\n"
+                  + "words\n" * 20 + claude_empty + "  status line\n")
+    check("text in the scrollback above the prompt isn't a draft", composer_text(scrollback) == "",
+          repr(composer_text(scrollback)))
+    rule = "\033[38:2:136:136:136m" + "─" * 20 + "\033[m\n"
+    suggested = rule + "\033[38:2:153:153:153m❯\u00a0\033[2mtry: run the tests\033[m\n" + rule
+    typed = rule + "\033[38:2:153:153:153m❯\u00a0\033[mrun the tests\n" + rule
+    check("a grey suggested prompt doesn't count as a draft",
+          composer_text(drop_placeholders(suggested)) == "", repr(drop_placeholders(suggested)))
+    check("text typed in the normal colour still counts",
+          composer_text(drop_placeholders(typed)) == "run the tests", repr(drop_placeholders(typed)))
+    agy_rule = "─" * 40 + "\n"
+    agy_hint = "? for shortcuts\n"
+    agy_empty = "scrollback\n> a quoted line in a reply\n" + agy_rule + ">\n" + agy_rule + agy_hint
+    agy_draft = agy_rule + "> integrate gravity\n" + agy_rule + agy_hint
+    agy_wrap = agy_rule + "> integrate\ngravity usage\n" + agy_rule + agy_hint
+    check("an empty Antigravity composer is safe to paste into",
+          composer_text(agy_empty) == "", repr(composer_text(agy_empty)))
+    check("an Antigravity draft blocks the paste",
+          composer_text(agy_draft) == "integrate gravity", repr(composer_text(agy_draft)))
+    check("a wrapped Antigravity draft blocks the paste",
+          composer_text(agy_wrap) == "integrate\ngravity usage", repr(composer_text(agy_wrap)))
+    agy_coloured = ("\033[38:2:65:72:104m" + "─" * 40 + "\033[m\n"
+                    "\033[38:2:122:162:247m> \033[mintegrate gravity\n"
+                    "\033[38:2:65:72:104m" + "─" * 40 + "\033[m\n"
+                    "\033[38:2:126:134:173m? for shortcuts\033[m\n")
+    check("Antigravity's coloured prompt keeps typed text and drops the hint",
+          composer_text(drop_placeholders(agy_coloured)) == "integrate gravity",
+          repr(drop_placeholders(agy_coloured)))
+    app_text = render([{"from": "grok", "to": "alice", "time": "2026-11-24 02:50:00", "text": "hi"}], "alice")
+    run(["hook", "--source", "grok", "--event", "SessionStart"], "grok", "{}", {"GROK_HOOK_EVENT": "session_start"})
+    acts = [json.loads(l) for l in Path(f"{tmp}/data/activity.jsonl").read_text().splitlines()]
+    check("state changes are written to the activity log",
+          any(a["seat"] == "grok" and a["state"] == "idle" for a in acts), str(acts[-3:]))
+    run(["send", "gravity", "hello gravity"], "claude")
+    r = run(["hook", "--source", "agy", "--event", "PreInvocation"], "gravity",
+            '{"invocationNum": 0, "lastUserInput": "go"}')
+    out = json.loads(r.stdout or "{}")
+    check("gravity gets notes before a model call, as a system message",
+          "hello gravity" in json.dumps(out) and "injectSteps" in out, r.stdout + r.stderr)
+    run(["send", "gravity", "second for gravity"], "claude")
+    r = run(["hook", "--source", "agy", "--event", "Stop"], "gravity", '{"fullyIdle": true}')
+    out = json.loads(r.stdout or "{}")
+    check("gravity's Stop continues the turn with a waiting note",
+          out.get("decision") == "continue" and "second for gravity" in out.get("reason", ""), r.stdout)
+    run(["hook", "--source", "agy", "--event", "Stop"], "gravity", '{"fullyIdle": true}')
+    check("gravity is idle after a Stop with nothing waiting",
+          (read_json(Path(tmp) / "data/seats/gravity.json", {}) or {}).get("state") == "idle")
+    run(["hook", "--source", "agy", "--event", "PreInvocation"], "gravity",
+        '{"invocationNum": 0, "lastUserInput": "stay busy", "modelName": "Gemini 3"}')
+    run(["hook", "--source", "agy", "--event", "Stop"], "gravity",
+        '{"fullyIdle": false, "modelName": "Gemini 3"}')
+    check("gravity stays busy while fullyIdle is false",
+          (read_json(Path(tmp) / "data/seats/gravity.json", {}) or {}).get("state") == "busy")
+    usage = read_json(Path(tmp) / "data/usage/gravity.json", {}) or {}
+    check("gravity's usage row is the model agy reported",
+          usage.get("source") == "gravity-hook"
+          and dig(usage, "data", "model") == {"display_name": "Gemini 3"}, str(usage))
+    granted = grant_gravity_tools({"colorScheme": "kept", "permissions": {"allow": [
+        "mcp(comms-deck/send_message)"]}, "trustedWorkspaces": ["/work"]})
+    allow = granted["permissions"]["allow"]
+    check("gravity install allows the comms-deck tools and keeps other settings",
+          granted["colorScheme"] == "kept" and granted["trustedWorkspaces"] == ["/work"]
+          and all(allow.count(entry) == 1 for entry in GRAVITY_MCP_ALLOW),
+          str(granted))
+    hooks = agy_hooks("comms-deck")["comms-deck"]
+    check("install registers gravity's SessionStart, PreInvocation and Stop",
+          set(hooks) == {"SessionStart", "PreInvocation", "Stop"}
+          and all(hooks[ev][0]["command"].endswith(f"hook --source agy --event {ev}") for ev in hooks),
+          str(hooks))
+    run(["hook", "--source", "grok", "--event", "UserPromptSubmit"], "grok",
+        '{"prompt": "Fix the usage clock\\nand more details"}', {"GROK_HOOK_EVENT": "user_prompt_submit"})
+    acts = [json.loads(l) for l in Path(f"{tmp}/data/activity.jsonl").read_text().splitlines()]
+    check("a new turn records what it's working on", acts[-1].get("doing") == "Fix the usage clock",
+          str(acts[-1]))
+    rpc = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                      "params": {"name": "set_status", "arguments": {"text": "reviewing PR #12"}}}) + "\n"
+    run(["mcp"], "grok", rpc)
+    acts = [json.loads(l) for l in Path(f"{tmp}/data/activity.jsonl").read_text().splitlines()]
+    check("set_status updates what the activity log shows", acts[-1].get("doing") == "reviewing PR #12",
+          str(acts[-1]))
+    act = Path(f"{tmp}/data/activity.jsonl")
+    base = time.time() - 20  # all in the past, so the live entry has run 10 s
+    act.write_text("".join(json.dumps({"time": base + t, "seat": "alice", "state": st, "doing": ""}) + "\n"
+                           for t, st in ((0, "busy"), (0.1, "idle"), (0.2, "busy"), (10, "idle"))))
+    view = recent_activity(10, act)
+    check("flicker under 3 s is left out of the activity view",
+          [r["state"] for r in view] == ["idle", "busy"], str([r["state"] for r in view]))
+    check("activity entries carry timers: a finished span, and a live one",
+          abs(view[1]["duration"] - 9.8) < 0.01 and not view[1]["live"]
+          and view[0]["live"] and 9.5 < view[0]["duration"] < 12,
+          str(view))
+    check("a pasted note's wrapper tags are left out of its description",
+          describe('<pasted_content id="x1">\n[comms-deck] 1 note(s) for claude:\n\nFrom alice at 03:21:\n'
+                   'Alice here, for the owner\n</pasted_content id="x1">') == "note from alice: Alice here, for the owner")
+    check("an activity line never shows a secret",
+          describe("deploy with token: ghp_" + "a" * 30) == "(something private)")
+    check("a delivered note is described by its sender and first line",
+          describe("[comms-deck] 1 note(s) for claude:\n\nFrom grok at 02:58:\nGrok here. Usage clock\nmore")
+          == "note from grok: Grok here. Usage clock")
+    check("a failed app-seat send logs its reason and drops the note text",
+          wake_failure_reason(RuntimeError("no composer")) == "no composer"
+          and wake_failure_reason(RuntimeError(MARK + " 1 note(s) for alice:\nhello")) == "RuntimeError"
+          and wake_failure_reason(RuntimeError("line one\nline two")) == "line one")
+    check("app seats are told to reply in their chat, not with tools",
+          "Reply here in this chat" in app_text and "send_message" not in app_text, app_text)
+    check("Grok's Notification hook matches idle_prompt only",
+          grok_hooks("comms-deck")["hooks"]["Notification"][0].get("matcher") == "idle_prompt")
+    code = "\n".join([
+        "import importlib.machinery as m, importlib.util as u, json",
+        f"l = m.SourceFileLoader('cd', {me!r}); s = u.spec_from_loader('cd', l)",
+        "x = u.module_from_spec(s); l.exec_module(x)",
+        "assert x.reply_target('@claude please') == 'claude'",
+        "assert x.reply_target('@owner no') == 'owner'",
+        "assert x.reply_target('hello') == 'owner'",
+        "assert x.reply_target('  @grok x') == 'grok'",
+        "assert x.reply_target('@bob nope') == 'owner'",
+        "msgs = [{'key':'t1@1','role':'user','text':'old','continued':False},"
+        " {'key':'t1@2','role':'assistant','text':'seen','continued':False}]",
+        "fresh, cur = x.new_assistant_replies(msgs, None)",
+        "assert fresh == [] and cur == 't1@2'",
+        "more = msgs + [{'key':'t1@3','role':'user','text':'note','continued':False},"
+        " {'key':'t1@4','role':'assistant','text':'hello','continued':True},"
+        " {'key':'t1@5','role':'assistant','text':'there','continued':False}]",
+        "fresh, cur = x.new_assistant_replies(more, 't1@2')",
+        "assert len(fresh)==1 and fresh[0]['text']=='hello\\nthere' and fresh[0]['key']=='t1@5' and cur=='t1@5'",
+        "fresh, cur = x.new_assistant_replies(more, 't1@5')",
+        "assert fresh == [] and cur == 't1@5'",
+        "fresh, cur = x.new_assistant_replies(msgs + [{'key':'t1@3','role':'user','text':'note','continued':False}], 't1@2')",
+        "assert fresh == [] and cur == 't1@3'",
+        "idle = {'open': True, 'replying': False, 'composer': ''}",
+        "assert x.app_delivery_allowed({'open':True,'replying':True,'composer':''}, False, {'auto':0}, 'alice') is False",
+        "assert x.app_delivery_allowed({'open':True,'replying':False,'composer':'draft'}, False, {'auto':0}, 'alice') is False",
+        "assert x.app_delivery_allowed(idle, True, {'auto':0}, 'alice') is False",
+        "assert x.app_delivery_allowed(idle, False, {'auto':2}, 'alice') is False",
+        "x.write_json(x.DATA/'inbox'/'alice'/'own.json', {'from':'owner','text':'hi','quiet':False})",
+        "assert x.app_delivery_allowed(idle, False, {'auto':2}, 'alice') is True",
+        "rec = x.usage_record({'used_percentage': 8.169, 'resets_at': 1795882386115})",
+        "week = rec['data']['rate_limits']['seven_day']",
+        "assert rec['source']=='grok-bot'",
+        "assert rec['data']['model']['display_name']=='account usage, shared by all bots'",
+        "assert abs(week['used_percentage']-8.169)<1e-9 and week['resets_at']==1795882386",
+        "assert x.usage_record({'used_percentage': True, 'resets_at': 1}) is None",
+        "payload, mask = b'hello-frame', b'\\x11\\x22\\x33\\x44'",
+        "fin, op, body, rest = x.ws_parse_frame(x.ws_client_frame(1, payload, mask))",
+        "assert fin and op==1 and body==payload and rest==b''",
+        "assert x.ws_mask(x.ws_mask(payload, mask), mask)==payload",
+        "raw = bytes([0x81, len(payload)]) + payload",
+        "assert x.ws_parse_frame(raw)[2]==payload",
+        "threw = False",
+        "try:",
+        "    x.cdp_connect('ws://10.1.2.3:9222/devtools/page/abc')",
+        "except RuntimeError:",
+        "    threw = True",
+        "assert threw",
+        "base = [{'key':'t9@1','role':'assistant','text':'history','continued':False}]",
+        "x.file_app_replies('alice', {}, {'replying': False, 'messages': base})",
+        "st = x.load_seat('alice')",
+        "assert st.get('app_cursor')=='t9@1' and not st.get('app_primed')",
+        "grown = base + [{'key':'t9@2','role':'assistant','text':'caught up','continued':False}]",
+        "x.file_app_replies('alice', st, {'replying': False, 'messages': grown})",
+        "st = x.load_seat('alice')",
+        "assert st.get('app_primed') is True and st.get('app_cursor')=='t9@2'",
+        "log = (x.DATA/'log.jsonl').read_text() if (x.DATA/'log.jsonl').exists() else ''",
+        "assert 'caught up' not in log and 'history' not in log",
+        "new = grown + [{'key':'t9@3','role':'assistant','text':'@claude the port is up','continued':False}]",
+        "x.file_app_replies('alice', st, {'replying': False, 'messages': new})",
+        "st = x.load_seat('alice')",
+        "assert st.get('app_cursor')=='t9@3'",
+        "box = list((x.DATA/'inbox'/'claude').glob('*.json'))",
+        "assert len(box)==1",
+        "filed = json.loads(box[0].read_text())",
+        "assert filed['from']=='alice' and filed['to']=='claude' and filed['text']=='@claude the port is up'",
+        "user = new + [{'key':'t9@4','role':'user','text':'typed note','continued':False}]",
+        "x.file_app_replies('alice', st, {'replying': False, 'messages': user})",
+        "assert x.load_seat('alice').get('app_cursor')=='t9@4'",
+        "assert len(list((x.DATA/'inbox'/'claude').glob('*.json')))==1",
+        "x.update_seat('alice', state='idle', app_seen=x.time.time())",
+        "assert x.app_seat_state('alice')=='idle'",
+        "print('ok')",
+    ])
+    r = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True, timeout=30)
+    check("app seat replies, guards, usage and websocket mask",
+          r.returncode == 0 and r.stdout.strip() == "ok", r.stdout + r.stderr)
+    shutil.rmtree(tmp, ignore_errors=True)
+    print(f"\n{'all passed' if not failures else f'{len(failures)} failed'}")
+    return 1 if failures else 0
+
+
+# -----------------------------------------------------------------------------
+# SECTION 13: command line
+# -----------------------------------------------------------------------------
+
+
+def main():
+    parser = argparse.ArgumentParser(prog="comms-deck", description=__doc__.split("\n")[0])
+    parser.add_argument("--from", dest="sender", help="send as this seat")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+    p = sub.add_parser("send")
+    p.add_argument("to")
+    p.add_argument("text", nargs="+")
+    p.add_argument("--quiet", action="store_true")
+    p.add_argument("--private", action="store_true")
+    p = sub.add_parser("read")
+    p.add_argument("--peek", action="store_true", help="show without taking")
+    p = sub.add_parser("note")
+    p.add_argument("text", nargs="+")
+    sub.add_parser("status")
+    sub.add_parser("watch")
+    p = sub.add_parser("chat")
+    p.add_argument("--hide-private", action="store_true")
+    p.add_argument("--history", type=int, default=200)
+    sub.add_parser("serve")
+    sub.add_parser("mcp")
+    p = sub.add_parser("hook")
+    p.add_argument("--source", required=True, choices=("claude", "grok", "agy"))
+    p.add_argument("--event", default="")
+    p = sub.add_parser("statusline")
+    p.add_argument("--source", required=True, choices=("claude", "grok", "agy"))
+    p = sub.add_parser("install")
+    p.add_argument("--yes", action="store_true")
+    sub.add_parser("self-test")
+    args = parser.parse_args()
+
+    def me():
+        seat = args.sender or find_agent()[0]
+        if not seat:
+            sys.exit("comms-deck: can't tell which seat you are; use --from <seat>")
+        return seat
+
+    try:
+        if args.cmd == "send":
+            text = " ".join(args.text)
+            if text == "-":
+                text = sys.stdin.read()
+            record, warning = send(me(), args.to, text, args.quiet, args.private)
+            print(f"sent to {record['to']}" + (" (private)" if record["private"] else ""))
+            if warning:
+                print(warning)
+        elif args.cmd == "read":
+            seat = me()
+            notes = [r for _, r in pending(seat)] if args.peek else take(seat)
+            print(render(notes, seat) if notes else "No notes waiting.")
+        elif args.cmd == "note":
+            add_note(me(), " ".join(args.text))
+            print("added to the commentary")
+        elif args.cmd == "status":
+            print(status_text())
+        elif args.cmd == "watch":
+            watch()
+        elif args.cmd == "chat":
+            chat(args.history, args.hide_private)
+        elif args.cmd == "serve":
+            serve()
+        elif args.cmd == "mcp":
+            mcp()
+        elif args.cmd == "hook":
+            try:
+                hook(args.source, args.event)
+            except Exception as error:  # a hook must never break the agent
+                print(f"comms-deck hook: {error}", file=sys.stderr)
+        elif args.cmd == "statusline":
+            try:
+                statusline(args.source)
+            except Exception as error:  # a status line must never break the agent
+                print(f"comms-deck: {error}")
+        elif args.cmd == "install":
+            install(args.yes)
+        elif args.cmd == "self-test":
+            sys.exit(self_test())
+    except ValueError as error:
+        sys.exit(f"comms-deck: {error}")
+    except KeyboardInterrupt:
+        pass
+
+
+if __name__ == "__main__":
+    main()
