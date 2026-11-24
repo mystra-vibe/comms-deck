@@ -2391,11 +2391,24 @@ def short_tokens(n):
     return f"{n:.0f}"
 
 
-def when(ts):
-    """A reset time as 'at 03:00' today, or 'Fri 18:00' later on."""
-    t = time.localtime(ts)
-    same_day = time.strftime("%Y%m%d", t) == time.strftime("%Y%m%d")
-    return time.strftime("%H:%M" if same_day else "%a %H:%M", t)
+def when(ts, now=None):
+    """A time for the panel: '15:02' today, 'tomorrow 15:02', 'Wed 15:02' up to
+    6 days away, 'Dec 9 15:02' further (agreed with Alice, 08:18).
+
+    Past times (an agent's 'since') use the weekday within 6 days, else the date.
+    """
+    import datetime
+    now = time.time() if now is None else now
+    t = datetime.datetime.fromtimestamp(ts)
+    days = (t.date() - datetime.datetime.fromtimestamp(now).date()).days
+    clock = t.strftime("%H:%M")
+    if days == 0:
+        return clock
+    if days == 1:
+        return f"tomorrow {clock}"
+    if abs(days) <= 6:
+        return f"{t.strftime('%a')} {clock}"
+    return f"{t.strftime('%b')} {t.day} {clock}"
 
 
 def ago(seconds):
@@ -3930,6 +3943,12 @@ def self_test():
         "assert x.spent_mark('gravity') is None",
         "try:\n    x.mark_spent('nobody', '+1h', 'claude'); raise SystemExit('bad seat accepted')\nexcept ValueError: pass",
         "try:\n    x.parse_until('soonish', now); raise SystemExit('bad time accepted')\nexcept ValueError: pass",
+        "base = dt.datetime(2026, 11, 24, 8, 0).timestamp()",
+        "assert x.when(dt.datetime(2026, 11, 24, 15, 2).timestamp(), base) == '15:02'",
+        "assert x.when(dt.datetime(2026, 11, 25, 15, 2).timestamp(), base) == 'tomorrow 15:02'",
+        "assert x.when(dt.datetime(2026, 11, 30, 5, 12).timestamp(), base) == 'Mon 05:12'",
+        "assert x.when(dt.datetime(2026, 12, 9, 15, 2).timestamp(), base) == 'Dec 9 15:02'",
+        "assert x.when(dt.datetime(2026, 11, 22, 18, 0).timestamp(), base) == 'Sun 18:00'",
         "assert x.poll_countdown({}, now) == \"hasn't checked yet\"",
         "assert x.poll_countdown({'polled_at': now - 18}, now) == 'next check in 0:42'",
         "assert x.poll_countdown({'polled_at': now - 125, 'poll_gap': 60}, now) == 'check late 1:05'",
