@@ -254,7 +254,9 @@ def append_log(record):
 
 
 def notify(title, body):
-    """Show a desktop notification. Never fails."""
+    """Show a desktop notification. Never fails. Off under the self-test."""
+    if setting("NO_NOTIFY"):
+        return
     try:
         subprocess.run(["notify-send", "-a", "comms-deck", title, body[:400]],
                        timeout=5, capture_output=True)
@@ -718,7 +720,7 @@ def render(records, seat):
     if seat in APP_SEATS:
         # An app seat reads this in its own chat and has no comms-deck tools:
         # its chat reply is picked up and filed, so tell it how that works.
-        who = senders[0] if senders else "owner"
+        who = "owner" if "owner" in senders or not senders else senders[0]  # not just the first alphabetically
         return (f"{MARK} {len(records)} note(s) for {seat}:\n\n" + "\n\n".join(lines)
                 + f"\n\nReply here in this chat. Your reply goes to {'the owner' if who == 'owner' else who}"
                   " on the comms-deck screen; start it with @claude, @grok or another seat to send it"
@@ -1883,9 +1885,12 @@ def deliver_app_notes(seat, state, cdp):
         cdp_eval(cdp, _SCROLL_JS)
         time.sleep(0.2)
         # The bubble has to be a user message. An empty composer alone can mean the insert missed.
-        landed = cdp_eval(cdp, "(() => [...document.querySelectorAll('.sand-message')]"
-                          ".some(m => m.getAttribute('data-role')==='user' && (m.innerText||'').includes("
-                          + json.dumps(marker) + ")))()")
+        # Compare with runs of whitespace collapsed: the chat renders blank lines
+        # differently, and a strict match called a sent note failed and sent it twice.
+        landed = cdp_eval(cdp, "(() => { const squash = t => (t||'').replace(/\\s+/g,' ').trim();"
+                          " const want = squash(" + json.dumps(marker) + ");"
+                          " return [...document.querySelectorAll('.sand-message')]"
+                          ".some(m => m.getAttribute('data-role')==='user' && squash(m.innerText).includes(want)); })()")
         if not landed:
             raise RuntimeError("the note never reached the chat")
     except Exception as error:
@@ -1919,13 +1924,18 @@ def drive_app_seat(seat, cdp, focused):
     changes, stale = draft_status(state, snap.get("composer"), time.time())
     if changes:
         state.update(update_seat(seat, **changes))
-    if stale and waiting and focused is False and not snap.get("replying"):
+    leftover = (snap.get("composer") or "").startswith(MARK)  # the deck's own text from a failed send
+    if (stale or leftover) and waiting and focused is False and not snap.get("replying"):
         draft = snap.get("composer") or ""
         minutes = int((time.time() - float(state.get("app_draft_since") or time.time())) // 60)
         cdp_eval(cdp, _FOCUS_JS)
         app_clear_composer(cdp)
         time.sleep(0.2)
-        if not (composer_text_now(cdp) or "").strip():
+        if not (composer_text_now(cdp) or "").strip() and leftover:
+            log(f"{seat}: cleared the deck's own text left from a failed send")
+            state.update(update_seat(seat, app_draft="", app_draft_since=0))
+            snap["composer"] = ""
+        elif not (composer_text_now(cdp) or "").strip():
             send("deck", "owner", f"{seat.title()}'s chat box held an unsent draft for {minutes} minutes, "
                                   f"so no notes could be typed in. I cleared it; here is what it said:\n\n{draft}",
                  private=True)
@@ -2191,12 +2201,8 @@ def queue_actions(record):
 
 
 def free_agent():
-    """The agent to hand a task to: an idle one first, then a busy one."""
-    for want in ("idle", "busy"):
-        for seat in ("claude", "grok", "gravity"):
-            if seat in AGENTS and load_seat(seat)["state"] == want:
-                return seat
-    return "claude"
+    """The agent to hand a task to: the most available, as ACTIVITY ranks them."""
+    return most_available()
 
 
 def run_action(asker, request, private=False):
@@ -2456,6 +2462,53 @@ def countdown(reset, now=None):
     return f"back in {minutes}m {seconds:02d}s"
 
 
+def idle_until(reset, now=None):
+    """'idle until Tue 05:08 · 6d 21h 53m': when a spent agent is back, and how long that is."""
+    if reset is None or reset == math.inf:
+        return "idle until its limit resets"
+    return f"idle until {when(reset)} · {countdown(reset, now)[len('back in '):]}"
+
+
+# The ACTIVITY list is sorted by how available each agent is, most available
+# first (the owner's ranking): ready, busy, stuck, idle until its limit
+# resets; then the rows that can't take work at all. Within a level, fewer
+# notes waiting ranks higher (each one weighs an agent down); then seat order.
+AVAILABILITY = {"ready": 0, "busy": 1, "stuck": 3, "draft in box": 3, "spent": 4,
+                "away": 5, "chat not open": 6, "not connected": 6, "no chat yet": 6, "not set up": 6}
+
+
+def availability(seat, state, now=None):
+    """How available `seat` is, as the ACTIVITY panel shows it and the router uses it.
+
+    One function for both, so the screen always shows who the next task
+    would go to. `state` is the seat file's state (or an app seat's). Returns
+    a dict: rank (level, notes waiting; lower is more available), word
+    ("ready", "busy", "stuck", "spent", ...), mark, shade, waiting, usage.
+    """
+    usage = (read_json(DATA / "usage" / f"{seat}.json") or {}).get("data") or {}
+    waiting = len(pending(seat))
+    mark, word, shade = activity_view(state, usage, now, waiting=waiting, marked=spent_mark(seat, now))
+    word = "ready" if word == "idle" else word  # the owner's word: idle means out of usage now
+    return {"rank": (AVAILABILITY.get(word, 6), waiting), "word": word, "mark": mark,
+            "shade": shade, "waiting": waiting, "usage": usage}
+
+
+ROUTABLE = ("claude", "grok", "gravity")  # agents a task can be handed to (not codex or app seats)
+
+
+def most_available(seats=ROUTABLE, now=None):
+    """The seat a task should go to: the best availability() rank that can take
+    work (ready, busy or stuck). If none can, the least encumbered of claude and
+    grok, so a task is never dropped; their notes wait until they're back."""
+    ranked = [(availability(s, load_seat(s)["state"], now)["rank"], i, s)
+              for i, s in enumerate(seats) if s in AGENTS]
+    usable = [r for r in ranked if r[0][0] <= AVAILABILITY["stuck"]]
+    if usable:
+        return min(usable)[2]
+    fallback = [(r[0][1], r[1], r[2]) for r in ranked if r[2] in ("claude", "grok")]
+    return min(fallback)[2] if fallback else "claude"
+
+
 def parse_until(text, now=None):
     """A reset time from '+166h', '+90m', '+2d', '06:20' (the next one), or 'YYYY-MM-DD HH:MM'."""
     import datetime
@@ -2512,7 +2565,7 @@ def activity_view(state, usage_data, now=None, waiting=0, marked=None):
     seat file, so wake and the loop guard still see idle, busy or away.
     """
     if limit_spent(usage_data, now) or marked is not None:
-        return "○", "spent", 196  # a red empty circle: out of usage, not working (the owner's choice)
+        return "○", "spent", 245  # a grey empty circle: out of usage until its reset (the owner's choice)
     mark, shade, word = row_status(state, waiting)
     return mark, (word or "")[:13], shade
 
@@ -2606,21 +2659,21 @@ def usage_panel(width):
     # from activity_view, which can say spent (a full plan limit, from the
     # agent's meter or a mark set with `comms-deck spent`) or stuck (idle
     # with notes waiting) while the seat file stays as it was. Spent beats
-    # stuck. Under the row, one line lists notes still in the inbox. Only a
+    # stuck. The blue squares count the notes waiting (the owner asked for no
+    # line of note text under the row). Only a
     # spent row counts down to its reset. Seconds show only in the last hour,
     # so only then does the screen redraw every second; otherwise every 2 s,
     # as before. (The history stays in activity.jsonl.)
     lines.append("\033[1mACTIVITY\033[0m")
     lines.append("")
     usage_panel.ticking = False
-    for seat, st, since in current_states():
-        usage = (read_json(DATA / "usage" / f"{seat}.json") or {}).get("data") or {}
-        notes = pending(seat)
-        waiting = len(notes)
-        mark, word, shade = activity_view(st, usage, waiting=waiting, marked=spent_mark(seat))
+    rows = []
+    for order, (seat, st, since) in enumerate(current_states()):
+        a = availability(seat, st)
+        usage, waiting, mark, word, shade = a["usage"], a["waiting"], a["mark"], a["word"], a["shade"]
         if word == "spent":
             reset = spent_reset(usage, spent_mark(seat))
-            began = countdown(reset)
+            began = idle_until(reset)
             if reset is not None and reset - time.time() < 3600:
                 usage_panel.ticking = True  # seconds are shown only in the last hour
         elif seat in APP_SEATS and APP_PROCESS.get(seat, "grok-bot") != "grok-bot" and st != "not set up":
@@ -2630,12 +2683,11 @@ def usage_panel(width):
             began = when(since) if since else ""  # static: "03:27" today, "Fri 18:00" otherwise
         squares = "■" * min(waiting, 5) + (f"+{waiting - 5}" if waiting > 5 else "")
         state_text = f"{mark} {began}" if word == "spent" else f"{mark} {word:9}\033[0m \033[2m{began}"
-        lines.append(f"  \033[38;5;{colour(seat)}m{seat.title():8}\033[0m "
+        rows.append((*a["rank"], order,
+                     f"  \033[38;5;{colour(seat)}m{seat.title():8}\033[0m "
                      f"\033[38;5;{shade}m{state_text}\033[0m"
-                     + (f" \033[38;5;33m{squares}\033[0m" if squares else ""))
-        summary = waiting_summary(notes)
-        if summary:
-            lines.append(f"    \033[2m{summary}\033[0m")
+                     + (f" \033[38;5;33m{squares}\033[0m" if squares else "")))
+    lines += [row[-1] for row in sorted(rows)]
     return [fit(" " + line, width) for line in lines]
 
 
@@ -3334,6 +3386,7 @@ def install(yes):
 def self_test():
     """Check the mailbox, hooks, loop guard and MCP server. Exit 1 on failure."""
     tmp = tempfile.mkdtemp(prefix="comms-deck-test-")
+    os.environ["COMMS_DECK_NO_NOTIFY"] = "1"  # test notes to the owner must not pop up on the desktop
     env = dict(os.environ, COMMS_DECK_HOME=f"{tmp}/data", COMMS_DECK_CONFIG=f"{tmp}/config",
                COMMS_DECK_AUTO_LIMIT="2")
     me = str(Path(__file__).resolve())
@@ -3695,6 +3748,10 @@ def self_test():
         "ch, st = x.draft_status({'app_draft': 'w', 'app_draft_since': 1000.0}, 'wh', 5000.0); assert ch['app_draft_since'] == 5000.0 and not st",
         "ch, st = x.draft_status({'app_draft': 'w', 'app_draft_since': 1000.0}, '', 5000.0); assert ch == {'app_draft': '', 'app_draft_since': 0} and not st",
         "ch, st = x.draft_status({}, None, 5000.0); assert ch == {} and not st",
+        "two = [{'from':'owner','to':'alice','time':'2026-11-24 07:00:00','text':'hi'},"
+        " {'from':'gravity','to':'all','time':'2026-11-24 07:00:00','text':'yo'}]",
+        "x.APP_SEATS = tuple(set(x.APP_SEATS) | {'alice'})",
+        "assert 'Your reply goes to the owner' in x.render(two, 'alice')",
         "assert x.app_delivery_allowed({'open':True,'replying':False,'composer':'draft'}, False, {'auto':0}, 'alice') is False",
         "assert x.app_delivery_allowed(idle, True, {'auto':0}, 'alice') is False",
         "assert x.app_delivery_allowed(idle, False, {'auto':2}, 'alice') is False",
@@ -3765,7 +3822,7 @@ def self_test():
         "assert x.limit_spent({'rate_limits': {'five_hour': full(past), 'seven_day': full(future)}}, now)",
         "assert x.limit_spent({'rate_limits': {'five_hour': full((future) * 1000)}}, now)",
         "assert not x.limit_spent({'rate_limits': {'five_hour': {'used_percentage': True, 'resets_at': future}}}, now)",
-        "assert x.activity_view('idle', {'rate_limits': {'five_hour': full(future)}}, now) == ('○', 'spent', 196)",
+        "assert x.activity_view('idle', {'rate_limits': {'five_hour': full(future)}}, now) == ('○', 'spent', 245)",
         "assert x.activity_view('busy', {'rate_limits': {'five_hour': full(past)}}, now)[1] == 'busy'",
         "assert x.activity_view('idle', {}, now, waiting=3) == ('●', 'stuck', 196)",
         "assert x.activity_view('idle', {'rate_limits': {'five_hour': full(future)}}, now, waiting=3)[1] == 'spent'",
@@ -3775,6 +3832,22 @@ def self_test():
         "assert x.countdown(now + 3600 + 12*60 + 5, now) == 'back in 1h 12m 05s'",
         "assert x.countdown(now + 42*60 + 5, now) == 'back in 42m 05s'",
         "assert x.countdown(float('inf'), now) == 'back: time unknown'",
+        "assert x.idle_until(now + 6*86400 + 19*3600 + 12*60 + 7, now).endswith(' · 6d 19h 12m')",
+        "assert x.idle_until(now + 6*86400, now).startswith('idle until ')",
+        "assert x.idle_until(float('inf'), now) == 'idle until its limit resets'",
+        "assert sorted(['spent', 'stuck', 'ready', 'busy', 'away'], key=x.AVAILABILITY.get) == ['ready', 'busy', 'stuck', 'spent', 'away']",
+        "for s, st in (('claude', 'busy'), ('grok', 'idle'), ('gravity', 'idle')): x.update_seat(s, state=st)",
+        "x.mark_spent('gravity', '+2h', 'claude')",
+        "assert x.availability('gravity', 'idle')['word'] == 'spent'",
+        "assert x.availability('grok', 'idle')['word'] == 'ready'",
+        "assert x.most_available() == 'grok'",  # gravity's file says idle, but she is spent
+        "x.update_seat('grok', state='busy')",
+        "x.write_json(x.DATA / 'inbox' / 'claude' / 'z1.json', {'from': 'owner', 'text': 'a', 'time': '2026-11-24 07:00:00'})",
+        "assert x.most_available() == 'grok'",  # both busy: fewer notes waiting wins
+        "x.mark_spent('claude', '+1h', 'claude'); x.mark_spent('grok', '+1h', 'claude')",
+        "assert x.most_available() == 'grok'",  # nobody can work: the less encumbered of claude and grok
+        "for s in ('claude', 'grok', 'gravity'): x.mark_spent(s, 'clear', 'claude')",
+        "(x.DATA / 'inbox' / 'claude' / 'z1.json').unlink()",
         "assert x.parse_until('+166h', now) == now + 166*3600",
         "assert x.parse_until('+90m', now) == now + 5400",
         "import datetime as dt",
