@@ -40,12 +40,13 @@
 #      - An agent that is WORKING gets its notes from its own Stop hook: when
 #        it is about to end a turn and a note is waiting, the hook hands the
 #        note over and the agent carries on. With an empty inbox the hook
-#        costs nothing.
+#        costs nothing. Stop does not decide idle; Grok's idle_prompt does.
 #      - An agent that is IDLE is woken by `comms-deck serve`, which uses
 #        kitty's remote control to paste the note into that agent's exact
-#        window. Focus never moves. If the owner is in that window right now,
-#        nothing is typed: the note waits, and is handed over with the
-#        owner's next prompt (Claude) or at the end of that turn (any agent).
+#        window. Focus never moves. If the owner is in that window, or a draft
+#        is already typed there, nothing is pasted: the note waits, and is
+#        handed over with the owner's next prompt (Claude) or at the end of
+#        that turn (any agent).
 #      - Hooks keep a small state file per seat (busy / idle, and which kitty
 #        window it lives in), so the service knows who can be woken.
 #
@@ -92,6 +93,7 @@
 #
 # Written by: Claude (2026-11-24), replacing relay-protocol, scheduler and
 # relay-watch (joint work by Grok, Codex and Claude; see CREDITS.md).
+# Hook idle rules, promptId, and the kitty draft check: Grok (2026-11-24).
 
 import argparse
 import fcntl
@@ -500,13 +502,46 @@ def render(records, seat):
 #
 # Events used, and what each does:
 #   SessionStart       remember the window; Claude is told about waiting notes
-#   UserPromptSubmit   mark busy; reset the loop count if the owner typed it;
-#                      Claude also gets any waiting notes added to the prompt
-#   Stop               if a note is waiting: hand it over and keep working;
-#                      otherwise mark idle
-#   StopCancelled      (Grok) the turn was interrupted: mark idle
-#   Notification       idle_prompt: mark idle
+#   UserPromptSubmit   mark busy; record promptId; reset the loop count if the
+#                      owner typed it. Claude also gets waiting notes.
+#   Stop               hand over a waiting note and keep working. Never marks
+#                      idle. channel_closed / shutdown mark away.
+#   StopCancelled      a late cancel can arrive after the next prompt, so this
+#                      does not mark idle. Older promptIds are ignored on Stop.
+#   Notification       idle_prompt only: mark idle. StopFailure is not hooked:
+#                      idle_prompt also fires after an errored turn.
 #   SessionEnd         mark away
+#
+# A child session's events carry subagentType. They are not this seat's.
+
+
+def event_prompt_id(data):
+    """The turn id on a hook payload, or None. Grok's field is promptId."""
+    value = data.get("promptId")
+    if value is None or value == "":
+        return None
+    return str(value)
+
+
+def turn_relation(state, data):
+    """How this event sits against the newest promptId for the seat.
+
+    'session' has no promptId (idle_prompt, a session-end Stop): act on it.
+    'older' belongs to a turn that UserPromptSubmit has already moved past.
+    'current' is the newest turn, or the first id this seat has seen.
+    """
+    pid = event_prompt_id(data)
+    if pid is None:
+        return "session"
+    newest = state.get("prompt_id")
+    if newest and pid != str(newest):
+        return "older"
+    return "current"
+
+
+def paused_for_background(data):
+    """True if this Stop is a pause for work that will wake the session."""
+    return bool(data.get("backgroundTasks") or data.get("sessionCrons"))
 
 
 def hook(source, event):
@@ -519,6 +554,8 @@ def hook(source, event):
     except ValueError:
         data = {}
     event = event or data.get("hook_event_name") or ""
+    if data.get("subagentType"):
+        return
     seat, pid = find_agent()
     if seat not in AGENTS:
         return
@@ -532,19 +569,32 @@ def hook(source, event):
 
     if event == "SessionStart":
         remember_window(seat, pid)
-        update_seat(seat, state="idle", auto=0)
+        update_seat(seat, state="idle", auto=0, prompt_id=None)
         count = len(pending(seat))
         if count and source == "claude":
             reply({"hookSpecificOutput": {"hookEventName": "SessionStart",
                    "additionalContext": f"{MARK} {count} note(s) are waiting for you "
                                         f"({seat}). Read them with read_messages."}})
     elif event == "UserPromptSubmit":
-        prompt = str(data.get("prompt") or data.get("userPrompt") or "")
-        woke = time.time() - float(state.get("woke_at") or 0) < 10
-        automatic = prompt.lstrip().startswith(MARK) or woke
-        update_seat(seat, state="busy", auto=state["auto"] if automatic else 0,
-                    woke_at=0)
-        if source == "claude" and not automatic:
+        # The text field is `prompt`. A missing key must not look like the
+        # owner typed something, or the loop guard resets on every such event.
+        if "prompt" in data and data.get("prompt") is not None:
+            prompt = str(data.get("prompt"))
+            woke = time.time() - float(state.get("woke_at") or 0) < 10
+            automatic = prompt.lstrip().startswith(MARK) or woke
+            auto = state["auto"] if automatic else 0
+            owner_typed = not automatic
+        else:
+            auto = state["auto"]
+            owner_typed = False
+        changes = {"state": "busy", "auto": auto, "woke_at": 0}
+        if auto == 0:
+            changes["paused_notice"] = False
+        prompt_id = event_prompt_id(data)
+        if prompt_id:
+            changes["prompt_id"] = prompt_id
+        update_seat(seat, **changes)
+        if source == "claude" and owner_typed:
             notes = take(seat, limit_chars=HANDOVER_MAX)
             if notes:
                 reply({"hookSpecificOutput": {"hookEventName": "UserPromptSubmit",
@@ -553,19 +603,32 @@ def hook(source, event):
         if data.get("reason") in ("channel_closed", "shutdown"):
             update_seat(seat, state="away")
             return
+        if turn_relation(state, data) == "older":
+            return
+        if paused_for_background(data):
+            return  # the session will wake itself; leave the notes
         if state["auto"] < AUTO_LIMIT or owner_waiting(seat):
             notes = take(seat, include_quiet=False, limit_chars=HANDOVER_MAX)
             if notes:
-                update_seat(seat, state="busy", auto=next_auto(state, notes))
+                new_auto = next_auto(state, notes)
+                changes = {"state": "busy", "auto": new_auto}
+                if new_auto == 0:
+                    changes["paused_notice"] = False
+                update_seat(seat, **changes)
                 reply({"decision": "block", "reason": render(notes, seat)})
                 return
         elif any(not r.get("quiet") for _, r in pending(seat)):
             pause_notice(seat)
+    elif event == "StopCancelled":
+        # Idle waits for idle_prompt. An older cancel must not touch the seat:
+        # Grok can deliver it after the next turn's UserPromptSubmit.
+        return
+    elif event == "Notification":
+        if data.get("notification_type") != "idle_prompt":
+            return
+        if turn_relation(state, data) == "older":
+            return
         update_seat(seat, state="idle")
-    elif event in ("StopCancelled", "Notification"):
-        kind = str(data.get("notification_type") or data.get("type") or data.get("message") or "")
-        if event == "StopCancelled" or "idle" in kind.lower():
-            update_seat(seat, state="idle")
     elif event == "SessionEnd":
         update_seat(seat, state="away")
 
@@ -620,6 +683,79 @@ def window_focused(socket, window_id):
     return None
 
 
+def _is_hbar(line):
+    """True if `line` is a horizontal rule (Claude's composer border)."""
+    text = line.strip()
+    return len(text) >= 8 and set(text) <= set("─━═-")
+
+
+def _after_marker(line):
+    """Text typed after a ❯ or '>' prompt marker, with the box drawing removed."""
+    text = line.replace("│", " ").replace("\u00a0", " ").strip()
+    for marker in ("❯", ">"):
+        if text.startswith(marker):
+            return text[len(marker):].strip()
+    return text
+
+
+def composer_text(screen):
+    """Text already typed in an agent's composer, or None if it can't be seen.
+
+    Grok's composer is the last `│ ❯ … │` line of the input box, plus any
+    wrapped lines before the box closes. Claude Code's is the `❯` line between
+    the two rules at the bottom of the screen. A bare `>` marker uses the
+    next line (Claude Code's composer when the marker sits on its own line).
+    An empty string means the composer is on screen and has no draft.
+    """
+    lines = screen.splitlines()
+    box = None
+    for i, line in enumerate(lines):
+        if "❯" in line and "│" in line:
+            box = i
+    if box is not None:
+        parts = [_after_marker(lines[box])]
+        for line in lines[box + 1:]:
+            if "╰" in line or "╭" in line:
+                break
+            if "│" in line:
+                parts.append(line.replace("│", "").replace("\u00a0", " ").strip())
+            else:
+                break
+        return "\n".join(part for part in parts if part).strip()
+
+    rules = [i for i, line in enumerate(lines) if _is_hbar(line)]
+    if len(rules) >= 2:
+        start, end = rules[-2], rules[-1]
+        middle = lines[start + 1:end]
+        if 0 < end - start <= 8 and any(
+                line.strip().startswith("❯") or line.strip().startswith(">") for line in middle):
+            parts = []
+            for line in middle:
+                stripped = line.strip()
+                if stripped.startswith("❯") or stripped.startswith(">"):
+                    parts.append(_after_marker(line))
+                else:
+                    parts.append(line.replace("\u00a0", " ").strip())
+            return "\n".join(part for part in parts if part).strip()
+
+    marker = None
+    for i, line in enumerate(lines):
+        stripped = line.strip().replace("\u00a0", " ")
+        if stripped.startswith("❯") or stripped == ">" or stripped.startswith("> "):
+            marker = i
+    if marker is None:
+        return None
+    typed = _after_marker(lines[marker])
+    if typed:
+        return typed
+    if marker + 1 >= len(lines):
+        return ""
+    nxt = lines[marker + 1]
+    if _is_hbar(nxt) or "╰" in nxt:
+        return ""
+    return nxt.replace("│", "").replace("\u00a0", " ").strip()
+
+
 def try_wake(seat):
     """If `seat` is idle with a normal note waiting, paste it in. True if done."""
     state = load_seat(seat)
@@ -640,6 +776,18 @@ def try_wake(seat):
         return False
     if focused:
         return False  # the owner may be typing there: wait
+    try:
+        screen = kitty(socket, "get-text", "--match", f"id:{window}")
+    except (RuntimeError, OSError, subprocess.SubprocessError) as error:
+        log(f"not waking {seat}: couldn't read the window ({error})")
+        return False
+    typed = composer_text(screen)
+    if typed is None:
+        log(f"not waking {seat}: couldn't see the prompt line")
+        return False
+    if typed:
+        log(f"not waking {seat}: a draft is already in the prompt")
+        return False
     notes = take(seat, include_quiet=False, limit_chars=HANDOVER_MAX)
     if not notes:
         return False
@@ -1312,11 +1460,21 @@ def claude_hooks(cmd):
 
 
 def grok_hooks(cmd):
-    """The hooks file for ~/.grok/hooks/comms-deck.json."""
-    return {"hooks": {e: [{"hooks": [{"type": "command", "timeout": 10,
-                                      "command": f"{cmd} hook --source grok --event {e}"}]}]
-                      for e in ("SessionStart", "UserPromptSubmit", "Stop", "StopCancelled",
-                                "Notification", "SessionEnd")}}
+    """The hooks file for ~/.grok/hooks/comms-deck.json.
+
+    Notification is matched on idle_prompt only. StopFailure is left out:
+    idle_prompt also fires after an errored turn, and that is what marks idle.
+    """
+    def entry(event, matcher=None):
+        group = {"hooks": [{"type": "command", "timeout": 10,
+                            "command": f"{cmd} hook --source grok --event {event}"}]}
+        if matcher:
+            group["matcher"] = matcher
+        return group
+    events = ("SessionStart", "UserPromptSubmit", "Stop", "StopCancelled", "SessionEnd")
+    hooks = {event: [entry(event)] for event in events}
+    hooks["Notification"] = [entry("Notification", "idle_prompt")]
+    return {"hooks": hooks}
 
 
 def install(yes):
@@ -1524,6 +1682,86 @@ def self_test():
           and not replies[2]["result"]["isError"], r.stdout + r.stderr)
     r = run(["read"], "claude")
     check("note sent over MCP arrives", "via mcp" in r.stdout, r.stdout)
+
+    def seat(name="grok"):
+        return read_json(Path(tmp) / "data" / "seats" / f"{name}.json", {}) or {}
+
+    grok_env = {"GROK_HOOK_EVENT": "stop"}
+    run(["read"], "grok")
+    run(["hook", "--source", "grok", "--event", "UserPromptSubmit"], "grok",
+        '{"prompt": "reset"}', {"GROK_HOOK_EVENT": "user_prompt_submit"})
+    run(["send", "grok", "loop-a"], "claude")
+    run(["hook", "--source", "grok", "--event", "Stop"], "grok", "{}", grok_env)
+    run(["send", "grok", "loop-b"], "claude")
+    run(["hook", "--source", "grok", "--event", "Stop"], "grok", "{}", grok_env)
+    run(["send", "grok", "loop-c"], "claude")
+    run(["hook", "--source", "grok", "--event", "UserPromptSubmit"], "grok",
+        '{"promptId": "keep"}', {"GROK_HOOK_EVENT": "user_prompt_submit"})
+    check("a missing prompt keeps the loop count",
+          seat().get("auto") == 2 and seat().get("prompt_id") == "keep", str(seat()))
+    r = run(["hook", "--source", "grok", "--event", "Stop"], "grok", "{}", grok_env)
+    check("a missing prompt does not lift the loop guard", "loop-c" not in r.stdout, r.stdout)
+    check("Stop does not mark the seat idle", seat().get("state") != "idle", str(seat()))
+    run(["hook", "--source", "grok", "--event", "Notification"], "grok",
+        '{"notification_type": "permission_prompt", "type": "idle_prompt", "message": "idle now"}',
+        {"GROK_HOOK_EVENT": "notification"})
+    check("only notification_type idle_prompt counts", seat().get("state") != "idle", str(seat()))
+    run(["hook", "--source", "grok", "--event", "Notification"], "grok",
+        '{"notification_type": "idle_prompt"}', {"GROK_HOOK_EVENT": "notification"})
+    check("idle_prompt marks the seat idle", seat().get("state") == "idle", str(seat()))
+    run(["hook", "--source", "grok", "--event", "UserPromptSubmit"], "grok",
+        '{"prompt": "next", "promptId": "new"}', {"GROK_HOOK_EVENT": "user_prompt_submit"})
+    check("an owner prompt records promptId and resets the count",
+          seat().get("auto") == 0 and seat().get("prompt_id") == "new"
+          and seat().get("state") == "busy", str(seat()))
+    run(["send", "grok", "for-new"], "claude")
+    r = run(["hook", "--source", "grok", "--event", "Stop"], "grok",
+            '{"promptId": "old"}', grok_env)
+    check("an older Stop does not take the note",
+          "for-new" not in r.stdout and seat().get("state") == "busy", r.stdout + str(seat()))
+    run(["hook", "--source", "grok", "--event", "StopCancelled"], "grok",
+        '{"promptId": "old"}', {"GROK_HOOK_EVENT": "stop_cancelled"})
+    check("an older StopCancelled does not mark idle", seat().get("state") == "busy", str(seat()))
+    r = run(["hook", "--source", "grok", "--event", "Stop"], "grok",
+            '{"promptId": "new", "backgroundTasks": [{"id": "t", "type": "shell"}]}', grok_env)
+    check("Stop leaves notes while background work is in flight",
+          "for-new" not in r.stdout, r.stdout)
+    r = run(["hook", "--source", "grok", "--event", "Stop"], "grok",
+            '{"promptId": "new", "subagentType": "explore"}', grok_env)
+    check("a subagent Stop does not take the note", "for-new" not in r.stdout, r.stdout)
+    r = run(["hook", "--source", "grok", "--event", "Stop"], "grok", '{"promptId": "new"}', grok_env)
+    handed = {}
+    try:
+        handed = json.loads(r.stdout or "{}")
+    except ValueError:
+        pass
+    check("the current Stop hands the note over and stays busy",
+          handed.get("decision") == "block" and "for-new" in r.stdout
+          and seat().get("state") == "busy", r.stdout + str(seat()))
+    run(["hook", "--source", "grok", "--event", "StopCancelled"], "grok",
+        '{"promptId": "new"}', {"GROK_HOOK_EVENT": "stop_cancelled"})
+    check("StopCancelled leaves idle to idle_prompt", seat().get("state") != "idle", str(seat()))
+    run(["hook", "--source", "grok", "--event", "Stop"], "grok",
+        '{"reason": "channel_closed"}', grok_env)
+    check("a session-end Stop marks the seat away", seat().get("state") == "away", str(seat()))
+    run(["hook", "--source", "grok", "--event", "SessionEnd"], "grok", "{}",
+        {"GROK_HOOK_EVENT": "session_end"})
+    check("SessionEnd marks the seat away", seat().get("state") == "away", str(seat()))
+    grok_empty = "╭──╮\n│ ❯" + " " * 8 + "│\n╰──╯\n"
+    grok_draft = "╭──╮\n│ ❯ remember the milk │\n╰──╯\n"
+    grok_wrap = "╭──╮\n│ ❯" + " " * 8 + "│\n│ second line │\n╰──╯\n"
+    claude_empty = "─" * 20 + "\n❯\u00a0\n" + "─" * 20 + "\n"
+    claude_draft = "─" * 20 + "\n❯\u00a0fix the hook\n" + "─" * 20 + "\n"
+    check("an empty Grok composer is safe to paste into", composer_text(grok_empty) == "")
+    check("a Grok draft blocks the paste", composer_text(grok_draft) == "remember the milk")
+    check("a wrapped Grok draft blocks the paste", composer_text(grok_wrap) == "second line")
+    check("an empty Claude composer is safe to paste into", composer_text(claude_empty) == "")
+    check("a Claude draft blocks the paste", composer_text(claude_draft) == "fix the hook")
+    check("Claude's bare > marker uses the next line",
+          composer_text("> \nfix the hook\n") == "fix the hook")
+    check("a screen with no composer is left alone", composer_text("no prompt here\n") is None)
+    check("Grok's Notification hook matches idle_prompt only",
+          grok_hooks("comms-deck")["hooks"]["Notification"][0].get("matcher") == "idle_prompt")
     shutil.rmtree(tmp, ignore_errors=True)
     print(f"\n{'all passed' if not failures else f'{len(failures)} failed'}")
     return 1 if failures else 0
