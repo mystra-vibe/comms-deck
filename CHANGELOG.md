@@ -1,5 +1,35 @@
 # Changelog
 
+## quantum-kittens (2026-11-24)
+
+The easy start guide is [quantum-kittens.md](quantum-kittens.md).
+
+- **Out of usage, with a countdown.** An agent whose plan limit is full
+  shows a grey `○ idle until Tue 05:08 · 6d 21h 52m`, from its usage meter
+  or from `comms-deck spent <seat> <time>` for agents with no meter. It
+  clears itself at the reset (#27).
+- **ACTIVITY sorted by availability.** Ready, busy, stuck, away; then
+  fewest notes waiting; idle until is always last. Idle now reads "ready" (#33).
+- **One availability score** (`availability()`, `most_available()`) for the
+  panel and for picking who gets a task, the base for the load balancer. A
+  spent agent whose seat file still says idle is no longer picked (#34).
+- **Lumo's row**: busy or ready from her own tool calls, and a countdown to
+  her next check (#28).
+- **App-seat delivery fixed.** The "did it land" check ignores whitespace,
+  so a sent batch is no longer typed twice. The deck clears its own
+  leftover text. A draft left untouched for 10 minutes is saved to the
+  owner and cleared; the row says "draft in box" meanwhile. Replies go to
+  the owner, not whichever sender sorts first (#29, #31).
+- **`@deck` desktop actions** from a fixed list; unlisted requests from app
+  seats are refused (#18). **`comms-deck review-check`** (#23).
+- **Chat views** full, half and small (#26), and **scratchpad-keeper**, a
+  user service that keeps the scratchpad arranged at login and when windows
+  change, leaving hand moves alone (#32).
+- **Under each ACTIVITY row, six words on what is outstanding**: what the
+  agent says it is doing while busy, otherwise the oldest note waiting
+  (a private note shows only "private note"). No count; the blue squares
+  count. The self-test no longer pops up desktop notifications (#31).
+
 ## Unreleased
 
 - **Recovery is written down.** [docs/REDUNDANCY.md](docs/REDUNDANCY.md)
