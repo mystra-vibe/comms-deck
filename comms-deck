@@ -2137,7 +2137,9 @@ def run_action(asker, request, private=False):
     send("deck", agent, f"Task from {asker}, asked of comms-deck: {request}\n\n"
                         f"It isn't one of comms-deck's own actions, so it's yours. Do it on this "
                         f"machine if it's appropriate and your rules allow it, then tell {asker} "
-                        f"the result with send_message.", private=private)
+                        f"the result with send_message"
+                        + (", with private set: this request was private." if private else "."),
+                        private=private)
     log(f"deck: {asker} asked for something not on the list; handed to {agent}")
     return f"that isn't one of my actions, so I've passed it to {agent}"
 
@@ -3326,7 +3328,7 @@ def self_test():
         "x.do_actions()",
         "mine = [json.loads(l) for l in open(x.DATA / 'log.jsonl')]",
         "mine = [g for g in mine if g['from'] == 'deck' and ('example.com/a' in g['text'] or 'make tea' in g['text'])]",
-        "print(json.dumps(sorted([g['text'][:40], g['private']] for g in mine)))",
+        "print(json.dumps(sorted([g['text'][:40], g['private'], 'with private set' in g['text']] for g in mine)))",
     ])
     Path(f"{tmp}/actions-config").mkdir(parents=True, exist_ok=True)
     Path(f"{tmp}/actions-config/app-seats").write_text("alice\n")
@@ -3348,9 +3350,9 @@ def self_test():
           and answers[3].startswith("couldn't do 'workspace'") and "not on the list" in answers[4]
           and len(lines) > 1 and lines[1] == "0", r.stdout + r.stderr)
     check("@deck from the owner: a dry-run https link, a handoff, and both stay private",
-          len(owner_side) == 2 and all(p for _, p in owner_side)
-          and any(t.startswith("done: would open https://example.com/a") for t, _ in owner_side)
-          and any(t.startswith("Task from owner") for t, _ in owner_side), r.stdout + r.stderr)
+          len(owner_side) == 2 and all(p for _, p, _ in owner_side)
+          and any(t.startswith("done: would open https://example.com/a") for t, _, _ in owner_side)
+          and any(t.startswith("Task from owner") and asks for t, _, asks in owner_side), r.stdout + r.stderr)
     check("app seats are told to reply in their chat, not with tools",
           "Reply here in this chat" in app_text and "send_message" not in app_text, app_text)
     check("Grok's Notification hook matches idle_prompt only",
