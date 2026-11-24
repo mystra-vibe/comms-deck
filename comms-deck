@@ -2475,7 +2475,8 @@ def idle_until(reset, now=None):
 
 # The ACTIVITY list is sorted by how available each agent is, most available
 # first (the owner's ranking): ready, busy, stuck, idle until its limit
-# resets; then the rows that can't take work at all. Ties keep seat order.
+# resets; then the rows that can't take work at all. Within a level, fewer
+# notes waiting ranks higher (each one weighs an agent down); then seat order.
 AVAILABILITY = {"ready": 0, "busy": 1, "stuck": 3, "draft in box": 3, "spent": 4,
                 "away": 5, "chat not open": 6, "not connected": 6, "no chat yet": 6, "not set up": 6}
 
@@ -2657,11 +2658,11 @@ def usage_panel(width):
             began = when(since) if since else ""  # static: "03:27" today, "Fri 18:00" otherwise
         squares = "■" * min(waiting, 5) + (f"+{waiting - 5}" if waiting > 5 else "")
         state_text = f"{mark} {began}" if word == "spent" else f"{mark} {word:9}\033[0m \033[2m{began}"
-        rows.append((AVAILABILITY.get(word, 6), order,
+        rows.append((AVAILABILITY.get(word, 6), waiting, order,
                      f"  \033[38;5;{colour(seat)}m{seat.title():8}\033[0m "
                      f"\033[38;5;{shade}m{state_text}\033[0m"
                      + (f" \033[38;5;33m{squares}\033[0m" if squares else "")))
-    lines += [line for _, _, line in sorted(rows)]
+    lines += [row[-1] for row in sorted(rows)]
     return [fit(" " + line, width) for line in lines]
 
 
