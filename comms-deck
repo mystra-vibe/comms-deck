@@ -2590,6 +2590,9 @@ def task_summary(doing, notes, words=6):
         text = record.get("text", "")
     else:
         return ""
+    if looks_secret(text):
+        return "(something private)"  # a key or password never reaches the screen, as in describe()
+    text = redact(text)
     text = re.sub(r"^(task from \w+, asked of comms-deck:|note from \w+:)\s*", "", text.strip(), flags=re.I)
     kept = [w for w in text.split() if not w.startswith(("@", "http://", "https://"))]
     return " ".join(kept[:words]) + (" …" if len(kept) > words else "")
@@ -3866,6 +3869,8 @@ def self_test():
         "assert x.task_summary('', [('p', {'text': '@claude please fix https://x.y the chat layout', 'private': False})]) == 'please fix the chat layout'",
         "assert x.task_summary('', [('p', {'text': 'token stuff', 'private': True})]) == 'private note'",
         "assert x.task_summary('', []) == ''",
+        "assert x.task_summary('deploy with token: ghp_' + 'a' * 30, []) == '(something private)'",
+        "assert x.task_summary('', [('p', {'text': 'key ghp_' + 'b' * 30 + ' now', 'private': False})]) == '(something private)'",
         "assert sorted(['spent', 'stuck', 'ready', 'busy', 'away'], key=x.AVAILABILITY.get) == ['ready', 'busy', 'stuck', 'away', 'spent']",
         "for s, st in (('claude', 'busy'), ('grok', 'idle'), ('gravity', 'idle')): x.update_seat(s, state=st)",
         "x.mark_spent('gravity', '+2h', 'claude')",
