@@ -138,7 +138,7 @@ WEBHOOK_FILE = CONFIG / "discord-webhook"
 
 # Agent seats: the process name each one runs as. Extra seats can be added
 # with COMMS_DECK_SEATS="name:process,name2:process2".
-AGENTS = {"claude": "claude", "grok": "grok", "codex": "codex"}
+AGENTS = {"claude": "claude", "grok": "grok", "codex": "codex", "agy": "agy"}  # agy: Antigravity CLI
 for _pair in filter(None, setting("SEATS", "").split(",")):
     _name, _, _proc = _pair.partition(":")
     AGENTS[_name.strip()] = (_proc or _name).strip()
@@ -650,6 +650,8 @@ def paused_for_background(data):
 
 def hook(source, event):
     """Handle one hook event (JSON on stdin). Prints the reply, if any."""
+    if source == "agy":
+        return agy_hook(event)
     running_in = "grok" if os.environ.get("GROK_HOOK_EVENT") else "claude"
     if source != running_in:
         return  # e.g. Grok reading Claude's settings file: not our hook here
@@ -754,6 +756,72 @@ def next_auto(state, notes):
     if any(r.get("from") == "owner" for r in notes):
         return 0
     return state["auto"] + 1
+
+
+def agy_hook(event):
+    """Hooks for the Antigravity CLI (agy). Its events and replies differ:
+
+      SessionStart   remember the window; say how many notes wait (injectSteps)
+      PreInvocation  runs before every model call. Call 0 is a new turn: mark
+                     busy, and reset the loop guard if the owner typed it.
+                     Waiting notes are handed over here as a system message,
+                     so they arrive mid-turn, not only at the end.
+      Stop           a note waiting: {"decision": "continue", "reason": notes}.
+                     Otherwise idle once fullyIdle says nothing is still running.
+    Payload fields are camelCase (lastUserInput, invocationNum, fullyIdle).
+    """
+    try:
+        data = json.loads(sys.stdin.read() or "{}")
+    except ValueError:
+        data = {}
+    seat, pid = find_agent()
+    if seat != "agy":
+        return  # not running inside agy: not this hook's business
+    state = load_seat(seat)
+    if pid and state.get("pid") != pid:
+        remember_window(seat, pid)
+        state = load_seat(seat)
+
+    def system(text):
+        return {"injectSteps": [{"systemMessage": {"systemMessage": text}}]}
+
+    if event == "SessionStart":
+        remember_window(seat, pid)
+        update_seat(seat, state="idle", auto=0)
+        count = len(pending(seat))
+        if count:
+            print(json.dumps(system(f"{MARK} {count} note(s) are waiting for you (agy). "
+                                    "Read them with the read_messages tool.")))
+    elif event == "PreInvocation":
+        if int(data.get("invocationNum") or 0) == 0:
+            typed = str(data.get("lastUserInput") or "")
+            woke = time.time() - float(state.get("woke_at") or 0) < 10
+            automatic = typed.lstrip().startswith(MARK) or woke or "lastUserInput" not in data
+            update_seat(seat, state="busy", woke_at=0, **({} if automatic else {"auto": 0}))
+            state = load_seat(seat)
+        if state["auto"] < AUTO_LIMIT or owner_waiting(seat):
+            notes = take(seat, limit_chars=HANDOVER_MAX)
+            if notes:
+                update_seat(seat, auto=next_auto(state, notes))
+                print(json.dumps(system(render(notes, seat))))
+    elif event == "Stop":
+        if state["auto"] < AUTO_LIMIT or owner_waiting(seat):
+            notes = take(seat, include_quiet=False, limit_chars=HANDOVER_MAX)
+            if notes:
+                update_seat(seat, state="busy", auto=next_auto(state, notes))
+                print(json.dumps({"decision": "continue", "reason": render(notes, seat)}))
+                return
+        elif any(not r.get("quiet") for _, r in pending(seat)):
+            pause_notice(seat)
+        if data.get("fullyIdle", True):
+            update_seat(seat, state="idle")
+
+
+def agy_hooks(cmd):
+    """The hooks file for ~/.gemini/config/hooks.json (Antigravity)."""
+    return {"comms-deck": {event: [{"type": "command", "timeout": 10,
+                                    "command": f"{cmd} hook --source agy --event {event}"}]
+                           for event in ("SessionStart", "PreInvocation", "Stop")}}
 
 
 def pause_notice(seat):
@@ -2502,6 +2570,21 @@ def install(yes):
         path.write_text(text)
     step("register the MCP server and status line with Grok (~/.grok/config.toml)",
          lambda: mcp_toml(HOME / ".grok/config.toml", "[mcp_servers.comms-deck]", status_line=True))
+    def antigravity():
+        if not (HOME / ".local/bin/agy").exists() and not shutil.which("agy"):
+            return
+        folder = HOME / ".gemini/config"
+        folder.mkdir(parents=True, exist_ok=True)
+        hooks_path = folder / "hooks.json"
+        hooks = read_json(hooks_path, {}) or {}
+        hooks.update(agy_hooks(cmd))
+        hooks_path.write_text(json.dumps(hooks, indent=2) + "\n")
+        mcp_path = folder / "mcp_config.json"
+        config = read_json(mcp_path, {}) or {}
+        config.setdefault("mcpServers", {})["comms-deck"] = {
+            "command": cmd, "args": ["mcp"], "env": {"COMMS_DECK_SEAT": "agy"}}
+        mcp_path.write_text(json.dumps(config, indent=2) + "\n")
+    step("add hooks and the MCP server for Antigravity, if installed (~/.gemini/config)", antigravity)
     step("register the MCP server with Codex, if installed (~/.codex/config.toml)",
          lambda: mcp_toml(HOME / ".codex/config.toml", "[mcp_servers.comms-deck]"))
 
@@ -2736,6 +2819,20 @@ def self_test():
     acts = [json.loads(l) for l in Path(f"{tmp}/data/activity.jsonl").read_text().splitlines()]
     check("state changes are written to the activity log",
           any(a["seat"] == "grok" and a["state"] == "idle" for a in acts), str(acts[-3:]))
+    run(["send", "agy", "hello agy"], "claude")
+    r = run(["hook", "--source", "agy", "--event", "PreInvocation"], "agy",
+            '{"invocationNum": 0, "lastUserInput": "go"}')
+    out = json.loads(r.stdout or "{}")
+    check("agy gets notes before a model call, as a system message",
+          "hello agy" in json.dumps(out) and "injectSteps" in out, r.stdout + r.stderr)
+    run(["send", "agy", "second for agy"], "claude")
+    r = run(["hook", "--source", "agy", "--event", "Stop"], "agy", '{"fullyIdle": true}')
+    out = json.loads(r.stdout or "{}")
+    check("agy's Stop continues the turn with a waiting note",
+          out.get("decision") == "continue" and "second for agy" in out.get("reason", ""), r.stdout)
+    run(["hook", "--source", "agy", "--event", "Stop"], "agy", '{"fullyIdle": true}')
+    check("agy is idle after a Stop with nothing waiting",
+          (read_json(Path(tmp) / "data/seats/agy.json", {}) or {}).get("state") == "idle")
     check("app seats are told to reply in their chat, not with tools",
           "Reply here in this chat" in app_text and "send_message" not in app_text, app_text)
     check("Grok's Notification hook matches idle_prompt only",
@@ -2847,10 +2944,10 @@ def main():
     sub.add_parser("serve")
     sub.add_parser("mcp")
     p = sub.add_parser("hook")
-    p.add_argument("--source", required=True, choices=("claude", "grok"))
+    p.add_argument("--source", required=True, choices=("claude", "grok", "agy"))
     p.add_argument("--event", default="")
     p = sub.add_parser("statusline")
-    p.add_argument("--source", required=True, choices=("claude", "grok"))
+    p.add_argument("--source", required=True, choices=("claude", "grok", "agy"))
     p = sub.add_parser("install")
     p.add_argument("--yes", action="store_true")
     sub.add_parser("self-test")
