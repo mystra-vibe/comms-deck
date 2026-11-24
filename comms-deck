@@ -2269,7 +2269,7 @@ def activity_view(state, usage_data, now=None, waiting=0, marked=None):
     seat file, so wake and the loop guard still see idle, busy or away.
     """
     if limit_spent(usage_data, now) or marked is not None:
-        return "✕", "spent", 196
+        return "○", "spent", 196  # a red empty circle: out of usage, not working (the owner's choice)
     mark, shade, word = row_status(state, waiting)
     return mark, (word or "")[:13], shade
 
@@ -2383,9 +2383,9 @@ def usage_panel(width):
         else:
             began = when(since) if since else ""  # static: "03:27" today, "Fri 18:00" otherwise
         squares = "■" * min(waiting, 5) + (f"+{waiting - 5}" if waiting > 5 else "")
+        state_text = f"{mark} {began}" if word == "spent" else f"{mark} {word:9}\033[0m \033[2m{began}"
         lines.append(f"  \033[38;5;{colour(seat)}m{seat.title():8}\033[0m "
-                     f"\033[38;5;{shade}m{mark} {word:9}\033[0m "
-                     + (f"\033[38;5;196m{began}\033[0m" if word == "spent" else f"\033[2m{began}\033[0m")
+                     f"\033[38;5;{shade}m{state_text}\033[0m"
                      + (f" \033[38;5;33m{squares}\033[0m" if squares else ""))
         summary = waiting_summary(notes)
         if summary:
@@ -3431,7 +3431,7 @@ def self_test():
         "assert x.limit_spent({'rate_limits': {'five_hour': full(past), 'seven_day': full(future)}}, now)",
         "assert x.limit_spent({'rate_limits': {'five_hour': full((future) * 1000)}}, now)",
         "assert not x.limit_spent({'rate_limits': {'five_hour': {'used_percentage': True, 'resets_at': future}}}, now)",
-        "assert x.activity_view('idle', {'rate_limits': {'five_hour': full(future)}}, now) == ('✕', 'spent', 196)",
+        "assert x.activity_view('idle', {'rate_limits': {'five_hour': full(future)}}, now) == ('○', 'spent', 196)",
         "assert x.activity_view('busy', {'rate_limits': {'five_hour': full(past)}}, now)[1] == 'busy'",
         "assert x.activity_view('idle', {}, now, waiting=3) == ('●', 'stuck', 196)",
         "assert x.activity_view('idle', {'rate_limits': {'five_hour': full(future)}}, now, waiting=3)[1] == 'spent'",
