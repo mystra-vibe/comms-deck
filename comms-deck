@@ -2201,12 +2201,8 @@ def queue_actions(record):
 
 
 def free_agent():
-    """The agent to hand a task to: an idle one first, then a busy one."""
-    for want in ("idle", "busy"):
-        for seat in ("claude", "grok", "gravity"):
-            if seat in AGENTS and load_seat(seat)["state"] == want:
-                return seat
-    return "claude"
+    """The agent to hand a task to: the most available, as ACTIVITY ranks them."""
+    return most_available()
 
 
 def run_action(asker, request, private=False):
@@ -2481,6 +2477,38 @@ AVAILABILITY = {"ready": 0, "busy": 1, "stuck": 3, "draft in box": 3, "spent": 4
                 "away": 5, "chat not open": 6, "not connected": 6, "no chat yet": 6, "not set up": 6}
 
 
+def availability(seat, state, now=None):
+    """How available `seat` is, as the ACTIVITY panel shows it and the router uses it.
+
+    One function for both, so the screen always shows who the next task
+    would go to. `state` is the seat file's state (or an app seat's). Returns
+    a dict: rank (level, notes waiting; lower is more available), word
+    ("ready", "busy", "stuck", "spent", ...), mark, shade, waiting, usage.
+    """
+    usage = (read_json(DATA / "usage" / f"{seat}.json") or {}).get("data") or {}
+    waiting = len(pending(seat))
+    mark, word, shade = activity_view(state, usage, now, waiting=waiting, marked=spent_mark(seat, now))
+    word = "ready" if word == "idle" else word  # the owner's word: idle means out of usage now
+    return {"rank": (AVAILABILITY.get(word, 6), waiting), "word": word, "mark": mark,
+            "shade": shade, "waiting": waiting, "usage": usage}
+
+
+ROUTABLE = ("claude", "grok", "gravity")  # agents a task can be handed to (not codex or app seats)
+
+
+def most_available(seats=ROUTABLE, now=None):
+    """The seat a task should go to: the best availability() rank that can take
+    work (ready, busy or stuck). If none can, the least encumbered of claude and
+    grok, so a task is never dropped; their notes wait until they're back."""
+    ranked = [(availability(s, load_seat(s)["state"], now)["rank"], i, s)
+              for i, s in enumerate(seats) if s in AGENTS]
+    usable = [r for r in ranked if r[0][0] <= AVAILABILITY["stuck"]]
+    if usable:
+        return min(usable)[2]
+    fallback = [(r[0][1], r[1], r[2]) for r in ranked if r[2] in ("claude", "grok")]
+    return min(fallback)[2] if fallback else "claude"
+
+
 def parse_until(text, now=None):
     """A reset time from '+166h', '+90m', '+2d', '06:20' (the next one), or 'YYYY-MM-DD HH:MM'."""
     import datetime
@@ -2641,11 +2669,8 @@ def usage_panel(width):
     usage_panel.ticking = False
     rows = []
     for order, (seat, st, since) in enumerate(current_states()):
-        usage = (read_json(DATA / "usage" / f"{seat}.json") or {}).get("data") or {}
-        notes = pending(seat)
-        waiting = len(notes)
-        mark, word, shade = activity_view(st, usage, waiting=waiting, marked=spent_mark(seat))
-        word = "ready" if word == "idle" else word  # the owner's word: idle means out of usage now
+        a = availability(seat, st)
+        usage, waiting, mark, word, shade = a["usage"], a["waiting"], a["mark"], a["word"], a["shade"]
         if word == "spent":
             reset = spent_reset(usage, spent_mark(seat))
             began = idle_until(reset)
@@ -2658,7 +2683,7 @@ def usage_panel(width):
             began = when(since) if since else ""  # static: "03:27" today, "Fri 18:00" otherwise
         squares = "■" * min(waiting, 5) + (f"+{waiting - 5}" if waiting > 5 else "")
         state_text = f"{mark} {began}" if word == "spent" else f"{mark} {word:9}\033[0m \033[2m{began}"
-        rows.append((AVAILABILITY.get(word, 6), waiting, order,
+        rows.append((*a["rank"], order,
                      f"  \033[38;5;{colour(seat)}m{seat.title():8}\033[0m "
                      f"\033[38;5;{shade}m{state_text}\033[0m"
                      + (f" \033[38;5;33m{squares}\033[0m" if squares else "")))
@@ -3811,6 +3836,18 @@ def self_test():
         "assert x.idle_until(now + 6*86400, now).startswith('idle until ')",
         "assert x.idle_until(float('inf'), now) == 'idle until its limit resets'",
         "assert sorted(['spent', 'stuck', 'ready', 'busy', 'away'], key=x.AVAILABILITY.get) == ['ready', 'busy', 'stuck', 'spent', 'away']",
+        "for s, st in (('claude', 'busy'), ('grok', 'idle'), ('gravity', 'idle')): x.update_seat(s, state=st)",
+        "x.mark_spent('gravity', '+2h', 'claude')",
+        "assert x.availability('gravity', 'idle')['word'] == 'spent'",
+        "assert x.availability('grok', 'idle')['word'] == 'ready'",
+        "assert x.most_available() == 'grok'",  # gravity's file says idle, but she is spent
+        "x.update_seat('grok', state='busy')",
+        "x.write_json(x.DATA / 'inbox' / 'claude' / 'z1.json', {'from': 'owner', 'text': 'a', 'time': '2026-11-24 07:00:00'})",
+        "assert x.most_available() == 'grok'",  # both busy: fewer notes waiting wins
+        "x.mark_spent('claude', '+1h', 'claude'); x.mark_spent('grok', '+1h', 'claude')",
+        "assert x.most_available() == 'grok'",  # nobody can work: the less encumbered of claude and grok
+        "for s in ('claude', 'grok', 'gravity'): x.mark_spent(s, 'clear', 'claude')",
+        "(x.DATA / 'inbox' / 'claude' / 'z1.json').unlink()",
         "assert x.parse_until('+166h', now) == now + 166*3600",
         "assert x.parse_until('+90m', now) == now + 5400",
         "import datetime as dt",
