@@ -13,6 +13,8 @@
   comms-deck statusline --source <claude|grok|agy>       status line (feeds the usage panel; agy has none)
   comms-deck install [--yes]                             set this machine up
   comms-deck self-test                                   run the tests in a temp folder
+  comms-deck status --json                               every seat as JSON (for watchdogs)
+  comms-deck wake <seat> [--stale]                       one wake attempt; --stale clears a stuck busy
   comms-deck spent <seat> <+166h|06:20|YYYY-MM-DD HH:MM|clear>
                                                          show a seat spent, counting down to its reset
   comms-deck review-check <PR#>                          fail unless another seat reviewed it
@@ -1194,6 +1196,8 @@ def try_wake(seat):
         return False
     if not any(not r.get("quiet") for _, r in pending(seat)):
         return False
+    if seat_spent(seat):
+        return False  # out of usage: its notes wait in the inbox until the reset, not lost in a dead turn
     if state["auto"] >= AUTO_LIMIT and not owner_waiting(seat):
         pause_notice(seat)
         return False
@@ -3056,6 +3060,68 @@ def context_percent(data):
     return None
 
 
+STALE_BUSY = 600  # a busy seat whose file hasn't changed this long, with notes waiting, is stale
+
+
+def status_json(now=None):
+    """Every seat, for programs (Chronophage): state, why it may be stuck, and ages.
+
+    Plain facts only; the watchdog decides what to do with them.
+    """
+    now = time.time() if now is None else now
+    seats = {}
+    for seat in tuple(AGENTS) + APP_SEATS:
+        s = load_seat(seat)
+        st = app_seat_state(seat) if seat in APP_SEATS else s["state"]
+        a = availability(seat, st, now)
+        notes = pending(seat)
+        oldest = min((path.stat().st_mtime for path, _ in notes), default=None)
+        seats[seat] = {
+            "kind": "app" if seat in APP_SEATS else "agent",
+            "state": st, "shown": a["word"], "rank": list(a["rank"]),
+            "waiting": len(notes),
+            "waiting_normal": sum(1 for _, r in notes if not r.get("quiet")),
+            "oldest_waiting_s": round(now - oldest) if oldest else 0,
+            "since_s": round(now - float(s.get("since") or now)),
+            "file_age_s": round(now - float(s.get("updated") or now)),
+            "can_wake": bool(s.get("kitty_socket") and s.get("kitty_window")) if seat in AGENTS else None,
+            "paused": int(s.get("auto") or 0) >= AUTO_LIMIT,
+            "held_by_draft": bool(s.get("held_by_draft")) or st == "draft in box",
+            "retry_at": float(s.get("app_retry_at") or 0) or None,
+            "spent_until": spent_reset(a["usage"], spent_mark(seat, now), now),
+            "hidden": seat in HIDDEN_SEATS,
+        }
+    return {"time": now, "machine": MACHINE, "seats": seats}
+
+
+def wake_seat(seat, stale=False):
+    """One wake attempt for `seat`, for a watchdog. Returns (done, reason).
+
+    With `stale`, a seat that has said busy for STALE_BUSY seconds without
+    its file changing, while notes wait, is treated as idle first: its Stop
+    hook never ran, so nothing else would ever deliver to it. Pasting into
+    an agent that is in fact still working only queues the text for it.
+    """
+    if seat not in AGENTS:
+        return False, "only terminal agents can be woken this way"
+    s = load_seat(seat)
+    if not pending(seat):
+        return False, "nothing waiting"
+    if stale and s["state"] == "busy" and time.time() - float(s.get("updated") or 0) >= STALE_BUSY:
+        update_seat(seat, state="idle")
+        log(f"{seat}: busy with no change for {STALE_BUSY // 60} min while notes wait; treating as idle")
+    if try_wake(seat):
+        return True, "woken"
+    s = load_seat(seat)
+    reason = ("out of usage until its reset" if seat_spent(seat) else
+              "paused by the loop guard" if int(s.get("auto") or 0) >= AUTO_LIMIT else
+              "a draft is in its prompt" if s.get("held_by_draft") else
+              f"state is {s['state']}" if s["state"] != "idle" else
+              "no kitty window to type into" if not (s.get("kitty_socket") and s.get("kitty_window")) else
+              "its window is focused or unreadable")
+    return False, reason
+
+
 def status_text():
     """A short table of every agent seat."""
     rows = []
@@ -3422,6 +3488,8 @@ def self_test():
     """Check the mailbox, hooks, loop guard and MCP server. Exit 1 on failure."""
     tmp = tempfile.mkdtemp(prefix="comms-deck-test-")
     os.environ["COMMS_DECK_NO_NOTIFY"] = "1"  # test notes to the owner must not pop up on the desktop
+    for name in ("KITTY_LISTEN_ON", "KITTY_WINDOW_ID"):
+        os.environ.pop(name, None)  # a test seat must never record, and so type into, a real kitty window
     env = dict(os.environ, COMMS_DECK_HOME=f"{tmp}/data", COMMS_DECK_CONFIG=f"{tmp}/config",
                COMMS_DECK_AUTO_LIMIT="2")
     me = str(Path(__file__).resolve())
@@ -3874,6 +3942,8 @@ def self_test():
         "assert x.task_summary('', [('p', {'text': '@claude please fix https://x.y the chat layout', 'private': False})]) == 'please fix the chat layout'",
         "assert x.task_summary('', [('p', {'text': 'token stuff', 'private': True})]) == 'private note'",
         "assert x.task_summary('', []) == ''",
+        "j = x.status_json(); assert set(j['seats']) >= {'claude', 'grok'} and 'shown' in j['seats']['claude']",
+        "assert x.wake_seat('alice')[0] is False",
         "assert x.task_summary('<system-reminder> fixing the chat layout now', []) == 'fixing the chat layout now'",
         "assert x.task_summary('<system-reminder>', [('p', {'text': 'merge the PR', 'private': False})]) == 'merge the PR'",
         "assert x.describe('<system-reminder>\\nhook text\\n</system-reminder>\\nreview PR 36') == 'review PR 36'",
@@ -3904,6 +3974,10 @@ def self_test():
         "assert x.seat_spent('gravity')",
         "x.mark_spent('gravity', 'clear', 'claude')",
         "assert not x.seat_spent('gravity')",
+        "x.mark_spent('codex', '+1h', 'claude'); x.update_seat('codex', state='idle', kitty_socket='unix:/nonexistent', kitty_window='1')",
+        "x.write_json(x.DATA / 'inbox' / 'codex' / 'w1.json', {'from': 'owner', 'text': 'hi', 'time': '2026-11-24 07:00:00'})",
+        "assert x.try_wake('codex') is False and x.wake_seat('codex') == (False, 'out of usage until its reset')",
+        "x.mark_spent('codex', 'clear', 'claude'); (x.DATA / 'inbox' / 'codex' / 'w1.json').unlink()",
         "x.write_json(x.DATA / 'usage' / 'gravity.json', {'time': now, 'data': {'rate_limits': {'five_hour': full(x.time.time() + 600)}}})",
         "x.update_seat('gravity', state='away')",
         "assert x.seat_spent('gravity') and any(s == 'gravity' for s, _, _ in x.current_states())",
@@ -4029,7 +4103,8 @@ def main():
     p.add_argument("--peek", action="store_true", help="show without taking")
     p = sub.add_parser("note")
     p.add_argument("text", nargs="+")
-    sub.add_parser("status")
+    p = sub.add_parser("status")
+    p.add_argument("--json", action="store_true", help="every seat as JSON, for programs")
     sub.add_parser("watch")
     p = sub.add_parser("chat")
     p.add_argument("--hide-private", action="store_true")
@@ -4044,6 +4119,9 @@ def main():
     p = sub.add_parser("install")
     p.add_argument("--yes", action="store_true")
     sub.add_parser("self-test")
+    p = sub.add_parser("wake", help="one wake attempt for a seat (for watchdogs)")
+    p.add_argument("seat")
+    p.add_argument("--stale", action="store_true", help="treat a long-unchanged busy seat as idle")
     p = sub.add_parser("spent", help="mark a seat spent until its limit resets (for agents with no meter)")
     p.add_argument("seat")
     p.add_argument("until", nargs="+", help="+166h, +90m, +2d, 06:20, 'YYYY-MM-DD HH:MM', or clear")
@@ -4075,7 +4153,7 @@ def main():
             add_note(me(), " ".join(args.text))
             print("added to the commentary")
         elif args.cmd == "status":
-            print(status_text())
+            print(json.dumps(status_json(), indent=1) if args.json else status_text())
         elif args.cmd == "watch":
             watch()
         elif args.cmd == "chat":
@@ -4098,6 +4176,10 @@ def main():
             install(args.yes)
         elif args.cmd == "self-test":
             sys.exit(self_test())
+        elif args.cmd == "wake":
+            done, reason = wake_seat(args.seat.lower(), args.stale)
+            print(json.dumps({"seat": args.seat.lower(), "woken": done, "reason": reason}))
+            sys.exit(0 if done else 3)
         elif args.cmd == "spent":
             print(mark_spent(args.seat.lower(), " ".join(args.until), me()))
         elif args.cmd == "review-check":
