@@ -812,22 +812,23 @@ def next_auto(state, notes):
 
 
 def remember_gravity_model(data):
-    """Save the model name agy put on this hook, for the usage panel.
+    """Save the model name from a PreInvocation hook, for the usage panel.
 
-    The hook payload has modelName and no token or quota figures, so the
-    panel names the model and draws no bar. A repeat of the same name inside
-    a minute does not rewrite the file.
+    The payload has modelName and no token or quota figures, so the panel
+    names the model and draws no bar. A repeat of the same name inside a
+    minute does not rewrite the file.
     """
     model = str(data.get("modelName") or "").strip()
     if not model:
         return
     path = DATA / "usage" / "gravity.json"
     prev = read_json(path) or {}
-    same = prev.get("source") == "agy" and dig(prev, "data", "model", "display_name") == model
+    same = (prev.get("source") == "gravity-hook"
+            and dig(prev, "data", "model", "display_name") == model)
     if same and time.time() - float(prev.get("time") or 0) < 60:
         return
-    write_json(path, {"time": time.time(), "source": "agy",
-                      "data": {"model": {"id": model, "display_name": model}}})
+    write_json(path, {"time": time.time(), "source": "gravity-hook",
+                      "data": {"model": {"display_name": model}}})
 
 
 def agy_hook(event):
@@ -849,7 +850,6 @@ def agy_hook(event):
     seat, pid = find_agent()
     if seat != "gravity":
         return  # not running inside agy: not this hook's business
-    remember_gravity_model(data)
     state = load_seat(seat)
     if pid and state.get("pid") != pid:
         remember_window(seat, pid)
@@ -866,6 +866,7 @@ def agy_hook(event):
             print(json.dumps(system(f"{MARK} {count} note(s) are waiting for you (gravity). "
                                     "Read them with the read_messages tool.")))
     elif event == "PreInvocation":
+        remember_gravity_model(data)
         if int(data.get("invocationNum") or 0) == 0:
             typed = str(data.get("lastUserInput") or "")
             woke = time.time() - float(state.get("woke_at") or 0) < 10
@@ -889,6 +890,30 @@ def agy_hook(event):
             pause_notice(seat)
         if data.get("fullyIdle", True):
             update_seat(seat, state="idle")
+
+
+# Tools Gravity may call without a per-call Allow prompt. install adds any
+# that are missing and leaves the rest of agy's settings file alone.
+GRAVITY_MCP_ALLOW = (
+    "mcp(comms-deck/team_status)",
+    "mcp(comms-deck/read_messages)",
+    "mcp(comms-deck/send_message)",
+    "mcp(comms-deck/add_note)",
+    "mcp(comms-deck/set_status)",
+)
+
+
+def grant_gravity_tools(settings):
+    """Add the comms-deck MCP tools to agy's allow list. Other settings stay."""
+    settings = dict(settings or {})
+    permissions = dict(settings.get("permissions") or {})
+    allow = list(permissions.get("allow") or [])
+    for entry in GRAVITY_MCP_ALLOW:
+        if entry not in allow:
+            allow.append(entry)
+    permissions["allow"] = allow
+    settings["permissions"] = permissions
+    return settings
 
 
 def agy_hooks(cmd):
@@ -2699,6 +2724,12 @@ def install(yes):
         config.setdefault("mcpServers", {})["comms-deck"] = {
             "command": cmd, "args": ["mcp"], "env": {"COMMS_DECK_SEAT": "gravity"}}
         mcp_path.write_text(json.dumps(config, indent=2) + "\n")
+        settings_path = HOME / ".gemini/antigravity-cli/settings.json"
+        settings_path.parent.mkdir(parents=True, exist_ok=True)
+        current = read_json(settings_path, {}) or {}
+        updated = grant_gravity_tools(current)
+        if updated != current:
+            settings_path.write_text(json.dumps(updated, indent=2) + "\n")
     step("add hooks and the MCP server for Antigravity, if installed (~/.gemini/config)", antigravity)
     step("register the MCP server with Codex, if installed (~/.codex/config.toml)",
          lambda: mcp_toml(HOME / ".codex/config.toml", "[mcp_servers.comms-deck]"))
@@ -2974,9 +3005,15 @@ def self_test():
           (read_json(Path(tmp) / "data/seats/gravity.json", {}) or {}).get("state") == "busy")
     usage = read_json(Path(tmp) / "data/usage/gravity.json", {}) or {}
     check("gravity's usage row is the model agy reported",
-          usage.get("source") == "agy"
-          and dig(usage, "data", "model", "display_name") == "Gemini 3"
-          and dig(usage, "data", "context_window") is None, str(usage))
+          usage.get("source") == "gravity-hook"
+          and dig(usage, "data", "model") == {"display_name": "Gemini 3"}, str(usage))
+    granted = grant_gravity_tools({"colorScheme": "kept", "permissions": {"allow": [
+        "mcp(comms-deck/send_message)"]}, "trustedWorkspaces": ["/work"]})
+    allow = granted["permissions"]["allow"]
+    check("gravity install allows the comms-deck tools and keeps other settings",
+          granted["colorScheme"] == "kept" and granted["trustedWorkspaces"] == ["/work"]
+          and all(allow.count(entry) == 1 for entry in GRAVITY_MCP_ALLOW),
+          str(granted))
     hooks = agy_hooks("comms-deck")["comms-deck"]
     check("install registers gravity's SessionStart, PreInvocation and Stop",
           set(hooks) == {"SessionStart", "PreInvocation", "Stop"}
