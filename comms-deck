@@ -2493,6 +2493,7 @@ def idle_until(reset, now=None):
 # always last. Within a level, fewer
 # notes waiting ranks higher (each one weighs an agent down); then seat order.
 AVAILABILITY = {"ready": 0, "busy": 1, "stuck": 3, "draft in box": 3,
+                "idle": 4,  # a polling seat whose check is late: not stuck, not ready
                 "away": 5, "chat not open": 6, "not connected": 6, "no chat yet": 6, "not set up": 6,
                 "spent": 7}  # idle until its limit resets: always the bottom (the owner, 07:23)
 
@@ -2508,7 +2509,12 @@ def availability(seat, state, now=None):
     usage = (read_json(DATA / "usage" / f"{seat}.json") or {}).get("data") or {}
     waiting = len(pending(seat))
     mark, word, shade = activity_view(state, usage, now, waiting=waiting, marked=spent_mark(seat, now))
-    word = "ready" if word == "idle" else word  # the owner's word: idle means out of usage now
+    # A seat that only checks on its own (Lumo) is not stuck, and not busy, once
+    # that check is late: the row says idle until she calls again.
+    if word in ("busy", "idle", "stuck") and poll_is_late(seat, now):
+        mark, word, shade = STATE_MARKS["idle"], "idle", STATE_COLOURS["idle"]
+    elif word == "idle":
+        word = "ready"  # the owner's word: idle, and here on time, means ready
     return {"rank": (AVAILABILITY.get(word, 6), waiting), "word": word, "mark": mark,
             "shade": shade, "waiting": waiting, "usage": usage}
 
@@ -3143,13 +3149,31 @@ def note_mcp_call(seat, name, now=None):
     update_seat(seat, **changes)
 
 
-def poll_countdown(state, now=None):
-    """'next check in 0:42', or 'check late 1:05' once the expected time has passed."""
+def poll_left(state, now=None):
+    """Seconds until the next check. Negative once that time has passed.
+
+    None when this seat has never checked, which is not the same as late.
+    """
     now = time.time() if now is None else now
     polled = float(state.get("polled_at") or 0)
     if not polled:
+        return None
+    return int(polled + float(state.get("poll_gap") or POLL_DEFAULT) - now)
+
+
+def poll_is_late(seat, now=None):
+    """True when a polling app seat's expected check has not come back."""
+    if seat not in APP_SEATS or APP_PROCESS.get(seat, "grok-bot") == "grok-bot":
+        return False
+    left = poll_left(load_seat(seat), now)
+    return left is not None and left < 0
+
+
+def poll_countdown(state, now=None):
+    """'next check in 0:42', or 'check late 1:05' once the expected time has passed."""
+    left = poll_left(state, now)
+    if left is None:
         return "hasn't checked yet"
-    left = int(polled + float(state.get("poll_gap") or POLL_DEFAULT) - now)
     clock = lambda n: f"{n // 3600}:{n % 3600 // 60:02d}:{n % 60:02d}" if n >= 3600 else f"{n // 60}:{n % 60:02d}"
     return f"next check in {clock(left)}" if left >= 0 else f"check late {clock(-left)}"
 
@@ -3943,6 +3967,17 @@ def self_test():
         "x.note_mcp_call('pollseat', 'read_messages', now + 300 + 90000)",
         "assert x.load_seat('pollseat')['poll_gap'] == 86400",
         "assert x.poll_countdown({'polled_at': now, 'poll_gap': 86400}, now) == 'next check in 24:00:00'",
+        "x.update_seat('pollseat', state='idle', polled_at=now - 125, poll_gap=60)",
+        "x.write_json(x.DATA / 'inbox' / 'pollseat' / 'n1.json', {'from': 'owner', 'text': 'check in', 'quiet': False})",
+        "late = x.availability('pollseat', 'idle', now)",
+        "assert late['word'] == 'idle' and late['mark'] == '○' and late['shade'] == x.STATE_COLOURS['idle']",
+        "x.update_seat('pollseat', state='busy', polled_at=now - 125, poll_gap=60)",
+        "assert x.availability('pollseat', 'busy', now)['word'] == 'idle'",
+        "x.update_seat('pollseat', state='idle', polled_at=now - 10, poll_gap=60)",
+        "assert x.availability('pollseat', 'idle', now)['word'] == 'stuck'",
+        "(x.DATA / 'inbox' / 'pollseat' / 'n1.json').unlink()",
+        "assert x.availability('pollseat', 'idle', now)['word'] == 'ready'",
+        "assert x.poll_is_late('alice', now) is False",
         "x.note_mcp_call('pollseat', 'set_status', now + 301)",
         "assert x.load_seat('pollseat')['status_at'] == now + 301",
         "x.note_mcp_call('alice', 'read_messages', now)",
