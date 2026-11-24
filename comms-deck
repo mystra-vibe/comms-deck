@@ -373,7 +373,7 @@ def app_seat_state(seat):
     state = read_json(seat_file(seat), {}) or {}
     seen = float(state.get("app_seen") or 0)
     if time.time() - seen < 15 and state.get("state") in (
-            "busy", "idle", "away", "not connected", "chat not open", "no chat yet"):
+            "busy", "idle", "away", "not connected", "chat not open", "no chat yet", "draft in box"):
         return state["state"]
     if APP_PROCESS.get(seat, "grok-bot") != "grok-bot":
         # Not a Grok Bot seat: it can only connect through its own app's MCP.
@@ -1218,6 +1218,23 @@ def GROK_BOT_SEATS():
     return [seat for seat in APP_SEATS if APP_PROCESS.get(seat, "grok-bot") == "grok-bot"]
 GROK_BOT_PAGE = "renderer/index.html"
 APP_USAGE_EVERY = 60
+DRAFT_STALE = int(setting("DRAFT_STALE", "600"))  # an unchanged draft this old is abandoned
+
+
+def draft_status(state, composer, now):
+    """Track the text left in an app seat's chat box. Returns (changes, stale).
+
+    The deck never types over a draft, in case the owner is writing one. But
+    a draft left unchanged for DRAFT_STALE seconds (a stray "w" held Alice's
+    notes for hours) is abandoned: `stale` is True, and the caller saves the
+    text to the owner and clears the box, so delivery can't be blocked forever.
+    """
+    text = composer or ""
+    if not text.strip():
+        return ({"app_draft": "", "app_draft_since": 0} if state.get("app_draft") else {}), False
+    if text != state.get("app_draft"):
+        return {"app_draft": text, "app_draft_since": now}, False
+    return {}, now - float(state.get("app_draft_since") or now) >= DRAFT_STALE
 _WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
 _SCROLL_JS = r"""(() => {
@@ -1851,9 +1868,31 @@ def drive_app_seat(seat, cdp, focused):
         update_seat(seat, state="chat not open", app_seen=time.time(), app_page="grok-bot")
         return False
     file_app_replies(seat, state, snap)
-    page_state = "busy" if snap.get("replying") else "idle"
+    waiting = any(not record.get("quiet") for _, record in pending(seat))
+    changes, stale = draft_status(state, snap.get("composer"), time.time())
+    if changes:
+        state.update(update_seat(seat, **changes))
+    if stale and waiting and focused is False and not snap.get("replying"):
+        draft = snap.get("composer") or ""
+        minutes = int((time.time() - float(state.get("app_draft_since") or time.time())) // 60)
+        cdp_eval(cdp, _FOCUS_JS)
+        app_clear_composer(cdp)
+        time.sleep(0.2)
+        if not (composer_text_now(cdp) or "").strip():
+            send("deck", "owner", f"{seat.title()}'s chat box held an unsent draft for {minutes} minutes, "
+                                  f"so no notes could be typed in. I cleared it; here is what it said:\n\n{draft}",
+                 private=True)
+            log(f"{seat}: cleared a draft left unchanged for {minutes} min")
+            state.update(update_seat(seat, app_draft="", app_draft_since=0))
+            snap["composer"] = ""
+    if snap.get("replying"):
+        page_state = "busy"
+    elif waiting and (snap.get("composer") or "").strip():
+        page_state = "draft in box"  # not idle: a draft is holding the notes back
+    else:
+        page_state = "idle"
     update_seat(seat, state=page_state, app_seen=time.time(), app_page="grok-bot")
-    if not any(not record.get("quiet") for _, record in pending(seat)):
+    if not waiting:
         return False
     if state.get("auto", 0) >= AUTO_LIMIT and not owner_waiting(seat):
         pause_notice(seat)
@@ -3172,6 +3211,12 @@ def self_test():
         "assert fresh == [] and cur == 't1@3'",
         "idle = {'open': True, 'replying': False, 'composer': ''}",
         "assert x.app_delivery_allowed({'open':True,'replying':True,'composer':''}, False, {'auto':0}, 'alice') is False",
+        "ch, st = x.draft_status({}, 'w', 1000.0); assert ch == {'app_draft': 'w', 'app_draft_since': 1000.0} and not st",
+        "ch, st = x.draft_status({'app_draft': 'w', 'app_draft_since': 1000.0}, 'w', 1000.0 + x.DRAFT_STALE - 1); assert not ch and not st",
+        "ch, st = x.draft_status({'app_draft': 'w', 'app_draft_since': 1000.0}, 'w', 1000.0 + x.DRAFT_STALE); assert st",
+        "ch, st = x.draft_status({'app_draft': 'w', 'app_draft_since': 1000.0}, 'wh', 5000.0); assert ch['app_draft_since'] == 5000.0 and not st",
+        "ch, st = x.draft_status({'app_draft': 'w', 'app_draft_since': 1000.0}, '', 5000.0); assert ch == {'app_draft': '', 'app_draft_since': 0} and not st",
+        "ch, st = x.draft_status({}, None, 5000.0); assert ch == {} and not st",
         "assert x.app_delivery_allowed({'open':True,'replying':False,'composer':'draft'}, False, {'auto':0}, 'alice') is False",
         "assert x.app_delivery_allowed(idle, True, {'auto':0}, 'alice') is False",
         "assert x.app_delivery_allowed(idle, False, {'auto':2}, 'alice') is False",
