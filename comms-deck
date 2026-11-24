@@ -619,12 +619,19 @@ def hook(source, event):
                 return
         elif any(not r.get("quiet") for _, r in pending(seat)):
             pause_notice(seat)
+        if source == "claude":
+            # On Claude an allowed Stop is the end of the turn (comms-deck's
+            # is the only Stop hook), so idle now rather than waiting the
+            # minute for idle_prompt. Grok settles idle on idle_prompt only.
+            update_seat(seat, state="idle")
     elif event == "StopCancelled":
         # Idle waits for idle_prompt. An older cancel must not touch the seat:
         # Grok can deliver it after the next turn's UserPromptSubmit.
         return
     elif event == "Notification":
-        if data.get("notification_type") != "idle_prompt":
+        # Claude's hook is installed with matcher idle_prompt, so whatever
+        # reaches it is idle; Grok's payload is checked field by field.
+        if source == "grok" and data.get("notification_type") != "idle_prompt":
             return
         if turn_relation(state, data) == "older":
             return
@@ -1661,6 +1668,9 @@ def self_test():
     check("chat box routing (@seat, several, @all, unknown, no @ = all, not emails)",
           r.stdout.strip() == "['grok'] ['claude', 'grok'] ['all'] True True True", r.stdout + r.stderr)
     run(["send", "claude", "for claude"], "grok")
+    run(["hook", "--source", "claude", "--event", "Stop"], "claude", "{}")
+    check("Claude is idle after an allowed Stop",
+          (read_json(Path(tmp) / "data/seats/claude.json", {}) or {}).get("state") == "idle")
     r = run(["hook", "--source", "claude", "--event", "UserPromptSubmit"], "claude", '{"prompt": "hi"}')
     check("Claude gets notes with the owner's prompt", "for claude" in r.stdout, r.stdout + r.stderr)
     r = run(["send", "grok", "token: abc123secret"], "claude")
