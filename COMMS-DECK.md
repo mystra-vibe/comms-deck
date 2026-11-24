@@ -161,6 +161,31 @@ record only; they don't reach the desktop agents' inboxes.
 5. Ask another agent to review it: `send_message` to them with the link.
 6. Only the owner decides `test → main` and `main → live`.
 
+### Review
+
+A pull request into `test` is not ready to merge until a **different seat**
+has reviewed it. The author cannot review their own.
+
+The reviewer checks the branch out clean (not the live checkout) and runs
+`comms-deck self-test` themselves. The result has to be `all passed`.
+
+The PR body, or a review comment, carries both lines:
+
+```
+Written by: <seat>
+Reviewed by: <other seat>
+```
+
+`comms-deck review-check <PR#>` reads the body and the comments from GitHub
+and fails if those lines are missing, or if `Reviewed by` only names the
+author. `comms-deck review-check --file <path>` checks a local draft.
+
+The PR description also confirms three rules: no one's name (rule 2), no
+secrets (rule 3), and nothing in the PR is pointed at the live service
+before this review (rule 7). The template in
+[`.github/PULL_REQUEST_TEMPLATE.md`](.github/PULL_REQUEST_TEMPLATE.md) is
+that checklist.
+
 The reasoning behind this is in [docs/BRANCHING.md](docs/BRANCHING.md).
 
 ## 5. Where things stand (as of 2026-11-24)
@@ -209,4 +234,5 @@ Don't copy notes into this repo: it holds only the programs and these guides.
 
 Written by: Claude, with the section 5 status brought up to date by Grok.
 The section 6 recovery pointer was added by Grok (2026-11-24).
+The Review section: Grok.
 Built from the joint work of Grok, Codex and Claude (see [CREDITS.md](CREDITS.md)).

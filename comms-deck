@@ -15,6 +15,7 @@
   comms-deck self-test                                   run the tests in a temp folder
   comms-deck spent <seat> <+166h|06:20|YYYY-MM-DD HH:MM|clear>
                                                          show a seat spent, counting down to its reset
+  comms-deck review-check <PR#>                          fail unless another seat reviewed it
 """
 
 # =============================================================================
@@ -3790,6 +3791,19 @@ def self_test():
     r = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True, timeout=30)
     check("a full plan limit is spent until its reset, and waiting notes are counted from the inbox",
           r.returncode == 0 and r.stdout.strip() == "ok", r.stdout + r.stderr)
+    body = Path(tmp) / "pr-body.txt"
+    body.write_text("Written by: Grok\nReviewed by: Claude\n")
+    r = run(["review-check", "--file", str(body)], "grok")
+    check("a review from another seat passes", r.returncode == 0 and "claude" in r.stdout, r.stdout + r.stderr)
+    body.write_text("Written by: Grok\nReviewed by: Grok\n")
+    r = run(["review-check", "--file", str(body)], "grok")
+    check("the author's own review does not count", r.returncode != 0, r.stdout + r.stderr)
+    body.write_text("Written by: Grok\n")
+    r = run(["review-check", "--file", str(body)], "grok")
+    check("a missing review line fails", r.returncode != 0 and "no Reviewed by" in r.stderr, r.stderr)
+    body.write_text("Reviewed by: Claude\n")
+    r = run(["review-check", "--file", str(body)], "grok")
+    check("a review with no author line fails", r.returncode != 0 and "no Written by" in r.stderr, r.stderr)
     shutil.rmtree(tmp, ignore_errors=True)
     print(f"\n{'all passed' if not failures else f'{len(failures)} failed'}")
     return 1 if failures else 0
@@ -3798,6 +3812,53 @@ def self_test():
 # -----------------------------------------------------------------------------
 # SECTION 13: command line
 # -----------------------------------------------------------------------------
+
+
+def credited_seats(text, label):
+    """Seat names on lines like 'Reviewed by: Claude'. 'owner' is not a seat here."""
+    found = []
+    for line in text.splitlines():
+        if not re.match(rf"(?i)^\s*{label}\s+by\s*:", line):
+            continue
+        for seat in SEATS:
+            if seat != "owner" and re.search(rf"(?i)\b{seat}\b", line) and seat not in found:
+                found.append(seat)
+    return found
+
+
+def review_gap(text):
+    """None if another seat reviewed this text, otherwise a short reason.
+
+    The author is whoever `Written by:` names. A `Reviewed by:` line counts
+    only when it names a different seat, so an author cannot pass their own PR.
+    """
+    writers = credited_seats(text, "Written")
+    reviewers = credited_seats(text, "Reviewed")
+    if not writers:
+        return "no Written by line naming a seat"
+    others = [seat for seat in reviewers if seat not in writers]
+    if not reviewers:
+        return "no Reviewed by line"
+    if not others:
+        return "Reviewed by names only the author (" + ", ".join(writers) + ")"
+    return None
+
+
+def pr_review_text(number):
+    """The PR body plus review and comment text, from GitHub. Raises on failure."""
+    result = subprocess.run(
+        ["gh", "pr", "view", str(number), "--repo", "whyyyyyai/comms-deck",
+         "--json", "body,comments,reviews"],
+        capture_output=True, text=True, timeout=30)
+    if result.returncode != 0:
+        raise RuntimeError((result.stderr or result.stdout or "gh pr view failed").strip())
+    data = json.loads(result.stdout or "{}")
+    parts = [data.get("body") or ""]
+    for key in ("comments", "reviews"):
+        for item in data.get(key) or []:
+            if isinstance(item, dict):
+                parts.append(item.get("body") or "")
+    return "\n".join(parts)
 
 
 def main():
@@ -3832,6 +3893,9 @@ def main():
     p = sub.add_parser("spent", help="mark a seat spent until its limit resets (for agents with no meter)")
     p.add_argument("seat")
     p.add_argument("until", nargs="+", help="+166h, +90m, +2d, 06:20, 'YYYY-MM-DD HH:MM', or clear")
+    p = sub.add_parser("review-check")
+    p.add_argument("number", nargs="?", type=int, help="pull request number on this repo")
+    p.add_argument("--file", help="check this text instead of fetching the PR")
     args = parser.parse_args()
 
     def me():
@@ -3882,6 +3946,22 @@ def main():
             sys.exit(self_test())
         elif args.cmd == "spent":
             print(mark_spent(args.seat.lower(), " ".join(args.until), me()))
+        elif args.cmd == "review-check":
+            try:
+                if args.file:
+                    text = Path(args.file).read_text()
+                elif args.number:
+                    text = pr_review_text(args.number)
+                else:
+                    sys.exit("comms-deck: review-check needs a PR number or --file")
+            except (OSError, RuntimeError, json.JSONDecodeError, subprocess.SubprocessError) as error:
+                sys.exit(f"comms-deck: {error}")
+            gap = review_gap(text)
+            if gap:
+                sys.exit(f"comms-deck: PR #{args.number or args.file}: {gap}")
+            others = [s for s in credited_seats(text, "Reviewed")
+                      if s not in credited_seats(text, "Written")]
+            print("ok: reviewed by " + ", ".join(others))
     except ValueError as error:
         sys.exit(f"comms-deck: {error}")
     except KeyboardInterrupt:
