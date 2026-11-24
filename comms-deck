@@ -441,11 +441,36 @@ def add_note(sender, text):
     return record
 
 
+PRIVATE_NAMES_FILE = CONFIG / "private-names"
+
+
+def redact(text):
+    """`text` with every private name replaced by "the owner".
+
+    Names live in ~/.config/comms-deck/private-names, one per line, on this
+    machine only: never in this repo. Whole words, any case. Applied to
+    every copy that leaves the machine (git, Discord); the local log keeps
+    the original.
+    """
+    try:
+        names = [n.strip() for n in PRIVATE_NAMES_FILE.read_text().splitlines()
+                 if n.strip() and not n.strip().startswith("#")]
+    except OSError:
+        return text
+    for name in sorted(names, key=len, reverse=True):
+        text = re.sub(rf"(?<!\w){re.escape(name)}(?!\w)", "the owner", text, flags=re.IGNORECASE)
+    return text
+
+
 def queue_out(record):
-    """Queue a record for the git copy, and for Discord if it's public."""
-    write_json(DATA / "queue/sync" / f"{record['id']}.json", record)
+    """Queue a record for the git copy, and for Discord if it's public.
+
+    Both copies leave the machine, so private names are redacted first.
+    """
+    out = dict(record, text=redact(record["text"]))
+    write_json(DATA / "queue/sync" / f"{record['id']}.json", out)
     if not record["private"] and WEBHOOK_FILE.exists():
-        write_json(DATA / "queue/discord" / f"{record['id']}.json", record)
+        write_json(DATA / "queue/discord" / f"{record['id']}.json", out)
 
 
 def pending(seat):
@@ -2508,6 +2533,14 @@ def self_test():
     r = run(["send", "grok", "token: abc123secret"], "claude")
     check("secret-looking notes go private", "private" in r.stdout and
           not list(Path(f"{tmp}/data").glob("queue/discord/*")), r.stdout)
+    Path(f"{tmp}/config").mkdir(parents=True, exist_ok=True)
+    Path(f"{tmp}/config/private-names").write_text("# local only\nZanzibar\n")
+    run(["send", "grok", "zanzibar asked; Zanzibarish stays"], "claude")
+    queued = [read_json(q) for q in Path(f"{tmp}/data/queue/sync").glob("*.json")]
+    logged = (Path(f"{tmp}/data/log.jsonl")).read_text()
+    check("private names are redacted in copies that leave the machine",
+          any(q and q["text"] == "the owner asked; Zanzibarish stays" for q in queued)
+          and "zanzibar asked" in logged, str([q["text"] for q in queued if q])[-200:])
     r = run(["send", "nobody", "x"], "claude")
     check("unknown seat is refused", r.returncode != 0)
     rpc = "\n".join(json.dumps(m) for m in [
