@@ -2033,10 +2033,7 @@ def usage_panel(width):
         money = f"~${total:,.2f} est."
         gap = max(1, inner - 5 - len(money))
         head += " " * gap + f"\033[1;38;5;220m{money}\033[0m"
-    lines = [head]
-    if counted:
-        lines.append(f"\033[2m  {' + '.join(counted)}'s own figures · Grok Bot: no $\033[0m")
-    lines.append("")
+    lines = [head, ""]  # where the figures come from is in the README, not on screen
     shown_account = False
     for seat in tuple(AGENTS) + APP_SEATS:
         record = read_json(DATA / "usage" / f"{seat}.json")
