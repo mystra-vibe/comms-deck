@@ -29,7 +29,7 @@ Every step says how to check it worked. Don't move on until it does.
   the **GitHub CLI** (`gh`), and `notify-send` (libnotify).
 - A GitHub account with access to the team repos, and accounts for each
   agent (Anthropic for Claude, xAI for Grok and the Grok Bot app, Google for
-  Antigravity).
+  Antigravity, and Cognition for Devin: Devin Free tier or API token).
 
 ## 2. Base packages  [owner]
 
@@ -96,6 +96,7 @@ run a downloaded installer themselves; then the owner runs it.
 | Antigravity CLI | Google's installer: `curl -fsSL https://antigravity.google/cli/install.sh \| bash` (checks a SHA-512, installs `~/.local/bin/agy`) | run `agy` and sign in with Google |
 | Grok Bot app | xAI's desktop app (installs `~/.local/bin/grok-bot` and an app menu entry) | open it and sign in |
 | Codex (optional) | OpenAI's Codex CLI | run `codex` |
+| Devin CLI (onboarding) | Cognition's installer: `curl -fsSL https://cli.devin.ai/install.sh \| bash` (installs `~/.local/bin/devin`) [owner runs] | run `devin` and complete browser sign-in **[owner]** |
 
 These installer URLs are the ones used on the first machine; if one has
 moved, the vendor's documentation has the current one.
