@@ -17,8 +17,8 @@ cd "$HOME" || exit 1
 kitty --class "$class" --title "comms-deck chat ($view)" \
     -o font_size=$font -o window_padding_width=$pad -o confirm_os_window_close=0 \
     comms-deck chat &
-# Place it once it has a window. Full is placed by its window rule.
-[ "$view" = full ] && wait && exit 0
+# Place it once it has a window. The window rule puts full on workspace 5,
+# but it can open with gaps, so full is also made fullscreen here.
 for _ in $(seq 1 40); do
     addr=$(hyprctl clients -j | python3 -c "import json,sys; print(next((c['address'] for c in json.load(sys.stdin) if c['class'] == '$class'), ''))")
     [ -n "$addr" ] && break
@@ -26,7 +26,11 @@ for _ in $(seq 1 40); do
 done
 [ -n "$addr" ] || exit 0
 w="window = \"address:$addr\""
-if [ "$view" = half ]; then
+if [ "$view" = full ]; then
+    sleep 0.5
+    hyprctl clients -j | python3 -c "import json,sys; sys.exit(0 if any(c['class'] == '$class' and c['fullscreen'] for c in json.load(sys.stdin)) else 1)" \
+        || hyprctl dispatch "hl.dsp.window.fullscreen({ $w })" >/dev/null
+elif [ "$view" = half ]; then
     hyprctl dispatch "hl.dsp.window.move({ $w, workspace = 1, follow = false })" >/dev/null
 else
     hyprctl dispatch "hl.dsp.window.move({ $w, workspace = \"special:magic\", follow = false })" >/dev/null
