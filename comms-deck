@@ -49,6 +49,11 @@
 #        that turn (any agent).
 #      - Hooks keep a small state file per seat (busy / idle, and which kitty
 #        window it lives in), so the service knows who can be woken.
+#      - An app seat that lives in the Grok Bot window has no hook. The service
+#        reads that chat through the app's debugging port, which has to be on
+#        127.0.0.1, and types a waiting note when the seat is idle, the
+#        composer is empty and the window is not focused. New replies are
+#        filed as notes. Other app seats are left alone.
 #
 #   4. RECORDS, BATCHED. The service copies notes to the flight-log repo
 #      (private ones to private-relay) every few minutes in one commit, and
@@ -86,21 +91,27 @@
 #
 # SECTIONS: search for "SECTION" to jump between them.
 #   1 settings  2 small helpers  3 seats  4 the mailbox  5 delivery text
-#   6 hooks  7 kitty wake  8 records (git, Discord)  9 the service
-#   10 MCP server  11 install  12 self-test  13 command line
+#   6 hooks  7 kitty wake  7b grok-bot page  8 records (git, Discord)
+#   9 the service  10 MCP server  11 install  12 self-test  13 command line
 #
 # Standard library only. Python 3.9+.
 #
 # Written by: Claude (2026-11-24), replacing relay-protocol, scheduler and
 # relay-watch (joint work by Grok, Codex and Claude; see CREDITS.md).
 # Hook idle rules, promptId, and the kitty draft check: Grok (2026-11-24).
+# Grok Bot page adapter: Grok (2026-11-24).
 
 import argparse
+import base64
 import fcntl
+import hashlib
 import json
 import os
 import re
+import secrets
 import shutil
+import socket
+import struct
 import subprocess
 import sys
 import tempfile
@@ -131,10 +142,10 @@ AGENTS = {"claude": "claude", "grok": "grok", "codex": "codex"}
 for _pair in filter(None, setting("SEATS", "").split(",")):
     _name, _, _proc = _pair.partition(":")
     AGENTS[_name.strip()] = (_proc or _name).strip()
-# App seats: bots in the Grok Bot app (e.g. alice). They use the MCP tools to
-# send and read, but have no hooks and no kitty window, so nothing wakes them;
-# they read their notes when they check. One name per line in
-# ~/.config/comms-deck/app-seats ("#" starts a comment).
+# App seats: bots with no hooks and no kitty window. One name per line in
+# ~/.config/comms-deck/app-seats ("#" starts a comment). A seat that appears
+# in the Grok Bot window is woken from that chat (section 7b). Any other app
+# seat is left to its own connector.
 _app_file = CONFIG / "app-seats"
 APP_SEATS = tuple(line.split("#")[0].strip() for line in
                   (_app_file.read_text().splitlines() if _app_file.exists() else [])
@@ -325,9 +336,13 @@ def load_seat(seat):
 
 
 def app_seat_state(seat):
-    """What can be known about an app seat (a Grok Bot bot) without hooks:
-    'connected' if its comms-deck MCP server is running, 'not connected' if
-    the Grok Bot app is open without it, 'away' if the app is closed."""
+    """Busy or idle when the Grok Bot page was just read. Otherwise
+    'connected' if a comms-deck MCP server is running for this seat,
+    'not connected' if the Grok Bot app is open without one, 'away' if closed."""
+    state = read_json(seat_file(seat), {}) or {}
+    seen = float(state.get("app_seen") or 0)
+    if time.time() - seen < 15 and state.get("state") in ("busy", "idle", "away", "not connected"):
+        return state["state"]
     app_open = False
     for d in Path("/proc").iterdir():
         if not d.name.isdigit():
@@ -882,6 +897,667 @@ def log(text):
 
 
 # -----------------------------------------------------------------------------
+# SECTION 7b: Grok Bot page - type a note into an app seat's own chat
+# -----------------------------------------------------------------------------
+#
+# The Grok Bot app can listen on 127.0.0.1:9222. This client speaks only to
+# that loopback debugger: a page whose url is not on this machine is refused.
+# It never reads cookies, storage or tokens. Note text is typed in and not
+# written to the service log.
+#
+# A seat is driven only when its name is a chat in that window. Seats that
+# live in another app (lumo, for one) are not touched.
+
+
+GROK_BOT_PORT = 9222
+GROK_BOT_PAGE = "renderer/index.html"
+APP_USAGE_EVERY = 60
+_WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+_SCROLL_JS = r"""(() => {
+  const views = [...document.querySelectorAll(".ui-scroll-area__viewport")];
+  let best = null;
+  for (const view of views) {
+    if (view.querySelector(".sand-virtual-transcript__inner, .sand-message")
+        && (!best || view.scrollHeight > best.scrollHeight)) best = view;
+  }
+  if (best) best.scrollTop = best.scrollHeight;
+  return true;
+})()"""
+
+_SNAP_JS = r"""(() => {
+  try {
+    const seat = __SEAT__;
+    const withUsage = __USAGE__;
+    const clean = (s) => (s || "").replace(/\u00a0/g, " ").replace(/\u200b/g, "").trim();
+    const buttons = [...document.querySelectorAll("button")];
+    const seatBtn = buttons.find(b =>
+      ((b.getAttribute("aria-label") || "").split(",")[0].trim().toLowerCase()) === String(seat).toLowerCase());
+    const titleBtn = buttons.find(b => (b.getAttribute("aria-label") || "") === "View conversation details");
+    const openName = titleBtn ? clean(titleBtn.innerText).toLowerCase() : "";
+    const open = !!(seatBtn && seatBtn.getAttribute("aria-selected") === "true")
+      || openName === String(seat).toLowerCase();
+    const replying = buttons.some(b => (b.getAttribute("aria-label") || "") === "Stop")
+      || !!document.querySelector('[data-row-key="sand-typing-indicator"]');
+    const composerEl = document.querySelector("div.sand-prompt-field");
+    const composer = composerEl ? clean(composerEl.innerText) : null;
+    const messages = [];
+    for (const row of document.querySelectorAll(".sand-virtual-transcript__row")) {
+      const key = row.getAttribute("data-row-key") || "";
+      if (!key.startsWith("t")) continue;
+      const msg = row.querySelector(".sand-message");
+      if (!msg) continue;
+      messages.push({
+        key: key,
+        role: msg.getAttribute("data-role") || "",
+        text: clean(msg.innerText),
+        continued: row.getAttribute("data-continued-next") === "true"
+          || msg.getAttribute("data-continued-next") === "true"
+      });
+    }
+    let usage = null;
+    if (withUsage) {
+      const root = document.getElementById("root");
+      const key = root && Object.keys(root).find(k => k.startsWith("__reactContainer"));
+      let fiber = key ? root[key] : null;
+      if (fiber && fiber.current) fiber = fiber.current;
+      else if (fiber && fiber.stateNode && fiber.stateNode.current) fiber = fiber.stateNode.current;
+      const queue = fiber ? [fiber] : [];
+      const seen = new Set();
+      const seenObj = new Set();
+      const skip = new Set(["child", "sibling", "return", "alternate", "elementType", "type", "ref", "dependencies", "_owner", "_store"]);
+      const hunt = (obj, depth) => {
+        if (usage || !obj || typeof obj !== "object" || depth > 5 || obj.nodeType) return;
+        if (typeof obj.percentUsed === "number" && typeof obj.nextResetMs === "number") {
+          usage = {used_percentage: obj.percentUsed, resets_at: obj.nextResetMs};
+          return;
+        }
+        if (seenObj.has(obj)) return;
+        seenObj.add(obj);
+        let n = 0;
+        for (const name of Object.keys(obj)) {
+          if (skip.has(name) || n++ > 30) continue;
+          const value = obj[name];
+          if (value && typeof value === "object") hunt(value, depth + 1);
+        }
+      };
+      let n = 0;
+      while (queue.length && n < 2000 && !usage) {
+        const node = queue.shift();
+        if (!node || seen.has(node)) continue;
+        seen.add(node);
+        n++;
+        if (node.child) queue.push(node.child);
+        if (node.sibling) queue.push(node.sibling);
+        let hook = node.memoizedState;
+        for (let i = 0; hook && i < 20 && !usage; i++) {
+          hunt(hook.memoizedState, 0);
+          hunt(hook.baseState, 0);
+          hook = hook.next;
+        }
+      }
+    }
+    return {open: open, has_row: !!seatBtn, composer: composer, replying: replying,
+            messages: messages, usage: usage};
+  } catch (e) {
+    return {error: "page"};
+  }
+})()"""
+
+_CLICK_JS = r"""(() => {
+  const seat = __SEAT__;
+  const btn = [...document.querySelectorAll("button")].find(b =>
+    ((b.getAttribute("aria-label") || "").split(",")[0].trim().toLowerCase()) === String(seat).toLowerCase());
+  if (!btn) return false;
+  btn.click();
+  return true;
+})()"""
+
+_FOCUS_JS = r"""(() => {
+  const el = document.querySelector("div.sand-prompt-field");
+  if (!el) return false;
+  el.focus();
+  return true;
+})()"""
+
+_COMPOSER_JS = r"""(() => {
+  const el = document.querySelector("div.sand-prompt-field");
+  if (!el) return null;
+  return (el.innerText || "").replace(/\u00a0/g, " ").replace(/\u200b/g, "").trim();
+})()"""
+
+
+def ws_mask(payload, mask):
+    """XOR `payload` with the 4-byte websocket mask. Applying it twice is the identity."""
+    return bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+
+
+def ws_client_frame(opcode, payload, mask):
+    """One masked client frame. The server rejects an unmasked client frame."""
+    n = len(payload)
+    head = bytes([0x80 | (opcode & 0x0F)])
+    if n < 126:
+        head += bytes([0x80 | n])
+    elif n < 65536:
+        head += bytes([0x80 | 126]) + struct.pack("!H", n)
+    else:
+        head += bytes([0x80 | 127]) + struct.pack("!Q", n)
+    return head + mask + ws_mask(payload, mask)
+
+
+def ws_parse_frame(buf):
+    """Parse one frame from `buf`. Returns (fin, opcode, payload, rest), or None if short."""
+    if len(buf) < 2:
+        return None
+    fin = bool(buf[0] & 0x80)
+    opcode = buf[0] & 0x0F
+    masked = buf[1] & 0x80
+    length = buf[1] & 0x7F
+    i = 2
+    if length == 126:
+        if len(buf) < 4:
+            return None
+        length = struct.unpack("!H", buf[2:4])[0]
+        i = 4
+    elif length == 127:
+        if len(buf) < 10:
+            return None
+        length = struct.unpack("!Q", buf[2:10])[0]
+        i = 10
+    if length > 4_000_000:
+        raise RuntimeError("websocket frame too large")
+    mask = b""
+    if masked:
+        if len(buf) < i + 4:
+            return None
+        mask = buf[i:i + 4]
+        i += 4
+    if len(buf) < i + length:
+        return None
+    payload = buf[i:i + length]
+    if masked:
+        payload = ws_mask(payload, mask)
+    return fin, opcode, payload, buf[i + length:]
+
+
+class Cdp:
+    """A small Chrome DevTools Protocol client over one websocket."""
+
+    def __init__(self, sock, leftover=b""):
+        self.sock = sock
+        self.buf = leftover
+        self.next_id = 0
+
+    def close(self):
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+
+    def send_frame(self, opcode, payload):
+        self.sock.sendall(ws_client_frame(opcode, payload, secrets.token_bytes(4)))
+
+    def _read_more(self):
+        chunk = self.sock.recv(65536)
+        if not chunk:
+            raise RuntimeError("websocket closed")
+        self.buf += chunk
+
+    def read_message(self):
+        """The next data message, answering ping frames on the way."""
+        parts = []
+        opcode = None
+        while True:
+            parsed = ws_parse_frame(self.buf)
+            while parsed is None:
+                self._read_more()
+                parsed = ws_parse_frame(self.buf)
+            fin, op, payload, self.buf = parsed
+            if op == 9:  # ping
+                self.send_frame(10, payload)
+                continue
+            if op == 8:
+                raise RuntimeError("websocket closed")
+            if op == 10 or op not in (0, 1, 2):
+                continue
+            if op != 0:
+                opcode = op
+                parts = [payload]
+            else:
+                parts.append(payload)
+            if fin:
+                return opcode, b"".join(parts)
+
+    def call(self, method, params=None, timeout=8):
+        self.next_id += 1
+        mid = self.next_id
+        self.send_frame(1, json.dumps({"id": mid, "method": method, "params": params or {}}).encode())
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            self.sock.settimeout(max(0.2, deadline - time.time()))
+            opcode, payload = self.read_message()
+            if opcode != 1:
+                continue
+            try:
+                msg = json.loads(payload.decode())
+            except ValueError:
+                continue
+            if msg.get("id") != mid:
+                continue
+            if "error" in msg:
+                raise RuntimeError("cdp call failed")
+            return msg.get("result")
+        raise TimeoutError(method)
+
+
+def cdp_connect(ws_url):
+    """Open a debugger websocket. The host must be loopback."""
+    match = re.match(r"^ws://([^/:]+)(?::(\d+))?(/.*)$", ws_url)
+    if not match:
+        raise RuntimeError("refusing debugger url")
+    host, port, path = match.group(1), int(match.group(2) or 80), match.group(3)
+    if host not in ("127.0.0.1", "localhost"):
+        raise RuntimeError("refusing debugger host")
+    sock = socket.create_connection(("127.0.0.1", port), timeout=5)
+    sock.settimeout(5)
+    key = base64.b64encode(secrets.token_bytes(16)).decode()
+    req = (f"GET {path} HTTP/1.1\r\nHost: {host}:{port}\r\nUpgrade: websocket\r\n"
+           f"Connection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n")
+    sock.sendall(req.encode())
+    data = b""
+    while b"\r\n\r\n" not in data:
+        chunk = sock.recv(4096)
+        if not chunk:
+            break
+        data += chunk
+        if len(data) > 8192:
+            break
+    head, _, leftover = data.partition(b"\r\n\r\n")
+    accept = base64.b64encode(hashlib.sha1((key + _WS_GUID).encode()).digest()).decode()
+    if b" 101 " not in head.split(b"\r\n", 1)[0] or accept.encode() not in head:
+        sock.close()
+        raise RuntimeError("debugger refused the websocket")
+    return Cdp(sock, leftover)
+
+
+def open_grok_bot_page():
+    """The Grok Bot renderer page on 127.0.0.1, or raise if it isn't there."""
+    req = urllib.request.Request(f"http://127.0.0.1:{GROK_BOT_PORT}/json/list")
+    with urllib.request.urlopen(req, timeout=2) as resp:
+        targets = json.loads(resp.read().decode())
+    for target in targets:
+        url = target.get("url") or ""
+        ws = target.get("webSocketDebuggerUrl") or ""
+        if target.get("type") == "page" and GROK_BOT_PAGE in url and ws.startswith("ws://"):
+            return cdp_connect(ws)
+    raise RuntimeError("no grok-bot page")
+
+
+def cdp_eval(cdp, expression):
+    result = cdp.call("Runtime.evaluate", {"expression": expression, "returnByValue": True})
+    if not isinstance(result, dict) or result.get("exceptionDetails"):
+        raise RuntimeError("page script failed")
+    return (result.get("result") or {}).get("value")
+
+
+def page_script(template, seat):
+    return template.replace("__SEAT__", json.dumps(seat))
+
+
+def app_snapshot(cdp, seat, with_usage):
+    script = _SNAP_JS.replace("__SEAT__", json.dumps(seat)).replace(
+        "__USAGE__", "true" if with_usage else "false")
+    snap = cdp_eval(cdp, script)
+    if not isinstance(snap, dict) or snap.get("error"):
+        raise RuntimeError("page script failed")
+    return snap
+
+
+def row_key_order(key):
+    """Sort a transcript row key. The number after @ is the message order."""
+    match = re.search(r"@(\d+)", key or "")
+    return (int(match.group(1)) if match else 0, key or "")
+
+
+def join_assistant(messages):
+    """Assistant bubbles, with rows marked continued-next joined into one."""
+    groups, buf, key, start = [], [], None, None
+
+    def flush():
+        nonlocal buf, key, start
+        text = "\n".join(part for part in buf if part).strip()
+        if key and text:
+            groups.append({"key": key, "text": text, "start": start})
+        buf, key, start = [], None, None
+
+    for msg in messages:
+        if not str(msg.get("key") or "").startswith("t"):
+            continue
+        if msg.get("role") != "assistant":
+            flush()
+            continue
+        if start is None:
+            start = msg.get("key")
+        buf.append(msg.get("text") or "")
+        key = msg.get("key")
+        if not msg.get("continued"):
+            flush()
+    flush()
+    return groups
+
+
+def new_assistant_replies(messages, cursor):
+    """Assistant bubbles newer than `cursor`. The first sight files nothing.
+
+    Returns (replies, new cursor). `new cursor` is None when there is nothing
+    on the page yet, so the baseline waits until a row is actually visible.
+    """
+    keys = [m.get("key") for m in messages or [] if str(m.get("key") or "").startswith("t")]
+    newest = max(keys, key=row_key_order) if keys else None
+    if not cursor:
+        return [], newest
+    fresh = []
+    for group in join_assistant(messages or []):
+        if row_key_order(group["key"]) > row_key_order(cursor) and row_key_order(group["start"]) > row_key_order(cursor):
+            fresh.append({"key": group["key"], "text": group["text"]})
+    new_cursor = cursor
+    if newest and row_key_order(newest) > row_key_order(cursor):
+        new_cursor = newest
+    return fresh, new_cursor
+
+
+def reply_target(text):
+    """Where an app seat's reply goes: a seat named at the start, or the owner."""
+    match = re.match(r"\s*@([A-Za-z][\w-]*)", text or "")
+    if match:
+        name = match.group(1).lower()
+        if name in SEATS and name != "owner":
+            return name
+    return "owner"
+
+
+def app_delivery_allowed(snapshot, focused, state, seat):
+    """True when a note may be typed into this chat right now."""
+    if not snapshot.get("open") or snapshot.get("replying"):
+        return False
+    if snapshot.get("composer") is None or snapshot.get("composer"):
+        return False
+    if focused is None or focused:
+        return False
+    if state.get("auto", 0) >= AUTO_LIMIT and not owner_waiting(seat):
+        return False
+    return True
+
+
+def usage_record(usage, now_ts=None):
+    """The chat panel's usage file for one reading of the account weekly limit."""
+    if not isinstance(usage, dict):
+        return None
+    pct = usage.get("used_percentage")
+    reset = usage.get("resets_at")
+    if not isinstance(pct, (int, float)) or isinstance(pct, bool):
+        return None
+    if not isinstance(reset, (int, float)) or isinstance(reset, bool):
+        return None
+    reset = int(reset / 1000) if reset > 1e12 else int(reset)
+    return {
+        "time": time.time() if now_ts is None else now_ts,
+        "source": "grok-bot",
+        "data": {
+            "model": {"display_name": "account usage, shared by all bots"},
+            "rate_limits": {"seven_day": {"used_percentage": pct, "resets_at": reset}},
+        },
+    }
+
+
+def write_app_usage(seat, usage):
+    """Save the weekly account usage. Skip a repeat inside a minute."""
+    record = usage_record(usage)
+    if not record:
+        return False
+    path = DATA / "usage" / f"{seat}.json"
+    prev = read_json(path) or {}
+    prev_week = dig(prev, "data", "rate_limits", "seven_day") or {}
+    week = record["data"]["rate_limits"]["seven_day"]
+    if (prev.get("source") == "grok-bot" and prev_week.get("resets_at") == week["resets_at"]
+            and isinstance(prev_week.get("used_percentage"), (int, float))
+            and abs(prev_week["used_percentage"] - week["used_percentage"]) < 0.05
+            and time.time() - float(prev.get("time") or 0) < APP_USAGE_EVERY):
+        return False
+    write_json(path, record)
+    return True
+
+
+def app_window_focused():
+    """True when the Grok Bot window is focused, or when focus can't be read."""
+    try:
+        result = subprocess.run(["hyprctl", "activewindow", "-j"],
+                                capture_output=True, text=True, timeout=2)
+        if result.returncode != 0 or not result.stdout.strip():
+            return True
+        return json.loads(result.stdout).get("class") == "grok-bot"
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return True
+
+
+def grok_bot_open():
+    """True when a grok-bot process is running."""
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            if (entry / "comm").read_text().strip() == "grok-bot":
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def mark_app_down(seat, state):
+    """The page can't be read. Remember that, and say so once when it changes."""
+    new = "not connected" if grok_bot_open() else "away"
+    if state.get("state") != new:
+        log(f"app seat {seat}: {new}")
+    update_seat(seat, state=new, app_seen=time.time(), app_page="grok-bot")
+
+
+def reply_already_logged(seat, text):
+    """True when this seat already filed the same words, so a chat copy is not sent again."""
+    needle = (text or "").strip()
+    path = DATA / "log.jsonl"
+    if not needle or not path.exists():
+        return False
+    try:
+        blob = path.read_bytes()[-200000:]
+    except OSError:
+        return False
+    for line in blob.splitlines()[-40:]:
+        try:
+            record = json.loads(line)
+        except ValueError:
+            continue
+        if record.get("from") == seat and (record.get("text") or "").strip() == needle:
+            return True
+    return False
+
+
+def file_app_replies(seat, state, snap):
+    """File assistant bubbles newer than the cursor.
+
+    The first sight only stores the newest row. The second sight catches the
+    cursor up again and still files nothing, so rows that appear once the
+    transcript has scrolled are not posted as new replies. After that, assistant
+    text is filed. Nothing is filed or moved while a reply is still being written,
+    so a growing bubble is posted once, when it finishes.
+    """
+    if snap.get("replying"):
+        return
+    fresh, cursor = new_assistant_replies(snap.get("messages") or [], state.get("app_cursor"))
+    if not state.get("app_cursor"):
+        if cursor:
+            update_seat(seat, app_cursor=cursor)
+        return
+    if not state.get("app_primed"):
+        update_seat(seat, app_cursor=cursor or state.get("app_cursor"), app_primed=True)
+        return
+    for reply in fresh:
+        if reply_already_logged(seat, reply["text"]):
+            continue
+        send(seat, reply_target(reply["text"]), reply["text"])
+    if cursor and cursor != state.get("app_cursor"):
+        update_seat(seat, app_cursor=cursor)
+
+
+def app_key(cdp, kind, key, code, vk, modifiers=0, text=None):
+    params = {"type": kind, "key": key, "code": code, "windowsVirtualKeyCode": vk,
+              "nativeVirtualKeyCode": vk, "modifiers": modifiers}
+    if text is not None:
+        params["text"] = text
+    cdp.call("Input.dispatchKeyEvent", params)
+
+
+def app_press_enter(cdp):
+    app_key(cdp, "keyDown", "Enter", "Enter", 13, text="\r")
+    app_key(cdp, "keyUp", "Enter", "Enter", 13)
+
+
+def app_click_send_button(cdp):
+    """Click Send at its on-screen point. A DOM click does not submit this composer."""
+    box = cdp_eval(cdp, r"""(() => {
+      const button = document.querySelector('button[aria-label="Send message"]');
+      if (!button) return null;
+      const rect = button.getBoundingClientRect();
+      if (rect.width < 1 || rect.height < 1) return null;
+      return {x: rect.x + rect.width / 2, y: rect.y + rect.height / 2};
+    })()""")
+    if not isinstance(box, dict):
+        return False
+    for kind in ("mousePressed", "mouseReleased"):
+        cdp.call("Input.dispatchMouseEvent", {
+            "type": kind, "x": box["x"], "y": box["y"], "button": "left", "clickCount": 1})
+    return True
+
+
+def app_clear_composer(cdp):
+    app_key(cdp, "keyDown", "a", "KeyA", 65, modifiers=2)
+    app_key(cdp, "keyUp", "a", "KeyA", 65, modifiers=2)
+    app_key(cdp, "keyDown", "Backspace", "Backspace", 8)
+    app_key(cdp, "keyUp", "Backspace", "Backspace", 8)
+
+
+def composer_text_now(cdp):
+    value = cdp_eval(cdp, _COMPOSER_JS)
+    return None if value is None else str(value)
+
+
+def restore_notes(seat, notes):
+    for record in notes:
+        write_json(DATA / "inbox" / seat / f"{record['id']}.json", record)
+
+
+def deliver_app_notes(seat, state, cdp):
+    """take() the waiting notes, type them, and put them back if the send fails."""
+    snap = app_snapshot(cdp, seat, with_usage=False)
+    if not app_delivery_allowed(snap, app_window_focused(), state, seat):
+        return False
+    notes = take(seat, include_quiet=False, limit_chars=HANDOVER_MAX)
+    if not notes:
+        return False
+    text = render(notes, seat)
+    marker = text[:120]
+    update_seat(seat, state="busy", auto=next_auto(state, notes), woke_at=time.time(),
+                app_seen=time.time(), app_page="grok-bot")
+    try:
+        if not cdp_eval(cdp, _FOCUS_JS):
+            raise RuntimeError("no composer")
+        cdp.call("Input.insertText", {"text": text})
+        if marker in (composer_text_now(cdp) or ""):
+            if not app_click_send_button(cdp):
+                app_press_enter(cdp)
+            time.sleep(0.4)
+        if marker in (composer_text_now(cdp) or ""):
+            app_press_enter(cdp)
+            time.sleep(0.3)
+        deadline = time.time() + 1.5
+        while marker in (composer_text_now(cdp) or "") and time.time() < deadline:
+            time.sleep(0.2)
+        if marker in (composer_text_now(cdp) or ""):
+            cdp_eval(cdp, _FOCUS_JS)
+            app_clear_composer(cdp)
+            time.sleep(0.2)
+            raise RuntimeError("composer still holds the note")
+        cdp_eval(cdp, _SCROLL_JS)
+        time.sleep(0.2)
+        # The bubble has to be a user message. An empty composer alone can mean the insert missed.
+        landed = cdp_eval(cdp, "(() => [...document.querySelectorAll('.sand-message')]"
+                          ".some(m => m.getAttribute('data-role')==='user' && (m.innerText||'').includes("
+                          + json.dumps(marker) + ")))()")
+        if not landed:
+            raise RuntimeError("the note never reached the chat")
+    except Exception:
+        restore_notes(seat, notes)
+        update_seat(seat, state="idle", app_seen=time.time())
+        log(f"couldn't wake {seat}: send failed")
+        return False
+    log(f"woke {seat} with {len(notes)} note(s)")
+    return True
+
+
+def drive_app_seat(seat, cdp, focused):
+    """Read one app seat's chat, file new replies, and type a waiting note."""
+    state = load_seat(seat)
+    prev_usage = read_json(DATA / "usage" / f"{seat}.json") or {}
+    with_usage = time.time() - float(prev_usage.get("time") or 0) >= APP_USAGE_EVERY
+    snap = app_snapshot(cdp, seat, with_usage)
+    if not snap.get("has_row"):
+        return False  # this seat is not in the Grok Bot window
+    if with_usage:
+        write_app_usage(seat, snap.get("usage"))
+    if not snap.get("open"):
+        waiting = any(not record.get("quiet") for _, record in pending(seat))
+        if waiting and not focused and not snap.get("replying"):
+            cdp_eval(cdp, page_script(_CLICK_JS, seat))
+        update_seat(seat, state="not connected", app_seen=time.time(), app_page="grok-bot")
+        return False
+    file_app_replies(seat, state, snap)
+    page_state = "busy" if snap.get("replying") else "idle"
+    update_seat(seat, state=page_state, app_seen=time.time(), app_page="grok-bot")
+    if not any(not record.get("quiet") for _, record in pending(seat)):
+        return False
+    if state.get("auto", 0) >= AUTO_LIMIT and not owner_waiting(seat):
+        pause_notice(seat)
+        return False
+    if not app_delivery_allowed(snap, focused, state, seat):
+        return False
+    return deliver_app_notes(seat, state, cdp)
+
+
+def try_app_seats():
+    """One pass over the Grok Bot window for every app seat that lives there."""
+    if not APP_SEATS:
+        return
+    focused = app_window_focused()
+    try:
+        cdp = open_grok_bot_page()
+    except (OSError, RuntimeError, TimeoutError, ValueError, urllib.error.URLError):
+        for seat in APP_SEATS:
+            state = load_seat(seat)
+            if state.get("app_page") == "grok-bot":
+                mark_app_down(seat, state)
+        return
+    try:
+        cdp_eval(cdp, _SCROLL_JS)
+        time.sleep(0.2)
+        for seat in APP_SEATS:
+            try:
+                drive_app_seat(seat, cdp, focused)
+            except Exception as error:
+                log(f"app seat {seat} failed: {type(error).__name__}")
+    finally:
+        cdp.close()
+
+
+# -----------------------------------------------------------------------------
 # SECTION 8: records - git copies and the Discord mirror
 # -----------------------------------------------------------------------------
 
@@ -1000,6 +1676,10 @@ def serve():
                 try_wake(seat)
             except Exception as error:  # one bad seat must not stop the service
                 log(f"wake check for {seat} failed: {error}")
+        try:
+            try_app_seats()
+        except Exception as error:
+            log(f"app seat check failed: {type(error).__name__}")
         if time.time() - last_usage >= 30:
             last_usage = time.time()
             try:
@@ -1488,7 +2168,7 @@ def status_text():
         paused = ", PAUSED (loop guard)" if s["auto"] >= AUTO_LIMIT else ""
         rows.append(f"{seat:8} {s['state']:5}  {len(pending(seat))} waiting  {wake}{paused}")
     for seat in APP_SEATS:
-        rows.append(f"{seat:8} app    {len(pending(seat))} waiting  reads when asked")
+        rows.append(f"{seat:8} {app_seat_state(seat):14} {len(pending(seat))} waiting")
     hook_state = "Discord mirror: on" if WEBHOOK_FILE.exists() else "Discord mirror: off"
     return "\n".join(rows + [hook_state])
 
@@ -1927,6 +2607,82 @@ def self_test():
           composer_text(drop_placeholders(typed)) == "run the tests", repr(drop_placeholders(typed)))
     check("Grok's Notification hook matches idle_prompt only",
           grok_hooks("comms-deck")["hooks"]["Notification"][0].get("matcher") == "idle_prompt")
+    code = "\n".join([
+        "import importlib.machinery as m, importlib.util as u, json",
+        f"l = m.SourceFileLoader('cd', {me!r}); s = u.spec_from_loader('cd', l)",
+        "x = u.module_from_spec(s); l.exec_module(x)",
+        "assert x.reply_target('@claude please') == 'claude'",
+        "assert x.reply_target('@owner no') == 'owner'",
+        "assert x.reply_target('hello') == 'owner'",
+        "assert x.reply_target('  @grok x') == 'grok'",
+        "assert x.reply_target('@bob nope') == 'owner'",
+        "msgs = [{'key':'t1@1','role':'user','text':'old','continued':False},"
+        " {'key':'t1@2','role':'assistant','text':'seen','continued':False}]",
+        "fresh, cur = x.new_assistant_replies(msgs, None)",
+        "assert fresh == [] and cur == 't1@2'",
+        "more = msgs + [{'key':'t1@3','role':'user','text':'note','continued':False},"
+        " {'key':'t1@4','role':'assistant','text':'hello','continued':True},"
+        " {'key':'t1@5','role':'assistant','text':'there','continued':False}]",
+        "fresh, cur = x.new_assistant_replies(more, 't1@2')",
+        "assert len(fresh)==1 and fresh[0]['text']=='hello\\nthere' and fresh[0]['key']=='t1@5' and cur=='t1@5'",
+        "fresh, cur = x.new_assistant_replies(more, 't1@5')",
+        "assert fresh == [] and cur == 't1@5'",
+        "fresh, cur = x.new_assistant_replies(msgs + [{'key':'t1@3','role':'user','text':'note','continued':False}], 't1@2')",
+        "assert fresh == [] and cur == 't1@3'",
+        "idle = {'open': True, 'replying': False, 'composer': ''}",
+        "assert x.app_delivery_allowed({'open':True,'replying':True,'composer':''}, False, {'auto':0}, 'alice') is False",
+        "assert x.app_delivery_allowed({'open':True,'replying':False,'composer':'draft'}, False, {'auto':0}, 'alice') is False",
+        "assert x.app_delivery_allowed(idle, True, {'auto':0}, 'alice') is False",
+        "assert x.app_delivery_allowed(idle, False, {'auto':2}, 'alice') is False",
+        "x.write_json(x.DATA/'inbox'/'alice'/'own.json', {'from':'owner','text':'hi','quiet':False})",
+        "assert x.app_delivery_allowed(idle, False, {'auto':2}, 'alice') is True",
+        "rec = x.usage_record({'used_percentage': 8.169, 'resets_at': 1795882386115})",
+        "week = rec['data']['rate_limits']['seven_day']",
+        "assert rec['source']=='grok-bot'",
+        "assert rec['data']['model']['display_name']=='account usage, shared by all bots'",
+        "assert abs(week['used_percentage']-8.169)<1e-9 and week['resets_at']==1795882386",
+        "assert x.usage_record({'used_percentage': True, 'resets_at': 1}) is None",
+        "payload, mask = b'hello-frame', b'\\x11\\x22\\x33\\x44'",
+        "fin, op, body, rest = x.ws_parse_frame(x.ws_client_frame(1, payload, mask))",
+        "assert fin and op==1 and body==payload and rest==b''",
+        "assert x.ws_mask(x.ws_mask(payload, mask), mask)==payload",
+        "raw = bytes([0x81, len(payload)]) + payload",
+        "assert x.ws_parse_frame(raw)[2]==payload",
+        "threw = False",
+        "try:",
+        "    x.cdp_connect('ws://10.1.2.3:9222/devtools/page/abc')",
+        "except RuntimeError:",
+        "    threw = True",
+        "assert threw",
+        "base = [{'key':'t9@1','role':'assistant','text':'history','continued':False}]",
+        "x.file_app_replies('alice', {}, {'replying': False, 'messages': base})",
+        "st = x.load_seat('alice')",
+        "assert st.get('app_cursor')=='t9@1' and not st.get('app_primed')",
+        "grown = base + [{'key':'t9@2','role':'assistant','text':'caught up','continued':False}]",
+        "x.file_app_replies('alice', st, {'replying': False, 'messages': grown})",
+        "st = x.load_seat('alice')",
+        "assert st.get('app_primed') is True and st.get('app_cursor')=='t9@2'",
+        "log = (x.DATA/'log.jsonl').read_text() if (x.DATA/'log.jsonl').exists() else ''",
+        "assert 'caught up' not in log and 'history' not in log",
+        "new = grown + [{'key':'t9@3','role':'assistant','text':'@claude the port is up','continued':False}]",
+        "x.file_app_replies('alice', st, {'replying': False, 'messages': new})",
+        "st = x.load_seat('alice')",
+        "assert st.get('app_cursor')=='t9@3'",
+        "box = list((x.DATA/'inbox'/'claude').glob('*.json'))",
+        "assert len(box)==1",
+        "filed = json.loads(box[0].read_text())",
+        "assert filed['from']=='alice' and filed['to']=='claude' and filed['text']=='@claude the port is up'",
+        "user = new + [{'key':'t9@4','role':'user','text':'typed note','continued':False}]",
+        "x.file_app_replies('alice', st, {'replying': False, 'messages': user})",
+        "assert x.load_seat('alice').get('app_cursor')=='t9@4'",
+        "assert len(list((x.DATA/'inbox'/'claude').glob('*.json')))==1",
+        "x.update_seat('alice', state='idle', app_seen=x.time.time())",
+        "assert x.app_seat_state('alice')=='idle'",
+        "print('ok')",
+    ])
+    r = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True, timeout=30)
+    check("app seat replies, guards, usage and websocket mask",
+          r.returncode == 0 and r.stdout.strip() == "ok", r.stdout + r.stderr)
     shutil.rmtree(tmp, ignore_errors=True)
     print(f"\n{'all passed' if not failures else f'{len(failures)} failed'}")
     return 1 if failures else 0
