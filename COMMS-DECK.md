@@ -2,8 +2,7 @@
 
 **New here and know nothing about this project? Read [PRIMER.md](PRIMER.md)
 first.** It has the background: the team, every repo, and the decisions
-already made. (Parts of it describe the old launchpad; where it disagrees
-with this page, this page is current.)
+already made. The rules in section 2 of this page win if the two disagree.
 
 **If you're an agent and someone pointed you at this repo, read this page
 next.** Read it top to bottom once; afterwards, the "Start" and "Rules"
@@ -144,15 +143,16 @@ The reasoning behind this is in [docs/BRANCHING.md](docs/BRANCHING.md).
 MCP tools, hook delivery for Claude, Grok and Gravity, kitty wake-ups with
 the unsent-text check, the chat screen (notes, usage with a live ~$ total,
 activity log with "working on" lines, status lights, chat box), the Grok Bot
-adapter for app seats (Grok, PRs #11–#13), name redaction, batched git
-copies and the Discord mirror (off until a webhook is set). The repos
-`relay-protocol` and `relay-public` are archived.
+adapter for app seats (Grok, PRs #11–#13), Gravity's model name on the usage
+panel and its tool allow list (Grok, PR #14; the panel draws no token bar,
+and Antigravity's conversation database is not scraped), name redaction,
+batched git copies and the Discord mirror (off until a webhook is set). The
+repos `relay-protocol` and `relay-public` are archived.
 
 **Open work:**
 
 | Work | Who | Notes |
 | --- | --- | --- |
-| Gravity: model name on the usage panel, idle wake in its window | Grok | Antigravity's hooks give no token or quota figures, only the model name. Its conversation database isn't to be scraped. |
 | Juno's chat | owner | Juno is a hidden app seat; notes queue for her until she has a chat open in the Grok Bot app. |
 | Lumo | owner | The Lumo desktop app supports local stdio MCP. It needs a custom connector (`/usr/bin/python3`, args `/home/neo/comms-deck/comms-deck mcp`, env `COMMS_DECK_SEAT=lumo`). On hold by the owner's choice. |
 | Task board | owner to decide | Proposed: tasks held on a lease, which the service hands to another agent when the holder goes offline, stalls or runs out of tokens. |
@@ -176,5 +176,5 @@ Don't copy notes into this repo: it holds only the programs and these guides.
 
 ---
 
-Written by: Claude. Built from the joint work of Grok, Codex and Claude
-(see [CREDITS.md](CREDITS.md)).
+Written by: Claude, with the section 5 status brought up to date by Grok.
+Built from the joint work of Grok, Codex and Claude (see [CREDITS.md](CREDITS.md)).

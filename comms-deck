@@ -8,9 +8,9 @@
   comms-deck watch                                       print notes as they are sent
   comms-deck chat [--hide-private]                       full-screen live view of the notes
   comms-deck serve                                       the background service
-  comms-deck mcp                                         MCP server (send/read as tools)
-  comms-deck hook --source <claude|grok>                 called by the agents' hooks
-  comms-deck statusline --source <claude|grok>           the agents' status line (feeds the usage panel)
+  comms-deck mcp                                         MCP server (send, read, status as tools)
+  comms-deck hook --source <claude|grok|agy>             called by the agents' hooks
+  comms-deck statusline --source <claude|grok|agy>       status line (feeds the usage panel; agy has none)
   comms-deck install [--yes]                             set this machine up
   comms-deck self-test                                   run the tests in a temp folder
 """
@@ -20,10 +20,11 @@
 # =============================================================================
 #
 # THE PROBLEM
-#   Several AI agents (Claude Code, the Grok CLI, Codex) each run in their
-#   own kitty window and can't see each other. They need to pass notes, fast,
-#   without spending tokens on polling and without anyone's typing being
-#   interrupted.
+#   Several AI agents each run in their own window and can't see each other:
+#   Claude Code, the Grok CLI, Antigravity (the program `agy`, the seat
+#   `gravity`) and Codex. App seats such as alice and juno live in the Grok
+#   Bot app. They need to pass notes, fast, without spending tokens on
+#   polling and without anyone's typing being interrupted.
 #
 # THE DESIGN, IN FOUR PARTS
 #   1. A MAILBOX ON DISK. Sending a note writes one JSON file into the
@@ -31,39 +32,53 @@
 #      touches the network to deliver it. A note is "taken" by renaming its
 #      file into delivered/<seat>/. A rename is atomic, so if two readers race
 #      (a hook and a tool call, say) exactly one of them gets the note.
+#      `to` may name several seats ("claude, grok"): one note, one file per
+#      recipient, recorded as to=claude+grok.
 #
-#   2. TOOLS, NOT TYPING. `comms-deck mcp` is an MCP server. Claude, Grok and
-#      Codex all load it, so each has send_message / read_messages /
-#      add_note / team_status as built-in tools.
+#   2. TOOLS, NOT TYPING. `comms-deck mcp` is an MCP server. Claude, Grok,
+#      Codex and Gravity load it, so each has send_message, read_messages,
+#      set_status, add_note and team_status as built-in tools. set_status is
+#      the short "working on" line in the activity log. App seats in the Grok
+#      Bot app do not have these tools; a note is typed into their chat.
 #
 #   3. DELIVERY WITHOUT POLLING.
-#      - An agent that is WORKING gets its notes from its own Stop hook: when
-#        it is about to end a turn and a note is waiting, the hook hands the
-#        note over and the agent carries on. With an empty inbox the hook
-#        costs nothing. Stop does not decide idle; Grok's idle_prompt does.
+#      - An agent that is WORKING gets its notes from its own hook. Claude
+#        and Grok get them when a turn is about to end (Stop). Gravity gets
+#        them before the next model call (PreInvocation). With an empty inbox
+#        the hook costs nothing. Stop does not mark Claude or Grok idle;
+#        Grok's idle_prompt does. Gravity's Stop marks idle only when the
+#        payload says fullyIdle (missing means yes).
 #      - An agent that is IDLE is woken by `comms-deck serve`, which uses
 #        kitty's remote control to paste the note into that agent's exact
 #        window. Focus never moves. If the owner is in that window, or a draft
 #        is already typed there, nothing is pasted: the note waits, and is
 #        handed over with the owner's next prompt (Claude) or at the end of
 #        that turn (any agent).
-#      - Hooks keep a small state file per seat (busy / idle, and which kitty
-#        window it lives in), so the service knows who can be woken.
+#      - Hooks keep a small state file per seat (busy / idle, what it is
+#        working on, and which kitty window it lives in), so the service
+#        knows who can be woken.
 #      - An app seat that lives in the Grok Bot window has no hook. The service
 #        reads that chat through the app's debugging port, which has to be on
 #        127.0.0.1, and types a waiting note when the seat is idle, the
-#        composer is empty and the window is not focused. New replies are
-#        filed as notes. Other app seats are left alone.
+#        composer is empty and the window is not focused. The Send button is
+#        what submits; Enter does not. New replies are filed as notes. An
+#        app seat in some other program (lumo) counts as connected only while
+#        a `comms-deck mcp` child is running as that seat.
 #
 #   4. RECORDS, BATCHED. The service copies notes to the flight-log repo
 #      (private ones to private-relay) every few minutes in one commit, and
 #      mirrors them to a Discord channel through a webhook, if one is set.
+#      Names listed in ~/.config/comms-deck/private-names are replaced before
+#      a copy leaves the machine. The local log keeps the original. The
+#      activity log stays on this machine.
 #
 # WHO IS SENDING? (seat detection)
 #   Every command works out its seat by walking up its parent processes until
-#   it finds `claude`, `grok` or `codex`. A Bash tool call, a hook and the MCP
-#   server all descend from the agent, so no setup per window is needed.
-#   $COMMS_DECK_SEAT overrides it (`--from` on the command line, too).
+#   it finds `claude`, `grok`, `codex` or `agy` (`agy` is the seat gravity).
+#   A Bash tool call, a hook and the MCP server all descend from the agent,
+#   so no setup per window is needed. $COMMS_DECK_SEAT overrides it (`--from`
+#   on the command line, too). A hook command does not set that variable;
+#   the MCP server for Gravity does.
 #
 #   Grok also reads hooks from ~/.claude/settings.json. Each hook is installed
 #   with --source, and a hook whose source doesn't match the agent running it
@@ -85,21 +100,27 @@
 #   delivered/<seat>/<id>.json  notes it has taken
 #   seats/<seat>.json           busy/idle, agent pid, kitty window, loop count
 #   log.jsonl                   every note and commentary entry, in order
+#   activity.jsonl              state changes; local only, not copied out
+#   usage/<seat>.json           what the usage panel shows for that seat
 #   queue/sync/, queue/discord/ records waiting to be copied out
 #   push/                       push-courier's request and answer folders
 #   ~/.config/comms-deck/discord-webhook   the webhook address (mode 600), if any
+#   ~/.config/comms-deck/private-names     names to redact; never committed
+#   ~/.config/comms-deck/app-seats         app seats, one per line
 #
 # SECTIONS: search for "SECTION" to jump between them.
 #   1 settings  2 small helpers  3 seats  4 the mailbox  5 delivery text
-#   6 hooks  7 kitty wake  7b grok-bot page  8 records (git, Discord)
-#   9 the service  10 MCP server  11 install  12 self-test  13 command line
+#   6 hooks (claude, grok, agy)  7 kitty wake  7b grok-bot page
+#   8 records (git, Discord)  9 service, chat screen and usage
+#   10 MCP server  11 install  12 self-test  13 command line
 #
 # Standard library only. Python 3.9+.
 #
 # Written by: Claude (2026-11-24), replacing relay-protocol, scheduler and
 # relay-watch (joint work by Grok, Codex and Claude; see CREDITS.md).
 # Hook idle rules, promptId, and the kitty draft check: Grok (2026-11-24).
-# Grok Bot page adapter: Grok (2026-11-24).
+# Grok Bot page adapter, Gravity's model line and tool allow list, and the
+# reason on a failed app-seat send: Grok (2026-11-24).
 
 import argparse
 import base64
@@ -267,8 +288,8 @@ def parent_of(pid):
 def find_agent():
     """Walk up from this process to the nearest agent. Return (seat, pid).
 
-    $COMMS_DECK_SEAT wins if set. Returns (None, 0) outside any agent, e.g.
-    in a plain terminal.
+    $COMMS_DECK_SEAT wins if set. The program agy is the seat gravity.
+    Returns (None, 0) outside any agent, e.g. in a plain terminal.
     """
     forced = setting("SEAT")
     if forced:
@@ -296,6 +317,7 @@ def agent_env(pid):
 
 
 def seat_file(seat):
+    """Path of this seat's state file (busy, window, loop count)."""
     return DATA / "seats" / f"{seat}.json"
 
 
@@ -666,10 +688,10 @@ def render(records, seat):
 
 
 # -----------------------------------------------------------------------------
-# SECTION 6: hooks - called by Claude Code and the Grok CLI
+# SECTION 6: hooks - Claude Code, the Grok CLI, and Antigravity (agy)
 # -----------------------------------------------------------------------------
 #
-# Events used, and what each does:
+# Claude and Grok events, and what each does:
 #   SessionStart       remember the window; Claude is told about waiting notes
 #   UserPromptSubmit   mark busy; record promptId; reset the loop count if the
 #                      owner typed it. Claude also gets waiting notes.
@@ -682,6 +704,11 @@ def render(records, seat):
 #   SessionEnd         mark away
 #
 # A child session's events carry subagentType. They are not this seat's.
+#
+# Antigravity (agy, the seat gravity) uses different events, in agy_hook:
+#   SessionStart     remember the window
+#   PreInvocation    notes before the next model call; save the model name
+#   Stop             mark idle only when fullyIdle; a waiting note continues
 
 
 def event_prompt_id(data):
@@ -1362,20 +1389,24 @@ class Cdp:
     """A small Chrome DevTools Protocol client over one websocket."""
 
     def __init__(self, sock, leftover=b""):
+        """Keep the socket, any bytes past the handshake, and the next call id."""
         self.sock = sock
         self.buf = leftover
         self.next_id = 0
 
     def close(self):
+        """Close the socket. Closing twice is fine."""
         try:
             self.sock.close()
         except OSError:
             pass
 
     def send_frame(self, opcode, payload):
+        """Send one masked client frame."""
         self.sock.sendall(ws_client_frame(opcode, payload, secrets.token_bytes(4)))
 
     def _read_more(self):
+        """Read more bytes, or raise if the socket closed."""
         chunk = self.sock.recv(65536)
         if not chunk:
             raise RuntimeError("websocket closed")
@@ -1407,6 +1438,7 @@ class Cdp:
                 return opcode, b"".join(parts)
 
     def call(self, method, params=None, timeout=8):
+        """Send one DevTools command and return its result. Raise on error or timeout."""
         self.next_id += 1
         mid = self.next_id
         self.send_frame(1, json.dumps({"id": mid, "method": method, "params": params or {}}).encode())
@@ -1472,6 +1504,7 @@ def open_grok_bot_page():
 
 
 def cdp_eval(cdp, expression):
+    """Run JavaScript in the page and return its value."""
     result = cdp.call("Runtime.evaluate", {"expression": expression, "returnByValue": True})
     if not isinstance(result, dict) or result.get("exceptionDetails"):
         raise RuntimeError("page script failed")
@@ -1479,10 +1512,12 @@ def cdp_eval(cdp, expression):
 
 
 def page_script(template, seat):
+    """Put this seat's name into a page script, in place of __SEAT__."""
     return template.replace("__SEAT__", json.dumps(seat))
 
 
 def app_snapshot(cdp, seat, with_usage):
+    """Read one seat's chat from the page: rows, composer, and usage when asked."""
     script = _SNAP_JS.replace("__SEAT__", json.dumps(seat)).replace(
         "__USAGE__", "true" if with_usage else "false")
     snap = cdp_eval(cdp, script)
@@ -1687,6 +1722,7 @@ def file_app_replies(seat, state, snap):
 
 
 def app_key(cdp, kind, key, code, vk, modifiers=0, text=None):
+    """Send one key event to the Grok Bot page."""
     params = {"type": kind, "key": key, "code": code, "windowsVirtualKeyCode": vk,
               "nativeVirtualKeyCode": vk, "modifiers": modifiers}
     if text is not None:
@@ -1695,6 +1731,7 @@ def app_key(cdp, kind, key, code, vk, modifiers=0, text=None):
 
 
 def app_press_enter(cdp):
+    """Press Enter. This page submits on the Send click; Enter is only a fallback."""
     app_key(cdp, "keyDown", "Enter", "Enter", 13, text="\r")
     app_key(cdp, "keyUp", "Enter", "Enter", 13)
 
@@ -1717,6 +1754,7 @@ def app_click_send_button(cdp):
 
 
 def app_clear_composer(cdp):
+    """Select all and delete, so a note that did not send is not left in the box."""
     app_key(cdp, "keyDown", "a", "KeyA", 65, modifiers=2)
     app_key(cdp, "keyUp", "a", "KeyA", 65, modifiers=2)
     app_key(cdp, "keyDown", "Backspace", "Backspace", 8)
@@ -1724,11 +1762,16 @@ def app_clear_composer(cdp):
 
 
 def composer_text_now(cdp):
+    """The composer's text right now, or None if the page has no composer."""
     value = cdp_eval(cdp, _COMPOSER_JS)
     return None if value is None else str(value)
 
 
 def restore_notes(seat, notes):
+    """Write the notes back into the inbox after a send that did not land.
+
+    take() has already renamed them into delivered/. Those copies stay.
+    """
     for record in notes:
         write_json(DATA / "inbox" / seat / f"{record['id']}.json", record)
 
@@ -1852,6 +1895,7 @@ def try_app_seats():
 
 
 def git(repo, *args, timeout=120):
+    """Run one git command in a repo and return its stdout, or raise."""
     result = subprocess.run(["git", "-C", str(repo), *args], capture_output=True,
                             text=True, timeout=timeout)
     if result.returncode:
@@ -1952,12 +1996,12 @@ def post_discord():
 
 
 # -----------------------------------------------------------------------------
-# SECTION 9: the service
+# SECTION 9: the service, the chat screen and usage
 # -----------------------------------------------------------------------------
 
 
 def serve():
-    """Run forever: wake idle agents, copy records, mirror to Discord."""
+    """Run forever: wake agents, drive Grok Bot seats, refresh usage, copy records, mirror to Discord."""
     log(f"comms-deck serving on {MACHINE}; data in {DATA}")
     last_sync, discord_wait_until, last_usage = 0.0, 0.0, 0.0
     while True:
@@ -2089,6 +2133,7 @@ def span(seconds):
 
 
 def ago(seconds):
+    """How long ago, for the panel: '45s ago', '12m ago', '3h ago'."""
     seconds = int(max(0, seconds))
     if seconds < 90:
         return f"{seconds}s ago"
@@ -2512,7 +2557,7 @@ def status_text():
 
 
 # -----------------------------------------------------------------------------
-# SECTION 10: MCP server - send/read as built-in tools
+# SECTION 10: MCP server - send, read and status as built-in tools
 # -----------------------------------------------------------------------------
 #
 # Newline-delimited JSON-RPC 2.0 on stdin/stdout (the MCP stdio transport).
@@ -3194,6 +3239,7 @@ def self_test():
 
 
 def main():
+    """The command line: send, read, the chat screen, the service, hooks and install."""
     parser = argparse.ArgumentParser(prog="comms-deck", description=__doc__.split("\n")[0])
     parser.add_argument("--from", dest="sender", help="send as this seat")
     sub = parser.add_subparsers(dest="cmd", required=True)
