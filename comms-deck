@@ -8,8 +8,7 @@
   comms-deck watch                                       print notes as they are sent
   comms-deck chat [--hide-private]                       full-screen live view of the notes
   comms-deck serve                                       the background service
-  comms-deck mcp                                        MCP server (send/read as tools)
-  comms-deck token <seat>                               the HTTP MCP token for an app seat
+  comms-deck mcp                                         MCP server (send/read as tools)
   comms-deck hook --source <claude|grok>                 called by the agents' hooks
   comms-deck statusline --source <claude|grok>           the agents' status line (feeds the usage panel)
   comms-deck install [--yes]                             set this machine up
@@ -134,17 +133,12 @@ for _pair in filter(None, setting("SEATS", "").split(",")):
     AGENTS[_name.strip()] = (_proc or _name).strip()
 # App seats: bots in the Grok Bot app (e.g. alice). They use the MCP tools to
 # send and read, but have no hooks and no kitty window, so nothing wakes them;
-# they read their notes when they check. One per line in
-# ~/.config/comms-deck/app-seats, as "name" or "name:app-process" ("#" starts
-# a comment). The process is the app the seat lives in (default grok-bot).
+# they read their notes when they check. One name per line in
+# ~/.config/comms-deck/app-seats ("#" starts a comment).
 _app_file = CONFIG / "app-seats"
-APP_PROCESS = {}
-for _line in (_app_file.read_text().splitlines() if _app_file.exists() else []):
-    _line = _line.split("#")[0].strip()
-    if _line:
-        _name, _, _proc = _line.partition(":")
-        APP_PROCESS[_name.strip()] = _proc.strip() or "grok-bot"
-APP_SEATS = tuple(APP_PROCESS)
+APP_SEATS = tuple(line.split("#")[0].strip() for line in
+                  (_app_file.read_text().splitlines() if _app_file.exists() else [])
+                  if line.split("#")[0].strip())
 SEATS = tuple(AGENTS) + APP_SEATS + ("owner",)
 
 # The repos the notes are copied to. A missing clone just means no copy.
@@ -340,7 +334,7 @@ def app_seat_state(seat):
             continue
         try:
             comm = (d / "comm").read_text().strip()
-            if comm == APP_PROCESS.get(seat, "grok-bot")[:15]:  # /proc comm is cut at 15
+            if comm == "grok-bot":
                 app_open = True
                 continue
             cmd = (d / "cmdline").read_bytes()
@@ -350,9 +344,6 @@ def app_seat_state(seat):
                     return "connected"
         except OSError:
             continue
-    seen = (read_json(seat_file(seat), {}) or {}).get("http_seen") or 0
-    if time.time() - float(seen) < 600:
-        return "connected"
     return "not connected" if app_open else "away"
 
 
@@ -995,7 +986,6 @@ def post_discord():
 def serve():
     """Run forever: wake idle agents, copy records, mirror to Discord."""
     log(f"comms-deck serving on {MACHINE}; data in {DATA}")
-    http_mcp_server()
     last_sync, discord_wait_until = 0.0, 0.0
     while True:
         for seat in AGENTS:
@@ -1506,132 +1496,6 @@ def mcp():
 
 
 # -----------------------------------------------------------------------------
-# SECTION 10b: MCP over HTTP - for apps that can't run a local command
-# -----------------------------------------------------------------------------
-#
-# Some agents' apps only connect to MCP servers by URL (the Lumo desktop app
-# uses rmcp's streamable-HTTP client). `comms-deck serve` also answers MCP at
-# http://127.0.0.1:HTTP_PORT/mcp, on this machine only. Each seat gets its own
-# secret token (`comms-deck token <seat>`), and the token says which seat is
-# calling, so one app can't send as another. Tokens live in
-# ~/.config/comms-deck/http-tokens.json (mode 600), never in a repo or a note.
-# Responses are plain JSON (the transport allows that instead of a stream).
-
-HTTP_PORT = int(setting("HTTP_PORT", "47620"))
-TOKENS_FILE = CONFIG / "http-tokens.json"
-
-
-def seat_token(seat):
-    """The HTTP token for `seat`, made on first use."""
-    import secrets
-    tokens = read_json(TOKENS_FILE, {}) or {}
-    for token, owner in tokens.items():
-        if owner == seat:
-            return token
-    token = secrets.token_urlsafe(32)
-    tokens[token] = seat
-    CONFIG.mkdir(parents=True, exist_ok=True)
-    write_json(TOKENS_FILE, tokens)
-    os.chmod(TOKENS_FILE, 0o600)
-    return token
-
-
-def mcp_answer(seat, msg):
-    """The JSON-RPC reply to one MCP message from `seat`, or None for a notification."""
-    method, msg_id = msg.get("method"), msg.get("id")
-    if msg_id is None:
-        return None
-    reply = {"jsonrpc": "2.0", "id": msg_id}
-    if method == "initialize":
-        reply["result"] = {
-            "protocolVersion": (msg.get("params") or {}).get("protocolVersion", "2025-06-18"),
-            "capabilities": {"tools": {}},
-            "serverInfo": {"name": "comms-deck", "version": "2.0"},
-            "instructions": f"You are the '{seat}' seat on comms-deck, the team's message board. "
-                            "Use read_messages to see notes for you and send_message to reply."}
-    elif method == "tools/list":
-        reply["result"] = {"tools": MCP_TOOLS}
-    elif method == "tools/call":
-        params = msg.get("params") or {}
-        try:
-            text, failed = mcp_call(seat, params.get("name"), params.get("arguments") or {})
-        except ValueError as error:
-            text, failed = str(error), True
-        reply["result"] = {"content": [{"type": "text", "text": text}], "isError": failed}
-    elif method == "ping":
-        reply["result"] = {}
-    else:
-        reply["error"] = {"code": -32601, "message": f"no method {method}"}
-    return reply
-
-
-def http_mcp_server():
-    """Start the HTTP MCP endpoint in a background thread (127.0.0.1 only)."""
-    import http.server
-    import threading
-
-    class Handler(http.server.BaseHTTPRequestHandler):
-        def log_message(self, *args):
-            pass
-
-        def _send(self, code, body=None, extra=None):
-            data = json.dumps(body).encode() if body is not None else b""
-            self.send_response(code)
-            if body is not None:
-                self.send_header("Content-Type", "application/json")
-            for k, v in (extra or {}).items():
-                self.send_header(k, v)
-            self.send_header("Content-Length", str(len(data)))
-            self.end_headers()
-            self.wfile.write(data)
-
-        def _seat(self):
-            host = (self.headers.get("Host") or "").rsplit(":", 1)[0].strip("[]")
-            if host not in ("127.0.0.1", "localhost", "::1"):
-                return None  # refuse DNS-rebinding style requests
-            auth = self.headers.get("Authorization") or ""
-            token = auth[7:].strip() if auth.lower().startswith("bearer ") else ""
-            seat = (read_json(TOKENS_FILE, {}) or {}).get(token) if token else None
-            return seat if seat in SEATS and seat != "owner" else None
-
-        def do_POST(self):
-            if self.path.split("?")[0] != "/mcp":
-                return self._send(404, {"error": "not found"})
-            seat = self._seat()
-            if not seat:
-                return self._send(401, {"error": "unauthorized"},
-                                  {"WWW-Authenticate": 'Bearer realm="comms-deck"'})
-            try:
-                length = int(self.headers.get("Content-Length") or 0)
-                body = json.loads(self.rfile.read(min(length, 1 << 20)) or b"null")
-            except ValueError:
-                return self._send(400, {"jsonrpc": "2.0", "id": None,
-                                        "error": {"code": -32700, "message": "parse error"}})
-            batch = body if isinstance(body, list) else [body]
-            replies = [r for r in (mcp_answer(seat, m) for m in batch if isinstance(m, dict)) if r]
-            update_seat(seat, http_seen=time.time())
-            if not replies:
-                return self._send(202)
-            self._send(200, replies if isinstance(body, list) else replies[0],
-                       {"Mcp-Session-Id": f"{seat}"})
-
-        def do_GET(self):
-            self._send(405, {"error": "no event stream; POST JSON-RPC to /mcp"}, {"Allow": "POST"})
-
-        def do_DELETE(self):
-            self._send(200, {})
-
-    try:
-        server = http.server.ThreadingHTTPServer(("127.0.0.1", HTTP_PORT), Handler)
-    except OSError as error:
-        log(f"HTTP MCP endpoint not started on 127.0.0.1:{HTTP_PORT}: {error}")
-        return None
-    threading.Thread(target=server.serve_forever, daemon=True).start()
-    log(f"MCP over HTTP at http://127.0.0.1:{HTTP_PORT}/mcp")
-    return server
-
-
-# -----------------------------------------------------------------------------
 # SECTION 11: install - set this machine up (safe to run again)
 # -----------------------------------------------------------------------------
 
@@ -1881,38 +1745,6 @@ def self_test():
           and not replies[2]["result"]["isError"], r.stdout + r.stderr)
     r = run(["read"], "claude")
     check("note sent over MCP arrives", "via mcp" in r.stdout, r.stdout)
-    Path(f"{tmp}/config").mkdir(parents=True, exist_ok=True)
-    Path(f"{tmp}/config/app-seats").write_text("lumo:lumo-desktop\n")
-    code = ("import importlib.machinery as m, importlib.util as u, json, socket, urllib.request, urllib.error\n"
-            "s = socket.socket(); s.bind(('127.0.0.1', 0)); port = s.getsockname()[1]; s.close()\n"
-            "import os; os.environ['COMMS_DECK_HTTP_PORT'] = str(port)\n"
-            f"l = m.SourceFileLoader('cd', {me!r}); sp = u.spec_from_loader('cd', l)\n"
-            "x = u.module_from_spec(sp); l.exec_module(x); x.http_mcp_server()\n"
-            "def post(body, token=None, host=None):\n"
-            "    h = {'Content-Type': 'application/json'}\n"
-            "    if token: h['Authorization'] = 'Bearer ' + token\n"
-            "    if host: h['Host'] = host\n"
-            "    req = urllib.request.Request(f'http://127.0.0.1:{port}/mcp', json.dumps(body).encode(), h)\n"
-            "    try:\n"
-            "        r = urllib.request.urlopen(req, timeout=5); return r.status, (json.loads(r.read() or b'null'))\n"
-            "    except urllib.error.HTTPError as e: return e.code, None\n"
-            "tok = x.seat_token('lumo')\n"
-            "print(post({'jsonrpc':'2.0','id':1,'method':'tools/list'})[0])\n"
-            "print(post({'jsonrpc':'2.0','id':1,'method':'tools/list'}, 'wrong')[0])\n"
-            "print(post({'jsonrpc':'2.0','id':1,'method':'tools/list'}, tok, 'evil.example')[0])\n"
-            "c, r = post({'jsonrpc':'2.0','id':1,'method':'initialize','params':{'protocolVersion':'2025-06-18'}}, tok)\n"
-            "print(c, 'lumo' in r['result']['instructions'])\n"
-            "print(post({'jsonrpc':'2.0','method':'notifications/initialized'}, tok)[0])\n"
-            "c, r = post({'jsonrpc':'2.0','id':2,'method':'tools/call','params':{'name':'send_message','arguments':{'to':'claude','text':'via http'}}}, tok)\n"
-            "print(c, r['result']['isError'])\n"
-            "print(x.app_seat_state('lumo'))\n")
-    r = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True, timeout=30)
-    check("HTTP MCP: no token, wrong token and wrong Host are refused; a token is its seat",
-          " ".join(l for l in r.stdout.splitlines() if "MCP over HTTP" not in l).split()
-          == ["401", "401", "401", "200", "True", "202", "200", "False", "connected"],
-          r.stdout + r.stderr)
-    r = run(["read"], "claude")
-    check("note sent over HTTP arrives from lumo", "via http" in r.stdout and "From lumo" in r.stdout, r.stdout)
 
     def seat(name="grok"):
         return read_json(Path(tmp) / "data" / "seats" / f"{name}.json", {}) or {}
@@ -2030,8 +1862,6 @@ def main():
     p.add_argument("--history", type=int, default=200)
     sub.add_parser("serve")
     sub.add_parser("mcp")
-    p = sub.add_parser("token")
-    p.add_argument("seat")
     p = sub.add_parser("hook")
     p.add_argument("--source", required=True, choices=("claude", "grok"))
     p.add_argument("--event", default="")
@@ -2074,10 +1904,6 @@ def main():
             serve()
         elif args.cmd == "mcp":
             mcp()
-        elif args.cmd == "token":
-            if args.seat not in SEATS or args.seat == "owner":
-                sys.exit(f"comms-deck: no seat {args.seat!r}")
-            print(seat_token(args.seat))
         elif args.cmd == "hook":
             try:
                 hook(args.source, args.event)
