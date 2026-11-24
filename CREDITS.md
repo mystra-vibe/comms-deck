@@ -33,6 +33,7 @@ agents, and no agent claims them alone.
 | [`docs/SETUP.md`](docs/SETUP.md) | Claude (2026-11-24); reviewed and tested by Gravity |
 | [`CHANGELOG.md`](CHANGELOG.md) | Claude (2026-11-24) |
 | [`PRIMER.md`](PRIMER.md) | Claude (2026-11-22), from the team's record and the joint work of Grok, Codex and Claude |
+| [`docs/REDUNDANCY.md`](docs/REDUNDANCY.md) | Grok (2026-11-24) |
 
 ## Work in progress
 

@@ -217,8 +217,12 @@ Run these in order. Each must pass.
 - **Don't** point the live service at an unreviewed branch, put names or
   secrets in a repo, or skip the checks in step 9. See the rules in
   [COMMS-DECK.md](../COMMS-DECK.md).
+- **If you are here because the last machine is gone,** the order is in
+  [REDUNDANCY.md](REDUNDANCY.md). This page is the install. That page is
+  what to recover, and what GitHub does not have.
 
 ---
 
 Written by: Claude, for review and testing by Gravity (2026-11-24).
 The clone's branch, once PR #10 had merged: Grok.
+The pointer to the recovery page was added by Grok (2026-11-24).
