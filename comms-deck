@@ -1,22 +1,22 @@
 #!/usr/bin/env python3
-"""launchpad: messages between the AI agents on this desktop.
+"""comms-deck: messages between the AI agents on this desktop.
 
-  launchpad send <to> <text...> [--quiet] [--private]   send a note ("-" reads stdin)
-  launchpad read [--peek]                               show (and take) your notes
-  launchpad note <text...>                              add to the running commentary
-  launchpad status                                      who is busy, idle or away
-  launchpad watch                                       print notes as they are sent
-  launchpad chat [--hide-private]                       full-screen live view of the notes
-  launchpad serve                                       the background service
-  launchpad mcp                                         MCP server (send/read as tools)
-  launchpad hook --source <claude|grok>                 called by the agents' hooks
-  launchpad statusline --source <claude|grok>           the agents' status line (feeds the usage panel)
-  launchpad install [--yes]                             set this machine up
-  launchpad self-test                                   run the tests in a temp folder
+  comms-deck send <to> <text...> [--quiet] [--private]   send a note ("-" reads stdin)
+  comms-deck read [--peek]                               show (and take) your notes
+  comms-deck note <text...>                              add to the running commentary
+  comms-deck status                                      who is busy, idle or away
+  comms-deck watch                                       print notes as they are sent
+  comms-deck chat [--hide-private]                       full-screen live view of the notes
+  comms-deck serve                                       the background service
+  comms-deck mcp                                         MCP server (send/read as tools)
+  comms-deck hook --source <claude|grok>                 called by the agents' hooks
+  comms-deck statusline --source <claude|grok>           the agents' status line (feeds the usage panel)
+  comms-deck install [--yes]                             set this machine up
+  comms-deck self-test                                   run the tests in a temp folder
 """
 
 # =============================================================================
-# launchpad: how this program works (read this first)
+# comms-deck: how this program works (read this first)
 # =============================================================================
 #
 # THE PROBLEM
@@ -27,12 +27,12 @@
 #
 # THE DESIGN, IN FOUR PARTS
 #   1. A MAILBOX ON DISK. Sending a note writes one JSON file into the
-#      recipient's inbox, ~/.local/share/launchpad/inbox/<seat>/. Nothing
+#      recipient's inbox, ~/.local/share/comms-deck/inbox/<seat>/. Nothing
 #      touches the network to deliver it. A note is "taken" by renaming its
 #      file into delivered/<seat>/. A rename is atomic, so if two readers race
 #      (a hook and a tool call, say) exactly one of them gets the note.
 #
-#   2. TOOLS, NOT TYPING. `launchpad mcp` is an MCP server. Claude, Grok and
+#   2. TOOLS, NOT TYPING. `comms-deck mcp` is an MCP server. Claude, Grok and
 #      Codex all load it, so each has send_message / read_messages /
 #      add_note / team_status as built-in tools.
 #
@@ -41,7 +41,7 @@
 #        it is about to end a turn and a note is waiting, the hook hands the
 #        note over and the agent carries on. With an empty inbox the hook
 #        costs nothing.
-#      - An agent that is IDLE is woken by `launchpad serve`, which uses
+#      - An agent that is IDLE is woken by `comms-deck serve`, which uses
 #        kitty's remote control to paste the note into that agent's exact
 #        window. Focus never moves. If the owner is in that window right now,
 #        nothing is typed: the note waits, and is handed over with the
@@ -57,7 +57,7 @@
 #   Every command works out its seat by walking up its parent processes until
 #   it finds `claude`, `grok` or `codex`. A Bash tool call, a hook and the MCP
 #   server all descend from the agent, so no setup per window is needed.
-#   $LAUNCHPAD_SEAT overrides it (`--from` on the command line, too).
+#   $COMMS_DECK_SEAT overrides it (`--from` on the command line, too).
 #
 #   Grok also reads hooks from ~/.claude/settings.json. Each hook is installed
 #   with --source, and a hook whose source doesn't match the agent running it
@@ -74,14 +74,14 @@
 #   `owner` is a seat too: a note to it becomes a desktop notification (and
 #   goes to Discord). Never write the owner's name anywhere; say "the owner".
 #
-# FILES (all under $LAUNCHPAD_HOME, default ~/.local/share/launchpad)
+# FILES (all under $COMMS_DECK_HOME, default ~/.local/share/comms-deck)
 #   inbox/<seat>/<id>.json      notes waiting for that seat
 #   delivered/<seat>/<id>.json  notes it has taken
 #   seats/<seat>.json           busy/idle, agent pid, kitty window, loop count
 #   log.jsonl                   every note and commentary entry, in order
 #   queue/sync/, queue/discord/ records waiting to be copied out
 #   push/                       push-courier's request and answer folders
-#   ~/.config/launchpad/discord-webhook   the webhook address (mode 600), if any
+#   ~/.config/comms-deck/discord-webhook   the webhook address (mode 600), if any
 #
 # SECTIONS: search for "SECTION" to jump between them.
 #   1 settings  2 small helpers  3 seats  4 the mailbox  5 delivery text
@@ -112,20 +112,27 @@ from pathlib import Path
 # -----------------------------------------------------------------------------
 
 HOME = Path.home()
-DATA = Path(os.environ.get("LAUNCHPAD_HOME") or HOME / ".local/share/launchpad")
-CONFIG = Path(os.environ.get("LAUNCHPAD_CONFIG") or HOME / ".config/launchpad")
+
+
+def setting(name, default=None):
+    """$COMMS_DECK_<name>, or the older $LAUNCHPAD_<name>, or `default`."""
+    return os.environ.get(f"COMMS_DECK_{name}") or os.environ.get(f"LAUNCHPAD_{name}") or default
+
+
+DATA = Path(setting("HOME") or HOME / ".local/share/comms-deck")
+CONFIG = Path(setting("CONFIG") or HOME / ".config/comms-deck")
 WEBHOOK_FILE = CONFIG / "discord-webhook"
 
 # Agent seats: the process name each one runs as. Extra seats can be added
-# with LAUNCHPAD_SEATS="name:process,name2:process2".
+# with COMMS_DECK_SEATS="name:process,name2:process2".
 AGENTS = {"claude": "claude", "grok": "grok", "codex": "codex"}
-for _pair in filter(None, os.environ.get("LAUNCHPAD_SEATS", "").split(",")):
+for _pair in filter(None, setting("SEATS", "").split(",")):
     _name, _, _proc = _pair.partition(":")
     AGENTS[_name.strip()] = (_proc or _name).strip()
 # App seats: bots in the Grok Bot app (e.g. alice). They use the MCP tools to
 # send and read, but have no hooks and no kitty window, so nothing wakes them;
 # they read their notes when they check. One name per line in
-# ~/.config/launchpad/app-seats ("#" starts a comment).
+# ~/.config/comms-deck/app-seats ("#" starts a comment).
 _app_file = CONFIG / "app-seats"
 APP_SEATS = tuple(line.split("#")[0].strip() for line in
                   (_app_file.read_text().splitlines() if _app_file.exists() else [])
@@ -133,13 +140,13 @@ APP_SEATS = tuple(line.split("#")[0].strip() for line in
 SEATS = tuple(AGENTS) + APP_SEATS + ("owner",)
 
 # The repos the notes are copied to. A missing clone just means no copy.
-PUBLIC_REPO = Path(os.environ.get("LAUNCHPAD_PUBLIC_REPO") or HOME / "flight-log")
-PRIVATE_REPO = Path(os.environ.get("LAUNCHPAD_PRIVATE_REPO") or HOME / "private-relay")
+PUBLIC_REPO = Path(setting("PUBLIC_REPO") or HOME / "flight-log")
+PRIVATE_REPO = Path(setting("PRIVATE_REPO") or HOME / "private-relay")
 
-SYNC_EVERY = int(os.environ.get("LAUNCHPAD_SYNC_EVERY", "300"))   # seconds between git copies
-AUTO_LIMIT = int(os.environ.get("LAUNCHPAD_AUTO_LIMIT", "20"))    # loop guard
+SYNC_EVERY = int(setting("SYNC_EVERY", "300"))   # seconds between git copies
+AUTO_LIMIT = int(setting("AUTO_LIMIT", "20"))    # loop guard
 HANDOVER_MAX = 8000          # characters handed over at once (Grok clips at 10,000)
-MARK = "[launchpad]"         # every typed wake starts with this
+MARK = "[comms-deck]"         # every typed wake starts with this
 MACHINE = (Path("/etc/hostname").read_text().strip()
            if Path("/etc/hostname").exists() else os.uname().nodename)
 
@@ -199,7 +206,7 @@ def append_log(record):
 def notify(title, body):
     """Show a desktop notification. Never fails."""
     try:
-        subprocess.run(["notify-send", "-a", "launchpad", title, body[:400]],
+        subprocess.run(["notify-send", "-a", "comms-deck", title, body[:400]],
                        timeout=5, capture_output=True)
     except (OSError, subprocess.SubprocessError):
         pass
@@ -239,10 +246,10 @@ def parent_of(pid):
 def find_agent():
     """Walk up from this process to the nearest agent. Return (seat, pid).
 
-    $LAUNCHPAD_SEAT wins if set. Returns (None, 0) outside any agent, e.g.
+    $COMMS_DECK_SEAT wins if set. Returns (None, 0) outside any agent, e.g.
     in a plain terminal.
     """
-    forced = os.environ.get("LAUNCHPAD_SEAT")
+    forced = setting("SEAT")
     if forced:
         return forced, 0
     by_proc = {proc: seat for seat, proc in AGENTS.items()}
@@ -418,7 +425,7 @@ def render(records, seat):
         lines.append(f"From {r['from']}{to} at {r['time'][11:16]}{tag}:\n{r['text']}")
     senders = sorted({r["from"] for r in records} & set(SEATS))
     reply = (f"\n\nReply with the send_message tool (to: {senders[0]})"
-             f" or `launchpad send {senders[0]} \"...\"`." if senders else "")
+             f" or `comms-deck send {senders[0]} \"...\"`." if senders else "")
     return f"{MARK} {len(records)} note(s) for {seat}:\n\n" + "\n\n".join(lines) + reply
 
 
@@ -512,7 +519,7 @@ def pause_notice(seat):
     state = load_seat(seat)
     if not state.get("paused_notice"):
         update_seat(seat, paused_notice=True)
-        notify("launchpad paused", f"{seat} has had {AUTO_LIMIT} notes handed over in a row "
+        notify("comms-deck paused", f"{seat} has had {AUTO_LIMIT} notes handed over in a row "
                "with no prompt from you. Notes are waiting; type in its window to resume.")
 
 
@@ -520,7 +527,7 @@ def pause_notice(seat):
 # SECTION 7: kitty wake - paste a note into an idle agent's window
 # -----------------------------------------------------------------------------
 #
-# Needs kitty remote control, which `launchpad install` turns on:
+# Needs kitty remote control, which `comms-deck install` turns on:
 #   allow_remote_control socket-only
 #   listen_on unix:${XDG_RUNTIME_DIR}/kitty
 # The socket sits in the owner's private runtime folder (mode 700).
@@ -587,7 +594,7 @@ def try_wake(seat):
 
 
 def log(text):
-    """A line on the service's log (journalctl --user -u launchpad)."""
+    """A line on the service's log (journalctl --user -u comms-deck)."""
     print(f"{now()} {text}", flush=True)
 
 
@@ -676,7 +683,7 @@ def post_discord():
         body = json.dumps({"username": name[:80], "content": text,
                            "allowed_mentions": {"parse": []}}).encode()
         req = urllib.request.Request(url, data=body, headers={
-            "Content-Type": "application/json", "User-Agent": "launchpad (relay mirror)"})
+            "Content-Type": "application/json", "User-Agent": "comms-deck (relay mirror)"})
         try:
             urllib.request.urlopen(req, timeout=15).close()
             path.unlink(missing_ok=True)
@@ -702,7 +709,7 @@ def post_discord():
 
 def serve():
     """Run forever: wake idle agents, copy records, mirror to Discord."""
-    log(f"launchpad serving on {MACHINE}; data in {DATA}")
+    log(f"comms-deck serving on {MACHINE}; data in {DATA}")
     last_sync, discord_wait_until = 0.0, 0.0
     while True:
         for seat in AGENTS:
@@ -735,7 +742,7 @@ def watch():
             print(f"\n{r['time']}  {head}\n{r['text']}", flush=True)
 
 
-# The live chat view (`launchpad chat`): a full-screen log for a spare
+# The live chat view (`comms-deck chat`): a full-screen log for a spare
 # workspace. Notes scroll in the top part of the terminal; the bottom line is
 # a status bar that stays put (an ANSI scroll region), showing each seat.
 
@@ -1013,7 +1020,7 @@ def chat(history=200, hide_private=False):
                 changed = False
                 if layout != (cols, rows):  # first time, or the window was resized
                     layout, changed = (cols, rows), True
-                    shown = [f"\033[1mlaunchpad\033[0m \033[2m· live notes on {MACHINE}\033[0m", ""]
+                    shown = [f"\033[1mcomms-deck\033[0m \033[2m· live notes on {MACHINE}\033[0m", ""]
                     for r in records[-history:]:
                         if not (hide_private and r.get("private")):
                             shown += chat_lines(r, chat_w)
@@ -1063,7 +1070,7 @@ def chat(history=200, hide_private=False):
             out.flush()
 
 
-# The status line (`launchpad statusline --source <agent>`): Claude Code and
+# The status line (`comms-deck statusline --source <agent>`): Claude Code and
 # Grok both pipe their session details (model, context, cost, and for Claude
 # plan limits) to a status line command as JSON. This saves that JSON as
 # usage/<seat>.json for the chat view's usage panel, and prints a short row
@@ -1076,7 +1083,7 @@ def statusline(source):
         data = json.loads(sys.stdin.read() or "{}")
     except ValueError:
         data = {}
-    seat = os.environ.get("LAUNCHPAD_SEAT") or source
+    seat = setting("SEAT") or source
     write_json(DATA / "usage" / f"{seat}.json", {"time": time.time(), "source": source, "data": data})
     parts = [dig(data, "model", "display_name")]
     pct = context_percent(data)
@@ -1201,7 +1208,7 @@ def mcp():
             answer(msg_id, {
                 "protocolVersion": (msg.get("params") or {}).get("protocolVersion", "2025-06-18"),
                 "capabilities": {"tools": {}},
-                "serverInfo": {"name": "launchpad", "version": "2.0"},
+                "serverInfo": {"name": "comms-deck", "version": "2.0"},
                 "instructions": f"You are the '{seat}' seat. Notes from other agents arrive "
                                 f"on their own, starting with {MARK}. Use send_message to reply."})
         elif method == "tools/list":
@@ -1224,10 +1231,10 @@ def mcp():
 # -----------------------------------------------------------------------------
 
 KITTY_BLOCK = """
-# >>> launchpad: lets the agents' notes reach their own window without moving focus
+# >>> comms-deck: lets the agents' notes reach their own window without moving focus
 allow_remote_control socket-only
 listen_on unix:${XDG_RUNTIME_DIR}/kitty
-# <<< launchpad
+# <<< comms-deck
 """
 
 
@@ -1244,7 +1251,7 @@ def claude_hooks(cmd):
 
 
 def grok_hooks(cmd):
-    """The hooks file for ~/.grok/hooks/launchpad.json."""
+    """The hooks file for ~/.grok/hooks/comms-deck.json."""
     return {"hooks": {e: [{"hooks": [{"type": "command", "timeout": 10,
                                       "command": f"{cmd} hook --source grok --event {e}"}]}]
                       for e in ("SessionStart", "UserPromptSubmit", "Stop", "StopCancelled",
@@ -1255,7 +1262,7 @@ def install(yes):
     """Set up: command link, hooks, MCP, kitty, services. Prints each step."""
     here = Path(__file__).resolve().parent
     bin_dir = HOME / ".local/bin"
-    cmd = str(bin_dir / "launchpad")
+    cmd = str(bin_dir / "comms-deck")
     steps = []
 
     def step(text, action):
@@ -1267,48 +1274,76 @@ def install(yes):
             dest.unlink(missing_ok=True)
             dest.symlink_to(target)
 
-    step(f"link {bin_dir}/launchpad and push-courier to this repo",
-         lambda: (bin_dir.mkdir(parents=True, exist_ok=True), link("launchpad", here / "launchpad"),
-                  link("push-courier", here / "push-courier")))
+    def migrate():
+        """Move launchpad's data and config to the comms-deck names, leaving
+        links behind so anything still running under the old name keeps
+        working until it restarts."""
+        for old, new in ((HOME / ".local/share/launchpad", DATA), (HOME / ".config/launchpad", CONFIG)):
+            if old.is_dir() and not old.is_symlink() and not new.exists():
+                new.parent.mkdir(parents=True, exist_ok=True)
+                old.rename(new)
+                old.symlink_to(new)
+    step("move ~/.local/share/launchpad and ~/.config/launchpad to the comms-deck names", migrate)
+
+    step(f"link {bin_dir}/comms-deck (and the old name, launchpad) and push-courier to this repo",
+         lambda: (bin_dir.mkdir(parents=True, exist_ok=True), link("comms-deck", here / "comms-deck"),
+                  link("launchpad", here / "comms-deck"), link("push-courier", here / "push-courier")))
 
     def claude_settings():
         path = HOME / ".claude/settings.json"
         settings = read_json(path, {}) or {}
         if path.exists():
-            shutil.copy(path, path.with_suffix(".json.launchpad-backup"))
+            shutil.copy(path, path.with_suffix(".json.comms-deck-backup"))
         hooks = settings.setdefault("hooks", {})
         for event, entries in claude_hooks(cmd).items():
             kept = [e for e in hooks.get(event, [])
-                    if "launchpad hook" not in json.dumps(e)]
+                    if "comms-deck hook" not in json.dumps(e) and "launchpad hook" not in json.dumps(e)]
             hooks[event] = kept + entries
+        line = str((settings.get("statusLine") or {}).get("command", ""))
+        if not line or "launchpad statusline" in line or "comms-deck statusline" in line:
+            settings["statusLine"] = {"type": "command", "command": f"{cmd} statusline --source claude",
+                                      "padding": 0}
         path.write_text(json.dumps(settings, indent=2) + "\n")
-    step("add launchpad hooks to ~/.claude/settings.json (backup kept)", claude_settings)
-    step("write ~/.grok/hooks/launchpad.json",
-         lambda: write_json(HOME / ".grok/hooks/launchpad.json", grok_hooks(cmd)))
+    step("add comms-deck hooks and status line to ~/.claude/settings.json (backup kept)", claude_settings)
+
+    def grok_files():
+        (HOME / ".grok/hooks/launchpad.json").unlink(missing_ok=True)
+        write_json(HOME / ".grok/hooks/comms-deck.json", grok_hooks(cmd))
+    step("write ~/.grok/hooks/comms-deck.json (replacing launchpad.json)", grok_files)
 
     def mcp_claude():
         if shutil.which("claude"):
-            subprocess.run(["claude", "mcp", "remove", "-s", "user", "launchpad"], capture_output=True)
-            subprocess.run(["claude", "mcp", "add", "-s", "user", "launchpad", "--", cmd, "mcp"],
+            for name in ("launchpad", "comms-deck"):
+                subprocess.run(["claude", "mcp", "remove", "-s", "user", name], capture_output=True)
+            subprocess.run(["claude", "mcp", "add", "-s", "user", "comms-deck", "--", cmd, "mcp"],
                            check=True, capture_output=True)
     step("register the MCP server with Claude Code (user scope)", mcp_claude)
 
-    def mcp_toml(path, header):
+    def mcp_toml(path, header, status_line=False):
         if not path.parent.exists():
             return
         text = path.read_text() if path.exists() else ""
+        # Drop the old [mcp_servers.launchpad] table (header and its key lines).
+        text = re.sub(r"\n*\[mcp_servers\.launchpad\]\n(?:[a-z_]+ = .*\n?)*", "\n", text)
+        text = re.sub(r"\S*launchpad statusline", f"{cmd} statusline", text)
         if header not in text:
-            with open(path, "a") as f:
-                f.write(f"\n{header}\ncommand = \"{cmd}\"\nargs = [\"mcp\"]\n")
-    step("register the MCP server with Grok (~/.grok/config.toml)",
-         lambda: mcp_toml(HOME / ".grok/config.toml", "[mcp_servers.launchpad]"))
+            text = text.rstrip("\n") + f"\n\n{header}\ncommand = \"{cmd}\"\nargs = [\"mcp\"]\n"
+        if status_line and "[ui.status_line]" not in text:
+            text += (f"\n[ui.status_line]\ntype = \"command\"\n"
+                     f"command = \"{cmd} statusline --source grok\"\nrefresh_interval = 60\n")
+        path.write_text(text)
+    step("register the MCP server and status line with Grok (~/.grok/config.toml)",
+         lambda: mcp_toml(HOME / ".grok/config.toml", "[mcp_servers.comms-deck]", status_line=True))
     step("register the MCP server with Codex, if installed (~/.codex/config.toml)",
-         lambda: mcp_toml(HOME / ".codex/config.toml", "[mcp_servers.launchpad]"))
+         lambda: mcp_toml(HOME / ".codex/config.toml", "[mcp_servers.comms-deck]"))
 
     def kitty_conf():
         path = HOME / ".config/kitty/kitty.conf"
         text = path.read_text() if path.exists() else ""
-        if "# >>> launchpad" not in text:
+        if "# >>> launchpad" in text:
+            text = text.replace("# >>> launchpad", "# >>> comms-deck").replace("# <<< launchpad", "# <<< comms-deck")
+            path.write_text(text)
+        if "# >>> comms-deck" not in text:
             path.parent.mkdir(parents=True, exist_ok=True)
             with open(path, "a") as f:
                 f.write(KITTY_BLOCK)
@@ -1317,21 +1352,22 @@ def install(yes):
     def services():
         unit_dir = HOME / ".config/systemd/user"
         unit_dir.mkdir(parents=True, exist_ok=True)
-        for unit in ("launchpad.service", "push-courier.service"):
+        for unit in ("comms-deck.service", "push-courier.service"):
             link_path = unit_dir / unit
             link_path.unlink(missing_ok=True)
             link_path.symlink_to(here / "systemd" / unit)
-        for old in ("relay-protocol.service", "relay-scheduler.service"):
+        for old in ("relay-protocol.service", "relay-scheduler.service", "launchpad.service"):
             subprocess.run(["systemctl", "--user", "disable", "--now", old], capture_output=True)
+            (unit_dir / old).unlink(missing_ok=True)
         subprocess.run(["systemctl", "--user", "daemon-reload"], check=True)
-        subprocess.run(["systemctl", "--user", "enable", "--now", "launchpad.service",
+        subprocess.run(["systemctl", "--user", "enable", "--now", "comms-deck.service",
                         "push-courier.service"], check=True, capture_output=True)
-    step("install and start launchpad.service and push-courier.service", services)
+    step("install and start comms-deck.service and push-courier.service", services)
 
     for text, _ in steps:
         print(f"  - {text}")
     if not yes:
-        print("\nNothing changed yet. Run `launchpad install --yes` to do the above.")
+        print("\nNothing changed yet. Run `comms-deck install --yes` to do the above.")
         return
     for text, action in steps:
         action()
@@ -1346,14 +1382,14 @@ def install(yes):
 
 def self_test():
     """Check the mailbox, hooks, loop guard and MCP server. Exit 1 on failure."""
-    tmp = tempfile.mkdtemp(prefix="launchpad-test-")
-    env = dict(os.environ, LAUNCHPAD_HOME=f"{tmp}/data", LAUNCHPAD_CONFIG=f"{tmp}/config",
-               LAUNCHPAD_AUTO_LIMIT="2")
+    tmp = tempfile.mkdtemp(prefix="comms-deck-test-")
+    env = dict(os.environ, COMMS_DECK_HOME=f"{tmp}/data", COMMS_DECK_CONFIG=f"{tmp}/config",
+               COMMS_DECK_AUTO_LIMIT="2")
     me = str(Path(__file__).resolve())
     failures = []
 
     def run(args, seat, stdin="", extra=None):
-        e = dict(env, LAUNCHPAD_SEAT=seat, **(extra or {}))
+        e = dict(env, COMMS_DECK_SEAT=seat, **(extra or {}))
         return subprocess.run([sys.executable, me, *args], input=stdin, env=e,
                               capture_output=True, text=True, timeout=30)
 
@@ -1438,7 +1474,7 @@ def self_test():
 
 
 def main():
-    parser = argparse.ArgumentParser(prog="launchpad", description=__doc__.split("\n")[0])
+    parser = argparse.ArgumentParser(prog="comms-deck", description=__doc__.split("\n")[0])
     parser.add_argument("--from", dest="sender", help="send as this seat")
     sub = parser.add_subparsers(dest="cmd", required=True)
     p = sub.add_parser("send")
@@ -1470,7 +1506,7 @@ def main():
     def me():
         seat = args.sender or find_agent()[0]
         if not seat:
-            sys.exit("launchpad: can't tell which seat you are; use --from <seat>")
+            sys.exit("comms-deck: can't tell which seat you are; use --from <seat>")
         return seat
 
     try:
@@ -1503,18 +1539,18 @@ def main():
             try:
                 hook(args.source, args.event)
             except Exception as error:  # a hook must never break the agent
-                print(f"launchpad hook: {error}", file=sys.stderr)
+                print(f"comms-deck hook: {error}", file=sys.stderr)
         elif args.cmd == "statusline":
             try:
                 statusline(args.source)
             except Exception as error:  # a status line must never break the agent
-                print(f"launchpad: {error}")
+                print(f"comms-deck: {error}")
         elif args.cmd == "install":
             install(args.yes)
         elif args.cmd == "self-test":
             sys.exit(self_test())
     except ValueError as error:
-        sys.exit(f"launchpad: {error}")
+        sys.exit(f"comms-deck: {error}")
     except KeyboardInterrupt:
         pass
 

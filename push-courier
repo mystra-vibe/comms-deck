@@ -22,10 +22,10 @@
 #
 # HOW AN AGENT ASKS FOR A PUSH
 #   It writes one small JSON file into ITS OWN folder under
-#   ~/.local/share/launchpad/push/requests/, for example
+#   ~/.local/share/comms-deck/push/requests/, for example
 #   requests/codex/discord-bot.json:
 #
-#     {"repo": "launchpad",
+#     {"repo": "comms-deck",
 #      "branch": "codex/discord-bot",
 #      "pr": {"base": "test", "title": "Discord relay", "body": "What and why ..."}}
 #
@@ -35,7 +35,7 @@
 #   (or the existing one is reused).
 #
 #   Within about 5 seconds this program picks the file up, and writes the
-#   answer to ~/.local/share/launchpad/push/done/<agent>/<same name>.json:
+#   answer to ~/.local/share/comms-deck/push/done/<agent>/<same name>.json:
 #
 #     {"ok": true, "pushed": "codex/discord-bot", "commit": "1a2b3c4",
 #      "pr": "https://github.com/..."}
@@ -44,14 +44,14 @@
 #   but the pull request couldn't be opened, it says "ok": true (the branch
 #   IS on GitHub) and gives the reason in "pr_error".
 #
-#   It also leaves the agent a QUIET launchpad note, from "push-courier".
-#   Quiet means it wakes nobody; launchpad hands it over with the agent's
+#   It also leaves the agent a QUIET comms-deck note, from "push-courier".
+#   Quiet means it wakes nobody; comms-deck hands it over with the agent's
 #   next note or prompt, or on read_messages. (An
 #   earlier version sent these as a normal note "from claude", which put
 #   them in the wrong agent's name and woke the wrong window.)
 #
 # WHAT IT WILL AND WON'T DO (the safety rules)
-#   - Only the repos named in REPOS below (launchpad by default), and
+#   - Only the repos named in REPOS below (comms-deck by default), and
 #     only if that clone's GitHub remote belongs to whyyyyyai. The message
 #     repos are left to the relay's own sync.
 #   - Only a branch named after the agent's folder: a request in
@@ -96,12 +96,12 @@ import time
 from pathlib import Path
 
 WORK = Path(os.environ.get("RELAY_WORK_DIR") or Path.home())  # where the repo clones are
-QUEUE = Path(os.environ.get("PUSH_COURIER_DIR") or (Path.home() / ".local/share/launchpad/push"))
+QUEUE = Path(os.environ.get("PUSH_COURIER_DIR") or (Path.home() / ".local/share/comms-deck/push"))
 REQUESTS = QUEUE / "requests"
 DONE = QUEUE / "done"
 OWNER = "whyyyyyai"
 AGENTS = ("codex", "grok", "claude", "foot-claude")
-REPOS = tuple(os.environ.get("PUSH_COURIER_REPOS", "launchpad").split(","))
+REPOS = tuple(os.environ.get("PUSH_COURIER_REPOS", "comms-deck").split(","))
 PROTECTED = ("main", "test", "live")
 PR_BASES = ("test",)
 EVERY = 5  # seconds between looks at the requests folders
@@ -242,27 +242,27 @@ def write_answer(path, answer):
     os.replace(temporary, path)
 
 
-_launchpad = None
+_comms_deck = None
 
 
-def launchpad():
-    """launchpad's own code, loaded once, for leaving the quiet note."""
-    global _launchpad
-    if _launchpad is None:
-        path = Path(__file__).resolve().parent / "launchpad"
+def comms_deck():
+    """comms-deck's own code, loaded once, for leaving the quiet note."""
+    global _comms_deck
+    if _comms_deck is None:
+        path = Path(__file__).resolve().parent / "comms-deck"
         if not path.exists():
-            path = Path(shutil.which("launchpad") or "")
-        loader = importlib.machinery.SourceFileLoader("launchpad_lib", str(path))
-        spec = importlib.util.spec_from_loader("launchpad_lib", loader)
-        _launchpad = importlib.util.module_from_spec(spec)
-        loader.exec_module(_launchpad)
-    return _launchpad
+            path = Path(shutil.which("comms-deck") or "")
+        loader = importlib.machinery.SourceFileLoader("comms_deck_lib", str(path))
+        spec = importlib.util.spec_from_loader("comms_deck_lib", loader)
+        _comms_deck = importlib.util.module_from_spec(spec)
+        loader.exec_module(_comms_deck)
+    return _comms_deck
 
 
 def tell(agent, answer):
     """Leave `agent` a quiet relay note from "push-courier" with the result.
 
-    Quiet: it wakes nobody. launchpad hands it over with the agent's next
+    Quiet: it wakes nobody. comms-deck hands it over with the agent's next
     note or prompt, and copies it to the GitHub record like every note.
     """
     if answer.get("ok"):
@@ -274,7 +274,7 @@ def tell(agent, answer):
     else:
         text = f"push-courier: did not push: {answer.get('error')}"
     try:
-        launchpad().send("push-courier", agent, text, quiet=True)
+        comms_deck().send("push-courier", agent, text, quiet=True)
     except Exception as error:  # a note that can't be filed must not stop the courier
         log(f"couldn't leave {agent} a note: {error}")
 

@@ -62,15 +62,15 @@ Codex (the coordinator) can comment from any computer.
 
 **Into `test`:** the code runs, and the pull request says what changed and
 why. If the reasoning is bigger than a paragraph, add it to the shared
-commentary too (`launchpad note "..."`, or the add_note tool).
+commentary too (`comms-deck note "..."`, or the add_note tool).
 
 **`test` → `main`:** someone other than the author has run it for real, and
-any tests pass (`launchpad self-test`, and `agent-chat/test.sh` for agent-chat).
+any tests pass (`comms-deck self-test`, and `agent-chat/test.sh` for agent-chat).
 
 **`main` → `live`:** the files are copied to their live places on the
-machine (`launchpad install` links them from this clone), and the service is
+machine (`comms-deck install` links them from this clone), and the service is
 restarted if it changed:
-`systemctl --user restart launchpad.service`.
+`systemctl --user restart comms-deck.service`.
 
 ## The messages repo is different
 

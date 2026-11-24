@@ -12,10 +12,10 @@ agents, and no agent claims them alone.
 
 | File | Written by | Notes |
 | --- | --- | --- |
-| [`launchpad`](launchpad), [`systemd/launchpad.service`](systemd/launchpad.service) | Claude (2026-11-24) | launchpad 2. Replaces `relay-protocol` (joint: Grok, Codex, Claude), `scheduler` and `relay-watch` (Claude), which are in the git history. Keeps their message file format, the public/private split and the secret patterns. |
+| [`comms-deck`](comms-deck), [`systemd/comms-deck.service`](systemd/comms-deck.service) | Claude (2026-11-24) | comms-deck. Replaces `relay-protocol` (joint: Grok, Codex, Claude), `scheduler` and `relay-watch` (Claude), which are in the git history. Keeps their message file format, the public/private split and the secret patterns. |
 | [`agent-chat/agent-chat`](agent-chat/agent-chat) | **Joint: Grok, Codex, Claude** | Built together before 2026-11-20. Claude added the comments on 2026-11-20, with no code changes. |
 | [`agent-chat/install.sh`](agent-chat/install.sh), [`agent-chat/test.sh`](agent-chat/test.sh) | **Joint: Grok, Codex, Claude** | Claude added the header comments on 2026-11-21. |
-| [`push-courier`](push-courier), [`systemd/push-courier.service`](systemd/push-courier.service) | Claude (2026-11-21) | Reviewed by Grok (2026-11-22); its findings were fixed before it landed here. On 2026-11-24 Claude moved it onto launchpad 2's mailbox and paths. |
+| [`push-courier`](push-courier), [`systemd/push-courier.service`](systemd/push-courier.service) | Claude (2026-11-21) | Reviewed by Grok (2026-11-22); its findings were fixed before it landed here. On 2026-11-24 Claude moved it onto comms-deck's mailbox and paths. |
 
 ## The docs
 
@@ -26,13 +26,13 @@ agents, and no agent claims them alone.
 | [`docs/BRANCHING.md`](docs/BRANCHING.md) | Claude (2026-11-20), from the owner's plan for test → main → live |
 | `CREDITS.md` (this file) | Claude (2026-11-21) |
 | The puzzle footer in `README.md`, [`puzzle/check.py`](puzzle/check.py) | Claude (2026-11-21), from the owner's idea |
-| [`LAUNCHPAD.md`](LAUNCHPAD.md) | Claude (2026-11-22), from the joint work above |
+| [`COMMS-DECK.md`](COMMS-DECK.md) | Claude (2026-11-22), from the joint work above |
 | [`PRIMER.md`](PRIMER.md) | Claude (2026-11-22), from the team's record and the joint work of Grok, Codex and Claude |
 
 ## Work in progress
 
 Open work, and who it belongs to, is listed in
-[LAUNCHPAD.md](LAUNCHPAD.md#5-where-things-stand-as-of-2026-11-22). When a piece
+[COMMS-DECK.md](COMMS-DECK.md#5-where-things-stand-as-of-2026-11-22). When a piece
 lands here, add its row to the tables above.
 
 ## About the commit history
