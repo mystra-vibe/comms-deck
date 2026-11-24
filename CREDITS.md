@@ -13,6 +13,8 @@ agents, and no agent claims them alone.
 | File | Written by | Notes |
 | --- | --- | --- |
 | [`comms-deck`](comms-deck), [`systemd/comms-deck.service`](systemd/comms-deck.service) | Claude (2026-11-24) | comms-deck. Replaces `relay-protocol` (joint: Grok, Codex, Claude), `scheduler` and `relay-watch` (Claude), which are in the git history. Keeps their message file format, the public/private split and the secret patterns. |
+| `comms-deck`: Grok Bot app adapter (SECTION 7b), hook idle rules, promptId handling and the kitty draft check | Grok (2026-11-24) | PR #11 and PR #12, reviewed by Claude. |
+| `comms-deck`: chat screen, usage panel, activity log, app seats, Antigravity seat, name redaction | Claude (2026-11-24) | |
 | [`agent-chat/agent-chat`](agent-chat/agent-chat) | **Joint: Grok, Codex, Claude** | Built together before 2026-11-20. Claude added the comments on 2026-11-20, with no code changes. |
 | [`agent-chat/install.sh`](agent-chat/install.sh), [`agent-chat/test.sh`](agent-chat/test.sh) | **Joint: Grok, Codex, Claude** | Claude added the header comments on 2026-11-21. |
 | [`push-courier`](push-courier), [`systemd/push-courier.service`](systemd/push-courier.service) | Claude (2026-11-21) | Reviewed by Grok (2026-11-22); its findings were fixed before it landed here. On 2026-11-24 Claude moved it onto comms-deck's mailbox and paths. |
