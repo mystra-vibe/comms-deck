@@ -148,11 +148,15 @@ for _pair in filter(None, setting("SEATS", "").split(",")):
 # seat is left to its own connector.
 _app_file = CONFIG / "app-seats"
 APP_PROCESS = {}  # seat -> the app it lives in; "name:app" in the file, default grok-bot
+HIDDEN_SEATS = set()  # "name hidden": works as a seat, but not shown in the status bar or chat box
 for _line in (_app_file.read_text().splitlines() if _app_file.exists() else []):
     _line = _line.split("#")[0].strip()
     if _line:
-        _name, _, _app = _line.partition(":")
+        _words = _line.split()
+        _name, _, _app = _words[0].partition(":")
         APP_PROCESS[_name.strip()] = _app.strip() or "grok-bot"
+        if "hidden" in _words[1:]:
+            HIDDEN_SEATS.add(_name.strip())
 APP_SEATS = tuple(APP_PROCESS)
 SEATS = tuple(AGENTS) + APP_SEATS + ("owner",)
 
@@ -2036,7 +2040,7 @@ def route(text):
         return ["all"], None
     unknown = [n for n in names if n not in SEATS or n == "owner"]
     if unknown:
-        return [], f"no seat called @{unknown[0]}; try " + " ".join(f"@{s}" for s in SEATS if s != "owner") + " @all"
+        return [], f"no seat called @{unknown[0]}; try " + " ".join(f"@{s}" for s in SEATS if s != "owner" and s not in HIDDEN_SEATS) + " @all"
     return list(dict.fromkeys(names)), None
 
 
@@ -2050,7 +2054,8 @@ def chat(history=200, hide_private=False):
     def status_bar(cols):
         parts = []
         seats = [(seat, load_seat(seat)) for seat in AGENTS]
-        seats += [(seat, {"state": app_seat_state(seat)}) for seat in APP_SEATS]
+        seats += [(seat, {"state": app_seat_state(seat)}) for seat in APP_SEATS
+                  if seat not in HIDDEN_SEATS]
         for seat, s in seats:
             if s["state"] == "away" and seat not in ("claude", "grok") + APP_SEATS:
                 continue
@@ -2146,7 +2151,7 @@ def chat(history=200, hide_private=False):
             line = f"  \033[1;38;5;{colour('owner')}myou ›\033[0m {highlighted}\033[7m \033[0m"
         else:
             line = (f"  \033[1;38;5;{colour('owner')}myou ›\033[0m \033[7m \033[0m\033[2m type a note · "
-                    + " ".join(f"@{s}" for s in SEATS if s != "owner") + " · no @ = everyone\033[0m")
+                    + " ".join(f"@{s}" for s in SEATS if s != "owner" and s not in HIDDEN_SEATS) + " · no @ = everyone\033[0m")
         if notice and time.time() < notice_until:
             line += f"   \033[38;5;{196 if notice.startswith('no seat') else 78}m{notice}\033[0m"
         return line
