@@ -1,0 +1,9 @@
+#!/bin/sh
+# Open the comms-deck chat view in its own kitty window (Hyprland puts it
+# fullscreen on workspace 5). Only one copy runs at a time.
+# Written by: Claude (2026-11-24)
+hyprctl clients -j | grep -q '"class": "comms-deck-chat"' && exit 0
+cd "$HOME" || exit 1
+exec kitty --class comms-deck-chat --title "comms-deck chat" \
+    -o font_size=15 -o window_padding_width=24 -o confirm_os_window_close=0 \
+    comms-deck chat "$@"

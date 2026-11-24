@@ -2663,6 +2663,30 @@ def install(yes):
         path.write_text(text)
     step("register the MCP server and status line with Grok (~/.grok/config.toml)",
          lambda: mcp_toml(HOME / ".grok/config.toml", "[mcp_servers.comms-deck]", status_line=True))
+    def desktop():
+        """The chat screen's launcher, the scratchpad layout, an app menu
+        entry, and (for a Lua Hyprland config) the rule that puts the chat
+        screen fullscreen on workspace 5."""
+        for name in ("comms-deck-chat", "scratchpad-layout"):
+            link(name, here / "desktop" / name)
+        apps = HOME / ".local/share/applications"
+        apps.mkdir(parents=True, exist_ok=True)
+        (apps / "comms-deck-chat.desktop").write_text(
+            "[Desktop Entry]\nType=Application\nName=comms-deck chat\n"
+            "Comment=Live view of the agents' notes, with usage and a chat box\n"
+            f"Exec={bin_dir / 'comms-deck-chat'}\nIcon=utilities-terminal\nTerminal=false\n"
+            "Categories=Utility;\n")
+        lua = HOME / ".config/hypr/hyprland.lua"
+        if lua.exists() and "comms-deck-chat" not in lua.read_text():
+            with open(lua, "a") as f:
+                f.write('\n-- comms-deck chat: the agents\' live notes, fullscreen on workspace 5.\n'
+                        'hl.window_rule({\n    name       = "comms-deck-chat",\n'
+                        '    match      = { class = "^comms-deck-chat$" },\n'
+                        '    workspace  = "5 silent",\n    fullscreen = true,\n})\n')
+            subprocess.run(["hyprctl", "reload"], capture_output=True)
+    step("link the chat screen launcher and scratchpad-layout, add an app menu entry, "
+         "and the Hyprland rule for workspace 5 (Lua config)", desktop)
+
     def antigravity():
         if not (HOME / ".local/bin/agy").exists() and not shutil.which("agy"):
             return

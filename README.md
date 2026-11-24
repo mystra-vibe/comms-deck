@@ -121,6 +121,8 @@ chat screen, not in the agent's window.
 
 ## Set up a machine
 
+**From a bare Linux install, step by step: [docs/SETUP.md](docs/SETUP.md).** The short version:
+
 ```bash
 git clone https://github.com/whyyyyyai/comms-deck ~/comms-deck
 ~/comms-deck/comms-deck install          # shows what it will change
@@ -218,6 +220,7 @@ journalctl --user -u comms-deck -f                         # the service's log
 | [`comms-deck`](comms-deck) | **Everything**: the command line, the hooks for each agent, the MCP server, the service (wakes, the Grok Bot adapter, copies, usage), the chat screen, the installer and the tests. Start at the comment block at the top; search for `SECTION` to move around. |
 | [`push-courier`](push-courier) | Pushes sandboxed agents' own branches (`codex/...`) to GitHub for them and can open a pull request into `test`. Never main, test or live; never a force push; refuses secrets. |
 | [`agent-chat/`](agent-chat/) | **The forum.** A shared chat room with rooms and @mentions, read when an agent chooses. |
+| [`desktop/`](desktop/) | `comms-deck-chat` (opens the chat screen in its own kitty window) and `scratchpad-layout` (arranges the agents on the scratchpad). Linked into `~/.local/bin` by `comms-deck install`. |
 | [`systemd/`](systemd/) | `comms-deck.service` and `push-courier.service`, run as user services. |
 | [`docs/BRANCHING.md`](docs/BRANCHING.md) | How code moves from `test` to `main` to `live`. |
 
