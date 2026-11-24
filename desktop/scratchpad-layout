@@ -1,0 +1,101 @@
+#!/usr/bin/env python3
+"""scratchpad-layout: arrange the agents on the scratchpad (Super+S).
+
+    +-----------+-----------+-----------------------+
+    |   Grok    | Grok Bot  |                       |
+    +-----------+-----------+        Firefox        |
+    |        Claude         |                       |
+    +-----------------------+-----------------------+
+
+Finds each window by what runs in it (the kitty holding `grok`, the kitty
+holding `claude`, the Grok Bot app, Firefox), moves it to special:magic
+without switching you there, floats it, and sets its exact size and place.
+Run it again whenever a window has been reopened or moved. Windows that
+aren't open are skipped.
+
+Written by: Claude (2026-11-24)
+"""
+import json
+import subprocess
+from pathlib import Path
+
+GAP_OUT, GAP_IN = 22, 14       # match the tiled gaps already in use
+WORKSPACE = "special:magic"
+
+
+def hypr(*args):
+    return subprocess.run(["hyprctl", *args], capture_output=True, text=True, check=True).stdout
+
+
+def dispatch(expr):
+    out = hypr("dispatch", expr).strip()
+    if out != "ok":
+        raise SystemExit(f"hyprctl refused {expr}: {out}")
+
+
+def proc_tree():
+    """{pid: (parent pid, name)} for every process."""
+    tree = {}
+    for d in Path("/proc").iterdir():
+        if d.name.isdigit():
+            try:
+                stat = (d / "stat").read_text()
+                name = (d / "comm").read_text().strip()
+                tree[int(d.name)] = (int(stat.rsplit(")", 1)[1].split()[1]), name)
+            except (OSError, ValueError, IndexError):
+                pass
+    return tree
+
+
+def window_holding(clients, tree, program):
+    """The kitty window whose process tree contains `program`."""
+    kitties = {c["pid"]: c for c in clients if c["class"] == "kitty"}
+    for pid, (_, name) in tree.items():
+        if name != program:
+            continue
+        p = pid
+        while p > 1:
+            if p in kitties:
+                return kitties[p]
+            p = tree.get(p, (0, ""))[0]
+    return None
+
+
+def main():
+    mon = next(m for m in json.loads(hypr("monitors", "-j")) if m["focused"])
+    left, top, right, bottom = mon["reserved"]
+    width = round(mon["width"] / mon["scale"]) - left - right - 2 * GAP_OUT
+    height = round(mon["height"] / mon["scale"]) - top - bottom - 2 * GAP_OUT
+    x0, y0 = mon["x"] + left + GAP_OUT, mon["y"] + top + GAP_OUT
+    half_w = (width - GAP_IN) // 2
+    half_h = (height - GAP_IN) // 2
+    quarter_w = (half_w - GAP_IN) // 2
+    lower_y = y0 + half_h + GAP_IN
+    right_x = x0 + half_w + GAP_IN
+
+    clients = json.loads(hypr("clients", "-j"))
+    tree = proc_tree()
+    by_class = lambda cls: next((c for c in clients if c["class"] == cls), None)
+    plan = [
+        ("Grok", window_holding(clients, tree, "grok"), x0, y0, quarter_w, half_h),
+        ("Grok Bot", by_class("grok-bot"), x0 + quarter_w + GAP_IN, y0,
+         half_w - quarter_w - GAP_IN, half_h),
+        ("Claude", window_holding(clients, tree, "claude"), x0, lower_y, half_w, height - half_h - GAP_IN),
+        ("Firefox", by_class("firefox"), right_x, y0, width - half_w - GAP_IN, height),
+    ]
+    for label, win, x, y, w, h in plan:
+        if not win:
+            print(f"skipped {label}: not open")
+            continue
+        addr = f'window = "address:{win["address"]}"'
+        if win["workspace"]["name"] != WORKSPACE:
+            dispatch(f'hl.dsp.window.move({{ {addr}, workspace = "{WORKSPACE}", follow = false }})')
+        if not win["floating"]:
+            dispatch(f'hl.dsp.window.float({{ action = "enable", {addr} }})')
+        dispatch(f"hl.dsp.window.resize({{ {addr}, x = {w}, y = {h} }})")
+        dispatch(f"hl.dsp.window.move({{ {addr}, x = {x}, y = {y} }})")
+        print(f"{label:9} {w}x{h} at {x},{y}")
+
+
+if __name__ == "__main__":
+    main()
