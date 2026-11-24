@@ -3099,14 +3099,17 @@ def wake_seat(seat, stale=False):
 
     With `stale`, a seat that has said busy for STALE_BUSY seconds without
     its file changing, while notes wait, is treated as idle first: its Stop
-    hook never ran, so nothing else would ever deliver to it. Pasting into
-    an agent that is in fact still working only queues the text for it.
+    hook never ran, so nothing else would ever deliver to it. The wake pastes
+    the notes and presses Enter; if the agent was in fact still working, that
+    lands in its turn, which is why the bar is 10 minutes with no change.
     """
     if seat not in AGENTS:
         return False, "only terminal agents can be woken this way"
     s = load_seat(seat)
     if not pending(seat):
         return False, "nothing waiting"
+    if seat_spent(seat):
+        return False, "out of usage until its reset"  # before any write: a spent seat's state is left as it is
     if stale and s["state"] == "busy" and time.time() - float(s.get("updated") or 0) >= STALE_BUSY:
         update_seat(seat, state="idle")
         log(f"{seat}: busy with no change for {STALE_BUSY // 60} min while notes wait; treating as idle")
@@ -3977,6 +3980,8 @@ def self_test():
         "x.mark_spent('codex', '+1h', 'claude'); x.update_seat('codex', state='idle', kitty_socket='unix:/nonexistent', kitty_window='1')",
         "x.write_json(x.DATA / 'inbox' / 'codex' / 'w1.json', {'from': 'owner', 'text': 'hi', 'time': '2026-11-24 07:00:00'})",
         "assert x.try_wake('codex') is False and x.wake_seat('codex') == (False, 'out of usage until its reset')",
+        "x.update_seat('codex', state='busy'); x.write_json(x.DATA / 'seats' / 'codex.json', dict(x.load_seat('codex'), updated=1.0))",
+        "assert x.wake_seat('codex', stale=True) == (False, 'out of usage until its reset') and x.load_seat('codex')['state'] == 'busy'",
         "x.mark_spent('codex', 'clear', 'claude'); (x.DATA / 'inbox' / 'codex' / 'w1.json').unlink()",
         "x.write_json(x.DATA / 'usage' / 'gravity.json', {'time': now, 'data': {'rate_limits': {'five_hour': full(x.time.time() + 600)}}})",
         "x.update_seat('gravity', state='away')",
