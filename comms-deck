@@ -2296,6 +2296,10 @@ def serve():
                 refresh_grok_usage()
             except Exception as error:  # usage is a nicety; never stop the service for it
                 log(f"couldn't read Grok's usage: {error}")
+            try:
+                refresh_screen_limits()
+            except Exception as error:  # never stop the service for it
+                log(f"couldn't read a usage-limit screen: {error}")
         if time.time() - last_sync >= SYNC_EVERY:
             last_sync = time.time()
             sync_records()
@@ -3038,6 +3042,79 @@ def grok_usage_from_session():
     if cost_ticks:
         data["cost"]["total_cost_usd"] = cost_ticks / 1e10  # Grok counts cost in 1e-10 USD ticks
     return (newest, data) if newest else None
+
+
+SCREEN_LIMIT = re.compile(r"hit your usage limit.*?try again\s+(?:at|on)\s+(?P<when>.+?)\.(?:\s|$)", re.IGNORECASE | re.DOTALL)
+
+
+def screen_limit_reset(text, now=None):
+    """The reset time an agent printed with its usage-limit message, or None.
+
+    Codex prints "You've hit your usage limit. ... try again at Dec 9th, 2026
+    3:02 PM." (or just "3:02 PM" when it is today), and the line can wrap.
+    The newest such message on the screen counts. A time with no date is the
+    next one; anything unreadable gives math.inf (spent, time unknown).
+    """
+    import datetime
+    now = time.time() if now is None else now
+    found = list(SCREEN_LIMIT.finditer(text or ""))
+    if not found:
+        return None
+    raw = " ".join(found[-1].group("when").split())
+    raw = re.sub(r"(\d)(st|nd|rd|th)\b", r"\1", raw)
+    for fmt in ("%b %d, %Y %I:%M %p", "%B %d, %Y %I:%M %p", "%b %d %Y %I:%M %p", "%Y-%m-%d %H:%M"):
+        try:
+            return datetime.datetime.strptime(raw, fmt).timestamp()
+        except ValueError:
+            pass
+    for fmt in ("%I:%M %p", "%H:%M"):
+        try:
+            t = datetime.datetime.strptime(raw, fmt)
+        except ValueError:
+            continue
+        base = datetime.datetime.fromtimestamp(now)
+        at = base.replace(hour=t.hour, minute=t.minute, second=0, microsecond=0)
+        if at.timestamp() <= now:
+            at += datetime.timedelta(days=1)
+        return at.timestamp()
+    return math.inf
+
+
+def refresh_screen_limits():
+    """Mark an agent spent when its terminal says it hit its usage limit.
+
+    For agents with no usage meter (Codex): the ACTIVITY panel then shows it
+    spent with a countdown to the reset it printed. A mark this set is
+    cleared when the message is gone from the screen (the agent restarted);
+    a mark set by hand with `comms-deck spent` is never touched.
+    """
+    for seat in AGENTS:
+        state = load_seat(seat)
+        socket, window = state.get("kitty_socket"), state.get("kitty_window")
+        if not socket or not window or state.get("state") == "away":
+            continue
+        try:
+            screen = kitty(socket, "get-text", "--match", f"id:{window}")
+        except (RuntimeError, OSError, subprocess.SubprocessError):
+            continue
+        path = DATA / SPENT_DIR / f"{seat}.json"
+        mark = read_json(path) or {}
+        reset = screen_limit_reset(screen)
+        if reset is None:
+            if mark.get("set_by") == "screen":
+                path.unlink(missing_ok=True)
+                log(f"{seat}: usage-limit message gone from its screen; spent mark cleared")
+            continue
+        if reset <= time.time():
+            continue  # an old message whose time has passed
+        stored = None if reset == math.inf else reset
+        if mark.get("set_by") != "screen" and spent_mark(seat) is not None:
+            continue  # a hand-set mark wins
+        if mark.get("set_by") == "screen" and mark.get("resets_at") == stored:
+            continue
+        write_json(path, {"resets_at": stored if stored is not None else time.time() + 86400 * 7,
+                          "set_by": "screen", "set_at": time.time()})
+        log(f"{seat}: its screen says usage limit; spent until {when(reset) if stored else 'unknown (7d)'}")
 
 
 def refresh_grok_usage():
@@ -3930,6 +4007,12 @@ def self_test():
         "assert x.spent_mark('gravity') is None",
         "try:\n    x.mark_spent('nobody', '+1h', 'claude'); raise SystemExit('bad seat accepted')\nexcept ValueError: pass",
         "try:\n    x.parse_until('soonish', now); raise SystemExit('bad time accepted')\nexcept ValueError: pass",
+        "msg = '■ You\u2019ve hit your usage limit. Upgrade to Plus to continue using Codex (https://x), or try again\\nat Dec 9th, 2026 3:02 PM.\\n› Ask'",
+        "assert x.screen_limit_reset(msg, now) == dt.datetime(2026, 12, 9, 15, 2).timestamp()",
+        "assert x.screen_limit_reset('all fine here', now) is None",
+        "t = x.screen_limit_reset(\"You've hit your usage limit. Try again at 3:02 PM.\", now); d = dt.datetime.fromtimestamp(t)",
+        "assert (d.hour, d.minute) == (15, 2) and now < t <= now + 86400",
+        "assert x.screen_limit_reset(\"You've hit your usage limit. Try again at teatime.\", now) == x.math.inf",
         "assert x.poll_countdown({}, now) == \"hasn't checked yet\"",
         "assert x.poll_countdown({'polled_at': now - 18}, now) == 'next check in 0:42'",
         "assert x.poll_countdown({'polled_at': now - 125, 'poll_gap': 60}, now) == 'check late 1:05'",
