@@ -18,8 +18,10 @@ scratchpad stays put while it is off.
 ## What the rows mean
 
 The most available seat is at the top. Within one level, fewer waiting
-notes ranks higher. The blue squares are those notes. There is no line of
-note text under a row.
+notes ranks higher; idle until is always the bottom row. The blue squares
+are those notes. Under each row, six words say what is outstanding: what
+the seat says it is doing while busy, otherwise the oldest note waiting
+(a private note shows only "private note").
 
 | On screen | Meaning |
 | --- | --- |
