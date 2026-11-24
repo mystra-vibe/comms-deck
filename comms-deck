@@ -2470,11 +2470,13 @@ def idle_until(reset, now=None):
 
 
 # The ACTIVITY list is sorted by how available each agent is, most available
-# first (the owner's ranking): ready, busy, stuck, idle until its limit
-# resets; then the rows that can't take work at all. Within a level, fewer
+# first (the owner's ranking): ready, busy, stuck; then the rows that can't
+# take work now (away, app not connected); idle until its limit resets is
+# always last. Within a level, fewer
 # notes waiting ranks higher (each one weighs an agent down); then seat order.
-AVAILABILITY = {"ready": 0, "busy": 1, "stuck": 3, "draft in box": 3, "spent": 4,
-                "away": 5, "chat not open": 6, "not connected": 6, "no chat yet": 6, "not set up": 6}
+AVAILABILITY = {"ready": 0, "busy": 1, "stuck": 3, "draft in box": 3,
+                "away": 5, "chat not open": 6, "not connected": 6, "no chat yet": 6, "not set up": 6,
+                "spent": 7}  # idle until its limit resets: always the bottom (the owner, 07:23)
 
 
 def availability(seat, state, now=None):
@@ -2568,6 +2570,32 @@ def activity_view(state, usage_data, now=None, waiting=0, marked=None):
         return "○", "spent", 245  # a grey empty circle: out of usage until its reset (the owner's choice)
     mark, shade, word = row_status(state, waiting)
     return mark, (word or "")[:13], shade
+
+
+def task_summary(doing, notes, words=6):
+    """Six words on what an agent has outstanding, for the line under its row.
+
+    The owner asked for this instead of a count (the blue squares count).
+    Deterministic, no model: what it said it is doing (set_status) while
+    busy, otherwise the first words of the oldest note waiting, with @names,
+    links and the deck's own wrapper left out. A private note shows only
+    "private note". '' when there is nothing outstanding.
+    """
+    if doing:
+        text = doing
+    elif notes:
+        _, record = notes[0]
+        if record.get("private"):
+            return "private note"
+        text = record.get("text", "")
+    else:
+        return ""
+    if looks_secret(text):
+        return "(something private)"  # a key or password never reaches the screen, as in describe()
+    text = redact(text)
+    text = re.sub(r"^(task from \w+, asked of comms-deck:|note from \w+:)\s*", "", text.strip(), flags=re.I)
+    kept = [w for w in text.split() if not w.startswith(("@", "http://", "https://"))]
+    return " ".join(kept[:words]) + (" …" if len(kept) > words else "")
 
 
 def waiting_summary(notes):
@@ -2683,11 +2711,13 @@ def usage_panel(width):
             began = when(since) if since else ""  # static: "03:27" today, "Fri 18:00" otherwise
         squares = "■" * min(waiting, 5) + (f"+{waiting - 5}" if waiting > 5 else "")
         state_text = f"{mark} {began}" if word == "spent" else f"{mark} {word:9}\033[0m \033[2m{began}"
+        summary = task_summary(load_seat(seat).get("doing") if word == "busy" else "", pending(seat))
         rows.append((*a["rank"], order,
-                     f"  \033[38;5;{colour(seat)}m{seat.title():8}\033[0m "
-                     f"\033[38;5;{shade}m{state_text}\033[0m"
-                     + (f" \033[38;5;33m{squares}\033[0m" if squares else "")))
-    lines += [row[-1] for row in sorted(rows)]
+                     [f"  \033[38;5;{colour(seat)}m{seat.title():8}\033[0m "
+                      f"\033[38;5;{shade}m{state_text}\033[0m"
+                      + (f" \033[38;5;33m{squares}\033[0m" if squares else "")]
+                     + ([f"    \033[2m↳ {summary}\033[0m"] if summary else [])))
+    lines += [line for row in sorted(rows) for line in row[-1]]
     return [fit(" " + line, width) for line in lines]
 
 
@@ -3835,7 +3865,13 @@ def self_test():
         "assert x.idle_until(now + 6*86400 + 19*3600 + 12*60 + 7, now).endswith(' · 6d 19h 12m')",
         "assert x.idle_until(now + 6*86400, now).startswith('idle until ')",
         "assert x.idle_until(float('inf'), now) == 'idle until its limit resets'",
-        "assert sorted(['spent', 'stuck', 'ready', 'busy', 'away'], key=x.AVAILABILITY.get) == ['ready', 'busy', 'stuck', 'spent', 'away']",
+        "assert x.task_summary('reviewing PR #35 for the owner today please', []) == 'reviewing PR #35 for the owner …'",
+        "assert x.task_summary('', [('p', {'text': '@claude please fix https://x.y the chat layout', 'private': False})]) == 'please fix the chat layout'",
+        "assert x.task_summary('', [('p', {'text': 'token stuff', 'private': True})]) == 'private note'",
+        "assert x.task_summary('', []) == ''",
+        "assert x.task_summary('deploy with token: ghp_' + 'a' * 30, []) == '(something private)'",
+        "assert x.task_summary('', [('p', {'text': 'key ghp_' + 'b' * 30 + ' now', 'private': False})]) == '(something private)'",
+        "assert sorted(['spent', 'stuck', 'ready', 'busy', 'away'], key=x.AVAILABILITY.get) == ['ready', 'busy', 'stuck', 'away', 'spent']",
         "for s, st in (('claude', 'busy'), ('grok', 'idle'), ('gravity', 'idle')): x.update_seat(s, state=st)",
         "x.mark_spent('gravity', '+2h', 'claude')",
         "assert x.availability('gravity', 'idle')['word'] == 'spent'",
