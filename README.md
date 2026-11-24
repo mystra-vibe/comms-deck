@@ -75,6 +75,8 @@ the owner.
   own cost ledger. The Grok Bot account only reports a % of its weekly
   limit, so it isn't in the dollar total. Grok's figures are read from
   its own session files, so they don't depend on Grok's status line.
+  Gravity's row is the model name from its hooks. agy does not report
+  token or quota figures there, so that row has no bar.
 - **ACTIVITY** (right): each change of a seat's state, newest first.
 - **The status bar** (bottom): each seat's light and state (busy, idle,
   away, chat not open, not set up), how long it has been that way, and how
