@@ -2186,6 +2186,12 @@ def spent_mark(seat, now=None):
     return float(reset)
 
 
+def seat_spent(seat, now=None):
+    """True when `seat` is spent, by its usage meter or a `comms-deck spent` mark."""
+    usage = (read_json(DATA / "usage" / f"{seat}.json") or {}).get("data") or {}
+    return spent_reset(usage, spent_mark(seat, now), now) is not None
+
+
 def spent_reset(data, marked=None, now=None):
     """The later of the meter's reset and the mark's, or None if neither says spent."""
     times = [t for t in (limit_reset(data, now), marked) if t is not None]
@@ -2407,7 +2413,7 @@ def current_states():
     out = []
     for seat in AGENTS:
         st = load_seat(seat)
-        if st["state"] == "away" and seat not in ("claude", "grok") and spent_mark(seat) is None:
+        if st["state"] == "away" and seat not in ("claude", "grok") and not seat_spent(seat):
             continue  # a spent seat stays shown, so its countdown can be seen
         out.append((seat, st["state"], st.get("since")))
     for seat in APP_SEATS:
@@ -3443,7 +3449,14 @@ def self_test():
         "x.mark_spent('gravity', '+2h', 'claude')",
         "assert x.spent_mark('gravity') and abs(x.spent_mark('gravity') - (x.time.time() + 7200)) < 5",
         "assert x.spent_mark('gravity', now=x.time.time() + 7300) is None",
+        "assert x.seat_spent('gravity')",
         "x.mark_spent('gravity', 'clear', 'claude')",
+        "assert not x.seat_spent('gravity')",
+        "x.write_json(x.DATA / 'usage' / 'gravity.json', {'time': now, 'data': {'rate_limits': {'five_hour': full(x.time.time() + 600)}}})",
+        "x.update_seat('gravity', state='away')",
+        "assert x.seat_spent('gravity') and any(s == 'gravity' for s, _, _ in x.current_states())",
+        "(x.DATA / 'usage' / 'gravity.json').unlink()",
+        "assert not any(s == 'gravity' for s, _, _ in x.current_states())",
         "assert x.spent_mark('gravity') is None",
         "try:\n    x.mark_spent('nobody', '+1h', 'claude'); raise SystemExit('bad seat accepted')\nexcept ValueError: pass",
         "try:\n    x.parse_until('soonish', now); raise SystemExit('bad time accepted')\nexcept ValueError: pass",
