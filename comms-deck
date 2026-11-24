@@ -2815,11 +2815,15 @@ def usage_panel(width):
             began = when(since) if since else ""  # static: "03:27" today, "Fri 18:00" otherwise
         squares = "■" * min(waiting, 5) + (f"+{waiting - 5}" if waiting > 5 else "")
         state_text = f"{mark} {began}" if word == "spent" else f"{mark} {word:9}\033[0m \033[2m{began}"
-        summary = task_summary(load_seat(seat).get("doing") if word == "busy" else "", pending(seat))
+        # A spent row is all grey, name and squares too, and has no line
+        # under it: nothing it holds can start until the reset (the owner, 08:07-08:08).
+        spent = word == "spent"
+        summary = "" if spent else task_summary(load_seat(seat).get("doing") if word == "busy" else "", pending(seat))
+        name_shade, square_shade = (shade, shade) if spent else (colour(seat), 33)
         rows.append((*a["rank"], order,
-                     [f"  \033[38;5;{colour(seat)}m{seat.title():8}\033[0m "
+                     [f"  \033[38;5;{name_shade}m{seat.title():8}\033[0m "
                       f"\033[38;5;{shade}m{state_text}\033[0m"
-                      + (f" \033[38;5;33m{squares}\033[0m" if squares else "")]
+                      + (f" \033[38;5;{square_shade}m{squares}\033[0m" if squares else "")]
                      + ([f"    \033[2m↳ {summary}\033[0m"] if summary else [])))
     lines += [line for row in sorted(rows) for line in row[-1]]
     return [fit(" " + line, width) for line in lines]
@@ -4073,6 +4077,11 @@ def self_test():
         "assert x.spent_mark('gravity') and abs(x.spent_mark('gravity') - (x.time.time() + 7200)) < 5",
         "assert x.spent_mark('gravity', now=x.time.time() + 7300) is None",
         "assert x.seat_spent('gravity')",
+        "x.write_json(x.DATA / 'inbox' / 'gravity' / 'g1.json', {'from': 'owner', 'text': 'review the spec', 'time': '2026-11-24 07:00:00'})",
+        "panel = x.usage_panel(80); row = [i for i, l in enumerate(panel) if 'Gravity' in l][-1]",
+        "assert 'idle until' in panel[row] and '\\033[38;5;245mGravity' in panel[row], panel[row]",
+        "assert '38;5;33m' not in panel[row] and not any('\\u21b3' in l and 'review' in l for l in panel), panel",
+        "(x.DATA / 'inbox' / 'gravity' / 'g1.json').unlink()",
         "x.mark_spent('gravity', 'clear', 'claude')",
         "assert not x.seat_spent('gravity')",
         "x.write_json(x.DATA / 'usage' / 'gravity.json', {'time': now, 'data': {'rate_limits': {'five_hour': full(x.time.time() + 600)}}})",
