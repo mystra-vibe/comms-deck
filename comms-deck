@@ -720,7 +720,7 @@ def render(records, seat):
     if seat in APP_SEATS:
         # An app seat reads this in its own chat and has no comms-deck tools:
         # its chat reply is picked up and filed, so tell it how that works.
-        who = senders[0] if senders else "owner"
+        who = "owner" if "owner" in senders or not senders else senders[0]  # not just the first alphabetically
         return (f"{MARK} {len(records)} note(s) for {seat}:\n\n" + "\n\n".join(lines)
                 + f"\n\nReply here in this chat. Your reply goes to {'the owner' if who == 'owner' else who}"
                   " on the comms-deck screen; start it with @claude, @grok or another seat to send it"
@@ -1885,9 +1885,12 @@ def deliver_app_notes(seat, state, cdp):
         cdp_eval(cdp, _SCROLL_JS)
         time.sleep(0.2)
         # The bubble has to be a user message. An empty composer alone can mean the insert missed.
-        landed = cdp_eval(cdp, "(() => [...document.querySelectorAll('.sand-message')]"
-                          ".some(m => m.getAttribute('data-role')==='user' && (m.innerText||'').includes("
-                          + json.dumps(marker) + ")))()")
+        # Compare with runs of whitespace collapsed: the chat renders blank lines
+        # differently, and a strict match called a sent note failed and sent it twice.
+        landed = cdp_eval(cdp, "(() => { const squash = t => (t||'').replace(/\\s+/g,' ').trim();"
+                          " const want = squash(" + json.dumps(marker) + ");"
+                          " return [...document.querySelectorAll('.sand-message')]"
+                          ".some(m => m.getAttribute('data-role')==='user' && squash(m.innerText).includes(want)); })()")
         if not landed:
             raise RuntimeError("the note never reached the chat")
     except Exception as error:
@@ -1921,13 +1924,18 @@ def drive_app_seat(seat, cdp, focused):
     changes, stale = draft_status(state, snap.get("composer"), time.time())
     if changes:
         state.update(update_seat(seat, **changes))
-    if stale and waiting and focused is False and not snap.get("replying"):
+    leftover = (snap.get("composer") or "").startswith(MARK)  # the deck's own text from a failed send
+    if (stale or leftover) and waiting and focused is False and not snap.get("replying"):
         draft = snap.get("composer") or ""
         minutes = int((time.time() - float(state.get("app_draft_since") or time.time())) // 60)
         cdp_eval(cdp, _FOCUS_JS)
         app_clear_composer(cdp)
         time.sleep(0.2)
-        if not (composer_text_now(cdp) or "").strip():
+        if not (composer_text_now(cdp) or "").strip() and leftover:
+            log(f"{seat}: cleared the deck's own text left from a failed send")
+            state.update(update_seat(seat, app_draft="", app_draft_since=0))
+            snap["composer"] = ""
+        elif not (composer_text_now(cdp) or "").strip():
             send("deck", "owner", f"{seat.title()}'s chat box held an unsent draft for {minutes} minutes, "
                                   f"so no notes could be typed in. I cleared it; here is what it said:\n\n{draft}",
                  private=True)
@@ -3696,6 +3704,10 @@ def self_test():
         "ch, st = x.draft_status({'app_draft': 'w', 'app_draft_since': 1000.0}, 'wh', 5000.0); assert ch['app_draft_since'] == 5000.0 and not st",
         "ch, st = x.draft_status({'app_draft': 'w', 'app_draft_since': 1000.0}, '', 5000.0); assert ch == {'app_draft': '', 'app_draft_since': 0} and not st",
         "ch, st = x.draft_status({}, None, 5000.0); assert ch == {} and not st",
+        "two = [{'from':'owner','to':'alice','time':'2026-11-24 07:00:00','text':'hi'},"
+        " {'from':'gravity','to':'all','time':'2026-11-24 07:00:00','text':'yo'}]",
+        "x.APP_SEATS = tuple(set(x.APP_SEATS) | {'alice'})",
+        "assert 'Your reply goes to the owner' in x.render(two, 'alice')",
         "assert x.app_delivery_allowed({'open':True,'replying':False,'composer':'draft'}, False, {'auto':0}, 'alice') is False",
         "assert x.app_delivery_allowed(idle, True, {'auto':0}, 'alice') is False",
         "assert x.app_delivery_allowed(idle, False, {'auto':2}, 'alice') is False",
