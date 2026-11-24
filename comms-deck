@@ -138,7 +138,7 @@ WEBHOOK_FILE = CONFIG / "discord-webhook"
 
 # Agent seats: the process name each one runs as. Extra seats can be added
 # with COMMS_DECK_SEATS="name:process,name2:process2".
-AGENTS = {"claude": "claude", "grok": "grok", "codex": "codex", "agy": "agy"}  # agy: Antigravity CLI
+AGENTS = {"claude": "claude", "grok": "grok", "codex": "codex", "gravity": "agy"}  # gravity: the Antigravity CLI, whose program is agy
 for _pair in filter(None, setting("SEATS", "").split(",")):
     _name, _, _proc = _pair.partition(":")
     AGENTS[_name.strip()] = (_proc or _name).strip()
@@ -763,7 +763,7 @@ def next_auto(state, notes):
 
 
 def agy_hook(event):
-    """Hooks for the Antigravity CLI (agy). Its events and replies differ:
+    """Hooks for the Antigravity CLI (program agy, seat gravity). Its events and replies differ:
 
       SessionStart   remember the window; say how many notes wait (injectSteps)
       PreInvocation  runs before every model call. Call 0 is a new turn: mark
@@ -779,7 +779,7 @@ def agy_hook(event):
     except ValueError:
         data = {}
     seat, pid = find_agent()
-    if seat != "agy":
+    if seat != "gravity":
         return  # not running inside agy: not this hook's business
     state = load_seat(seat)
     if pid and state.get("pid") != pid:
@@ -794,7 +794,7 @@ def agy_hook(event):
         update_seat(seat, state="idle", auto=0)
         count = len(pending(seat))
         if count:
-            print(json.dumps(system(f"{MARK} {count} note(s) are waiting for you (agy). "
+            print(json.dumps(system(f"{MARK} {count} note(s) are waiting for you (gravity). "
                                     "Read them with the read_messages tool.")))
     elif event == "PreInvocation":
         if int(data.get("invocationNum") or 0) == 0:
@@ -2587,7 +2587,7 @@ def install(yes):
         mcp_path = folder / "mcp_config.json"
         config = read_json(mcp_path, {}) or {}
         config.setdefault("mcpServers", {})["comms-deck"] = {
-            "command": cmd, "args": ["mcp"], "env": {"COMMS_DECK_SEAT": "agy"}}
+            "command": cmd, "args": ["mcp"], "env": {"COMMS_DECK_SEAT": "gravity"}}
         mcp_path.write_text(json.dumps(config, indent=2) + "\n")
     step("add hooks and the MCP server for Antigravity, if installed (~/.gemini/config)", antigravity)
     step("register the MCP server with Codex, if installed (~/.codex/config.toml)",
@@ -2824,20 +2824,20 @@ def self_test():
     acts = [json.loads(l) for l in Path(f"{tmp}/data/activity.jsonl").read_text().splitlines()]
     check("state changes are written to the activity log",
           any(a["seat"] == "grok" and a["state"] == "idle" for a in acts), str(acts[-3:]))
-    run(["send", "agy", "hello agy"], "claude")
-    r = run(["hook", "--source", "agy", "--event", "PreInvocation"], "agy",
+    run(["send", "gravity", "hello gravity"], "claude")
+    r = run(["hook", "--source", "agy", "--event", "PreInvocation"], "gravity",
             '{"invocationNum": 0, "lastUserInput": "go"}')
     out = json.loads(r.stdout or "{}")
-    check("agy gets notes before a model call, as a system message",
-          "hello agy" in json.dumps(out) and "injectSteps" in out, r.stdout + r.stderr)
-    run(["send", "agy", "second for agy"], "claude")
-    r = run(["hook", "--source", "agy", "--event", "Stop"], "agy", '{"fullyIdle": true}')
+    check("gravity gets notes before a model call, as a system message",
+          "hello gravity" in json.dumps(out) and "injectSteps" in out, r.stdout + r.stderr)
+    run(["send", "gravity", "second for gravity"], "claude")
+    r = run(["hook", "--source", "agy", "--event", "Stop"], "gravity", '{"fullyIdle": true}')
     out = json.loads(r.stdout or "{}")
-    check("agy's Stop continues the turn with a waiting note",
-          out.get("decision") == "continue" and "second for agy" in out.get("reason", ""), r.stdout)
-    run(["hook", "--source", "agy", "--event", "Stop"], "agy", '{"fullyIdle": true}')
-    check("agy is idle after a Stop with nothing waiting",
-          (read_json(Path(tmp) / "data/seats/agy.json", {}) or {}).get("state") == "idle")
+    check("gravity's Stop continues the turn with a waiting note",
+          out.get("decision") == "continue" and "second for gravity" in out.get("reason", ""), r.stdout)
+    run(["hook", "--source", "agy", "--event", "Stop"], "gravity", '{"fullyIdle": true}')
+    check("gravity is idle after a Stop with nothing waiting",
+          (read_json(Path(tmp) / "data/seats/gravity.json", {}) or {}).get("state") == "idle")
     check("app seats are told to reply in their chat, not with tools",
           "Reply here in this chat" in app_text and "send_message" not in app_text, app_text)
     check("Grok's Notification hook matches idle_prompt only",
