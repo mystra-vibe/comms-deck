@@ -411,7 +411,9 @@ def describe(text, limit=70):
     becomes "note from grok: <its first line>"; anything else is its own
     first line. Private names are redacted.
     """
-    text = str(text or "").strip()
+    # Claude Code wraps a pasted note in <pasted_content ...> tags before its
+    # hook sees the prompt; those aren't part of the text.
+    text = re.sub(r"</?pasted_content[^>]*>", "", str(text or "")).strip()
     if text.startswith(MARK):
         m = re.search(r"^From (\S+)[^\n]*:\n+(.+)$", text, re.M)
         if m:
@@ -2004,6 +2006,8 @@ def watch():
 # a status bar that stays put (an ANSI scroll region), showing each seat.
 
 SEAT_COLOURS = {"claude": 208, "grok": 45, "codex": 78, "owner": 220, "push-courier": 245}
+# One symbol per state, so busy and idle differ at a glance (not by colour alone).
+STATE_MARKS = {"busy": "●", "idle": "○", "away": "·"}
 STATE_COLOURS = {"busy": 208, "idle": 78, "away": 240, "connected": 78, "not connected": 214,
                  "chat not open": 214, "no chat yet": 240, "not set up": 240}
 
@@ -2167,11 +2171,13 @@ def usage_panel(width):
         for r in activity:
             seat, st = r["seat"], r["state"]
             clock = span(r["duration"])
-            timer = (f"\033[1;38;5;{STATE_COLOURS.get(st, 245)}m{clock:>8} ▶\033[0m" if r["live"]
-                     else f"\033[2m{clock:>8}  \033[0m")
+            shade = STATE_COLOURS.get(st, 245)
+            mark = STATE_MARKS.get(st, "◌")
+            timer = (f"\033[1;38;5;{shade}m{clock:>8}\033[0m" if r["live"]  # live: bold, counting up
+                     else f"\033[2m{clock:>8}\033[0m")
             lines.append(f"  \033[2m{time.strftime('%H:%M', time.localtime(r['time']))}\033[0m  "
                          f"\033[38;5;{colour(seat)}m{seat.title():7}\033[0m "
-                         f"\033[38;5;{STATE_COLOURS.get(st, 245)}m{st[:13]:13}\033[0m {timer}")
+                         f"\033[38;5;{shade}m{mark} {st[:12]:12}\033[0m {timer}")
             if r["live"] and st == "busy" and r.get("doing"):
                 lines.append(f"\033[2m           {r['doing'][:inner - 12]}\033[0m")
     return [fit(" " + line, width) for line in lines]
@@ -3094,6 +3100,9 @@ def self_test():
           abs(view[1]["duration"] - 9.8) < 0.01 and not view[1]["live"]
           and view[0]["live"] and 9.5 < view[0]["duration"] < 12,
           str(view))
+    check("a pasted note's wrapper tags are left out of its description",
+          describe('<pasted_content id="x1">\n[comms-deck] 1 note(s) for claude:\n\nFrom alice at 03:21:\n'
+                   'Alice here, for the owner\n</pasted_content id="x1">') == "note from alice: Alice here, for the owner")
     check("an activity line never shows a secret",
           describe("deploy with token: ghp_" + "a" * 30) == "(something private)")
     check("a delivered note is described by its sender and first line",
