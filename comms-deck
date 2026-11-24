@@ -767,7 +767,10 @@ def composer_text(screen):
     next line (Claude Code's composer when the marker sits on its own line).
     An empty string means the composer is on screen and has no draft.
     """
-    lines = screen.splitlines()
+    # Only the bottom of the window: the composer always sits there, while
+    # the scrollback above can hold anything (a quoted "> " line, a copy of
+    # another agent's screen) that would look like a prompt.
+    lines = screen.rstrip("\n").splitlines()[-15:]
     box = None
     for i, line in enumerate(lines):
         if "❯" in line and "│" in line:
@@ -846,7 +849,7 @@ def try_wake(seat):
         log(f"not waking {seat}: couldn't see the prompt line")
         return False
     if typed:
-        log(f"not waking {seat}: a draft is already in the prompt")
+        log(f"not waking {seat}: a draft is already in the prompt: {typed[:60]!r}")
         return False
     notes = take(seat, include_quiet=False, limit_chars=HANDOVER_MAX)
     if not notes:
@@ -1823,6 +1826,10 @@ def self_test():
     check("Claude's bare > marker uses the next line",
           composer_text("> \nfix the hook\n") == "fix the hook")
     check("a screen with no composer is left alone", composer_text("no prompt here\n") is None)
+    scrollback = ("│ ❯ old text from another screen │\n> a quoted line in a reply\n"
+                  + "words\n" * 20 + claude_empty + "  status line\n")
+    check("text in the scrollback above the prompt isn't a draft", composer_text(scrollback) == "",
+          repr(composer_text(scrollback)))
     rule = "\033[38:2:136:136:136m" + "─" * 20 + "\033[m\n"
     suggested = rule + "\033[38:2:153:153:153m❯\u00a0\033[2mtry: run the tests\033[m\n" + rule
     typed = rule + "\033[38:2:153:153:153m❯\u00a0\033[mrun the tests\n" + rule
