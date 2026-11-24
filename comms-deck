@@ -696,12 +696,14 @@ def render(records, seat):
 #   SessionStart       remember the window; Claude is told about waiting notes
 #   UserPromptSubmit   mark busy; record promptId; reset the loop count if the
 #                      owner typed it. Claude also gets waiting notes.
-#   Stop               hand over a waiting note and keep working. Never marks
-#                      idle. channel_closed / shutdown mark away.
+#   Stop               hand over a waiting note and keep working. An allowed
+#                      Stop marks Claude idle immediately. Grok's Stop does
+#                      not. channel_closed / shutdown mark away.
 #   StopCancelled      a late cancel can arrive after the next prompt, so this
 #                      does not mark idle. Older promptIds are ignored on Stop.
-#   Notification       idle_prompt only: mark idle. StopFailure is not hooked:
-#                      idle_prompt also fires after an errored turn.
+#   Notification       idle_prompt only: mark idle. For Grok this is what
+#                      settles idle. StopFailure is not hooked: idle_prompt
+#                      also fires after an errored turn.
 #   SessionEnd         mark away
 #
 # A child session's events carry subagentType. They are not this seat's.
@@ -2201,22 +2203,34 @@ def usage_panel(width):
         lines.append(f"\033[2m  updated {ago(time.time() - record.get('time', 0))}\033[0m")
         lines.append("")
     # ACTIVITY: one row per agent: its state's symbol, the state, when it
-    # began, and a blue square per note waiting for it. Nothing ticks. (The history stays in
-    # activity.jsonl; the owner asked for just the current picture here.)
+    # began, and a blue square per note waiting for it. Nothing ticks. Idle
+    # with notes still waiting is shown as stuck, in red. (The history stays
+    # in activity.jsonl; the owner asked for just the current picture here.)
     lines.append("\033[1mACTIVITY\033[0m")
     lines.append("")
     for seat, st, since in current_states():
         # Static: when the state began, not a ticking timer. A row changes
         # only when that agent's state does, and is rewritten in place.
-        shade = STATE_COLOURS.get(st, 245)
         began = when(since) if since else ""  # "03:27" today, "Fri 18:00" otherwise
         waiting = len(pending(seat))
+        mark, shade, word = row_status(st, waiting)
         squares = "■" * min(waiting, 5) + (f"+{waiting - 5}" if waiting > 5 else "")
         lines.append(f"  \033[38;5;{colour(seat)}m{seat.title():8}\033[0m "
-                     f"\033[38;5;{shade}m{STATE_MARKS.get(st, '◌')} {st[:13]:13}\033[0m "
+                     f"\033[38;5;{shade}m{mark} {word[:13]:13}\033[0m "
                      f"\033[2m{began}\033[0m"
                      + (f" \033[38;5;33m{squares}\033[0m" if squares else ""))
     return [fit(" " + line, width) for line in lines]
+
+
+def row_status(state, waiting):
+    """The mark, colour and word for one activity row.
+
+    Idle with notes still in the inbox is stuck: a red row that says stuck,
+    so a queue nobody has picked up stands out from a genuinely idle agent.
+    """
+    if state == "idle" and waiting:
+        return "●", 196, "stuck"
+    return STATE_MARKS.get(state, "◌"), STATE_COLOURS.get(state, 245), state
 
 
 def current_states():
@@ -3132,6 +3146,10 @@ def self_test():
           abs(view[1]["duration"] - 9.8) < 0.01 and not view[1]["live"]
           and view[0]["live"] and 9.5 < view[0]["duration"] < 12,
           str(view))
+    check("idle with notes waiting shows stuck, in red",
+          row_status("idle", 1) == ("●", 196, "stuck"))
+    check("idle with an empty inbox stays idle", row_status("idle", 0)[2] == "idle")
+    check("busy with notes waiting stays busy", row_status("busy", 4)[2] == "busy")
     check("a pasted note's wrapper tags are left out of its description",
           describe('<pasted_content id="x1">\n[comms-deck] 1 note(s) for claude:\n\nFrom alice at 03:21:\n'
                    'Alice here, for the owner\n</pasted_content id="x1">') == "note from alice: Alice here, for the owner")
