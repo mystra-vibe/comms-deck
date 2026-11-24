@@ -20,8 +20,10 @@ left alone, so running it again changes nothing.
                                 workspace 5, half on 1, small here) if they
                                 aren't open. Run by scratchpad-keeper.service.
 
-A window you drag or resize by hand is not pulled back until the next open,
-close or move, so you can still adjust things for a while.
+After its first pass, --watch leaves a window that is already floating on
+the scratchpad wherever it is, so a window you drag or resize by hand
+stays put. It places only windows that open, come back to the scratchpad,
+or stop floating. Run scratchpad-layout (no flag) to snap everything back.
 
 Written by: Claude (2026-11-24)
 """
@@ -95,8 +97,13 @@ def plan_layout(mon, clients, tree):
     ]
 
 
-def arrange(quiet=False):
-    """Put every window in the plan where it belongs. Returns how many were changed."""
+def arrange(quiet=False, keep_hand_moves=False):
+    """Put every window in the plan where it belongs. Returns how many were changed.
+
+    With keep_hand_moves, a window already floating on the scratchpad is left
+    where it is, whatever its size and place: only a window that has just
+    opened, or left the scratchpad, or stopped floating, is placed.
+    """
     mon = next(m for m in json.loads(hypr("monitors", "-j")) if m["focused"])
     clients = json.loads(hypr("clients", "-j"))
     changed = 0
@@ -110,6 +117,8 @@ def arrange(quiet=False):
                     and abs(win["size"][0] - w) <= 8 and abs(win["size"][1] - h) <= 8)
         if in_place:  # (a few pixels of slack: some apps have a minimum size)
             continue
+        if keep_hand_moves and win["workspace"]["name"] == WORKSPACE and win["floating"]:
+            continue  # moved or resized by hand: leave it
         addr = f'window = "address:{win["address"]}"'
         if win["workspace"]["name"] != WORKSPACE:
             dispatch(f'hl.dsp.window.move({{ {addr}, workspace = "{WORKSPACE}", follow = false }})')
@@ -163,6 +172,7 @@ def watch():
             continue
         print(f"watching {event_socket()}", flush=True)
         buffer, due = b"", time.time() + 2  # first pass shortly after start, once windows exist
+        first = True  # the first pass arranges everything; later ones keep hand moves
         with sock:
             while True:
                 timeout = max(0.0, due - time.time()) if due else None
@@ -177,7 +187,8 @@ def watch():
                 elif due:
                     due = None
                     try:
-                        n = arrange(quiet=True)
+                        n = arrange(quiet=True, keep_hand_moves=not first)
+                        first = False
                         if n:
                             print(f"rearranged {n} window(s)", flush=True)
                     except (OSError, subprocess.SubprocessError, SystemExit, StopIteration, ValueError) as error:
