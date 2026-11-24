@@ -2,10 +2,13 @@
 """scratchpad-layout: arrange the agents on the scratchpad (Super+S).
 
     +-----------+-----------+-----------------------+
-    |   Grok    | Grok Bot  |                       |
-    +-----------+-----------+        Firefox        |
-    |        Claude         |                       |
+    |   Grok    | Grok Bot  |     chat (small)      |
+    +-----------+-----------+-----------------------+
+    |        Claude         |  Gravity (the agy kitty) |
     +-----------------------+-----------------------+
+
+Firefox takes the whole right column instead only when neither the small
+chat (comms-deck-chat small) nor Gravity is on the scratchpad.
 
 Finds each window by what runs in it (the kitty holding `grok`, the kitty
 holding `claude`, the Grok Bot app, Firefox), moves it to special:magic
@@ -81,8 +84,13 @@ def main():
         ("Grok Bot", by_class("grok-bot"), x0 + quarter_w + GAP_IN, y0,
          half_w - quarter_w - GAP_IN, half_h),
         ("Claude", window_holding(clients, tree, "claude"), x0, lower_y, half_w, height - half_h - GAP_IN),
-        ("Firefox", by_class("firefox"), right_x, y0, width - half_w - GAP_IN, height),
     ]
+    right_w = width - half_w - GAP_IN
+    chat, gravity = by_class("comms-deck-chat-small"), window_holding(clients, tree, "agy")
+    plan.append(("Chat", chat, right_x, y0, right_w, half_h))
+    plan.append(("Gravity", gravity, right_x, lower_y, right_w, height - half_h - GAP_IN))
+    if not (chat or gravity):
+        plan.append(("Firefox", by_class("firefox"), right_x, y0, right_w, height))
     for label, win, x, y, w, h in plan:
         if not win:
             print(f"skipped {label}: not open")

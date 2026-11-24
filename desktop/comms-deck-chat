@@ -1,9 +1,35 @@
 #!/bin/sh
-# Open the comms-deck chat view in its own kitty window (Hyprland puts it
-# fullscreen on workspace 5). Only one copy runs at a time.
+# Open a comms-deck chat view in its own kitty window. One copy of each view.
+#   comms-deck-chat          fullscreen on workspace 5 (the window rule does it)
+#   comms-deck-chat half     tiled on workspace 1, half the screen beside Lumo
+#   comms-deck-chat small    small, floating, top right of the scratchpad
+# Several views can run at once: they all read the same notes.
 # Written by: Claude (2026-11-24)
-hyprctl clients -j | grep -q '"class": "comms-deck-chat"' && exit 0
+view=${1:-full}
+case "$view" in
+    full)  class=comms-deck-chat;       font=15; pad=24 ;;
+    half)  class=comms-deck-chat-half;  font=13; pad=16 ;;
+    small) class=comms-deck-chat-small; font=9;  pad=8  ;;
+    *) echo "usage: comms-deck-chat [full|half|small]" >&2; exit 2 ;;
+esac
+hyprctl clients -j | grep -q "\"class\": \"$class\"" && exit 0
 cd "$HOME" || exit 1
-exec kitty --class comms-deck-chat --title "comms-deck chat" \
-    -o font_size=15 -o window_padding_width=24 -o confirm_os_window_close=0 \
-    comms-deck chat "$@"
+kitty --class "$class" --title "comms-deck chat ($view)" \
+    -o font_size=$font -o window_padding_width=$pad -o confirm_os_window_close=0 \
+    comms-deck chat &
+# Place it once it has a window. Full is placed by its window rule.
+[ "$view" = full ] && wait && exit 0
+for _ in $(seq 1 40); do
+    addr=$(hyprctl clients -j | python3 -c "import json,sys; print(next((c['address'] for c in json.load(sys.stdin) if c['class'] == '$class'), ''))")
+    [ -n "$addr" ] && break
+    sleep 0.25
+done
+[ -n "$addr" ] || exit 0
+w="window = \"address:$addr\""
+if [ "$view" = half ]; then
+    hyprctl dispatch "hl.dsp.window.move({ $w, workspace = 1, follow = false })" >/dev/null
+else
+    hyprctl dispatch "hl.dsp.window.move({ $w, workspace = \"special:magic\", follow = false })" >/dev/null
+    "$(dirname "$(readlink -f "$0")")/scratchpad-layout" >/dev/null
+fi
+wait
