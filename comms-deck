@@ -705,6 +705,59 @@ def _after_marker(line):
     return text
 
 
+SGR = re.compile(r"\033\[([0-9;:]*)m")
+STRUCTURE = set("❯>│─━═╭╮╰╯-|")
+
+
+def drop_placeholders(ansi_screen):
+    """The screen as plain text, with greyed-out text blanked.
+
+    Agents draw hints in the prompt in grey or dim text: Claude Code's
+    suggested next prompt, Grok's placeholder. Typed text is drawn in the
+    normal colour. So grey or dim characters, apart from the box drawing and
+    prompt markers the composer is found by, become spaces, and only what
+    the owner really typed is left for composer_text().
+    """
+    out, pos, dim, grey = [], 0, False, False
+
+    def is_grey(params):
+        nums = [int(n) for n in re.split(r"[;:]", params) if n.isdigit()]
+        for i, n in enumerate(nums):
+            if n == 38 and i + 1 < len(nums):
+                if nums[i + 1] == 5 and i + 2 < len(nums):
+                    c = nums[i + 2]
+                    return c in (8, 59, 102, 145) or 237 <= c <= 250
+                if nums[i + 1] == 2 and i + 4 < len(nums):
+                    r, g, b = nums[i + 2:i + 5]
+                    return max(r, g, b) - min(r, g, b) <= 12 and max(r, g, b) <= 200
+            if n == 90:
+                return True
+        return None  # no colour change in this code
+
+    for m in SGR.finditer(ansi_screen):
+        for ch in ansi_screen[pos:m.start()]:
+            muted = (dim or grey) and ch not in STRUCTURE and not ch.isspace()
+            out.append(" " if muted else ch)
+        params = m.group(1)
+        codes = [c for c in re.split(r"[;:]", params) if c] or ["0"]
+        if "0" in codes and params.split(";")[0] in ("", "0"):
+            dim = grey = False
+        if "2" in codes and params.split(";")[0] == "2":
+            dim = True
+        if "22" in codes:
+            dim = False
+        if "39" in codes:
+            grey = False
+        g = is_grey(params)
+        if g is not None:
+            grey = g
+        pos = m.end()
+    for ch in ansi_screen[pos:]:
+        muted = (dim or grey) and ch not in STRUCTURE and not ch.isspace()
+        out.append(" " if muted else ch)
+    return re.sub(r"\033\[[0-9;:?]*[A-Za-z]", "", "".join(out))
+
+
 def composer_text(screen):
     """Text already typed in an agent's composer, or None if it can't be seen.
 
@@ -784,7 +837,7 @@ def try_wake(seat):
     if focused:
         return False  # the owner may be typing there: wait
     try:
-        screen = kitty(socket, "get-text", "--match", f"id:{window}")
+        screen = drop_placeholders(kitty(socket, "get-text", "--match", f"id:{window}", "--ansi"))
     except (RuntimeError, OSError, subprocess.SubprocessError) as error:
         log(f"not waking {seat}: couldn't read the window ({error})")
         return False
@@ -1770,6 +1823,13 @@ def self_test():
     check("Claude's bare > marker uses the next line",
           composer_text("> \nfix the hook\n") == "fix the hook")
     check("a screen with no composer is left alone", composer_text("no prompt here\n") is None)
+    rule = "\033[38:2:136:136:136m" + "─" * 20 + "\033[m\n"
+    suggested = rule + "\033[38:2:153:153:153m❯\u00a0\033[2mtry: run the tests\033[m\n" + rule
+    typed = rule + "\033[38:2:153:153:153m❯\u00a0\033[mrun the tests\n" + rule
+    check("a grey suggested prompt doesn't count as a draft",
+          composer_text(drop_placeholders(suggested)) == "", repr(drop_placeholders(suggested)))
+    check("text typed in the normal colour still counts",
+          composer_text(drop_placeholders(typed)) == "run the tests", repr(drop_placeholders(typed)))
     check("Grok's Notification hook matches idle_prompt only",
           grok_hooks("comms-deck")["hooks"]["Notification"][0].get("matcher") == "idle_prompt")
     shutil.rmtree(tmp, ignore_errors=True)
