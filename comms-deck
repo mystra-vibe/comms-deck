@@ -811,6 +811,26 @@ def next_auto(state, notes):
     return state["auto"] + 1
 
 
+def remember_gravity_model(data):
+    """Save the model name from a PreInvocation hook, for the usage panel.
+
+    The payload has modelName and no token or quota figures, so the panel
+    names the model and draws no bar. A repeat of the same name inside a
+    minute does not rewrite the file.
+    """
+    model = str(data.get("modelName") or "").strip()
+    if not model:
+        return
+    path = DATA / "usage" / "gravity.json"
+    prev = read_json(path) or {}
+    same = (prev.get("source") == "gravity-hook"
+            and dig(prev, "data", "model", "display_name") == model)
+    if same and time.time() - float(prev.get("time") or 0) < 60:
+        return
+    write_json(path, {"time": time.time(), "source": "gravity-hook",
+                      "data": {"model": {"display_name": model}}})
+
+
 def agy_hook(event):
     """Hooks for the Antigravity CLI (program agy, seat gravity). Its events and replies differ:
 
@@ -846,6 +866,7 @@ def agy_hook(event):
             print(json.dumps(system(f"{MARK} {count} note(s) are waiting for you (gravity). "
                                     "Read them with the read_messages tool.")))
     elif event == "PreInvocation":
+        remember_gravity_model(data)
         if int(data.get("invocationNum") or 0) == 0:
             typed = str(data.get("lastUserInput") or "")
             woke = time.time() - float(state.get("woke_at") or 0) < 10
@@ -869,6 +890,30 @@ def agy_hook(event):
             pause_notice(seat)
         if data.get("fullyIdle", True):
             update_seat(seat, state="idle")
+
+
+# Tools Gravity may call without a per-call Allow prompt. install adds any
+# that are missing and leaves the rest of agy's settings file alone.
+GRAVITY_MCP_ALLOW = (
+    "mcp(comms-deck/team_status)",
+    "mcp(comms-deck/read_messages)",
+    "mcp(comms-deck/send_message)",
+    "mcp(comms-deck/add_note)",
+    "mcp(comms-deck/set_status)",
+)
+
+
+def grant_gravity_tools(settings):
+    """Add the comms-deck MCP tools to agy's allow list. Other settings stay."""
+    settings = dict(settings or {})
+    permissions = dict(settings.get("permissions") or {})
+    allow = list(permissions.get("allow") or [])
+    for entry in GRAVITY_MCP_ALLOW:
+        if entry not in allow:
+            allow.append(entry)
+    permissions["allow"] = allow
+    settings["permissions"] = permissions
+    return settings
 
 
 def agy_hooks(cmd):
@@ -989,8 +1034,10 @@ def composer_text(screen):
 
     Grok's composer is the last `│ ❯ … │` line of the input box, plus any
     wrapped lines before the box closes. Claude Code's is the `❯` line between
-    the two rules at the bottom of the screen. A bare `>` marker uses the
-    next line (Claude Code's composer when the marker sits on its own line).
+    the two rules at the bottom of the screen. Antigravity's is a `>` between
+    two rules, with a hint such as "? for shortcuts" under the bottom rule;
+    that hint is not part of the draft. A bare `>` marker uses the next line
+    (Claude Code's composer when the marker sits on its own line).
     An empty string means the composer is on screen and has no draft.
     """
     # Only the bottom of the window: the composer always sits there, while
@@ -2701,6 +2748,12 @@ def install(yes):
         config.setdefault("mcpServers", {})["comms-deck"] = {
             "command": cmd, "args": ["mcp"], "env": {"COMMS_DECK_SEAT": "gravity"}}
         mcp_path.write_text(json.dumps(config, indent=2) + "\n")
+        settings_path = HOME / ".gemini/antigravity-cli/settings.json"
+        settings_path.parent.mkdir(parents=True, exist_ok=True)
+        current = read_json(settings_path, {}) or {}
+        updated = grant_gravity_tools(current)
+        if updated != current:
+            settings_path.write_text(json.dumps(updated, indent=2) + "\n")
     step("add hooks and the MCP server for Antigravity, if installed (~/.gemini/config)", antigravity)
     step("register the MCP server with Codex, if installed (~/.codex/config.toml)",
          lambda: mcp_toml(HOME / ".codex/config.toml", "[mcp_servers.comms-deck]"))
@@ -2931,6 +2984,24 @@ def self_test():
           composer_text(drop_placeholders(suggested)) == "", repr(drop_placeholders(suggested)))
     check("text typed in the normal colour still counts",
           composer_text(drop_placeholders(typed)) == "run the tests", repr(drop_placeholders(typed)))
+    agy_rule = "─" * 40 + "\n"
+    agy_hint = "? for shortcuts\n"
+    agy_empty = "scrollback\n> a quoted line in a reply\n" + agy_rule + ">\n" + agy_rule + agy_hint
+    agy_draft = agy_rule + "> integrate gravity\n" + agy_rule + agy_hint
+    agy_wrap = agy_rule + "> integrate\ngravity usage\n" + agy_rule + agy_hint
+    check("an empty Antigravity composer is safe to paste into",
+          composer_text(agy_empty) == "", repr(composer_text(agy_empty)))
+    check("an Antigravity draft blocks the paste",
+          composer_text(agy_draft) == "integrate gravity", repr(composer_text(agy_draft)))
+    check("a wrapped Antigravity draft blocks the paste",
+          composer_text(agy_wrap) == "integrate\ngravity usage", repr(composer_text(agy_wrap)))
+    agy_coloured = ("\033[38:2:65:72:104m" + "─" * 40 + "\033[m\n"
+                    "\033[38:2:122:162:247m> \033[mintegrate gravity\n"
+                    "\033[38:2:65:72:104m" + "─" * 40 + "\033[m\n"
+                    "\033[38:2:126:134:173m? for shortcuts\033[m\n")
+    check("Antigravity's coloured prompt keeps typed text and drops the hint",
+          composer_text(drop_placeholders(agy_coloured)) == "integrate gravity",
+          repr(drop_placeholders(agy_coloured)))
     app_text = render([{"from": "grok", "to": "alice", "time": "2026-11-24 02:50:00", "text": "hi"}], "alice")
     run(["hook", "--source", "grok", "--event", "SessionStart"], "grok", "{}", {"GROK_HOOK_EVENT": "session_start"})
     acts = [json.loads(l) for l in Path(f"{tmp}/data/activity.jsonl").read_text().splitlines()]
@@ -2950,6 +3021,28 @@ def self_test():
     run(["hook", "--source", "agy", "--event", "Stop"], "gravity", '{"fullyIdle": true}')
     check("gravity is idle after a Stop with nothing waiting",
           (read_json(Path(tmp) / "data/seats/gravity.json", {}) or {}).get("state") == "idle")
+    run(["hook", "--source", "agy", "--event", "PreInvocation"], "gravity",
+        '{"invocationNum": 0, "lastUserInput": "stay busy", "modelName": "Gemini 3"}')
+    run(["hook", "--source", "agy", "--event", "Stop"], "gravity",
+        '{"fullyIdle": false, "modelName": "Gemini 3"}')
+    check("gravity stays busy while fullyIdle is false",
+          (read_json(Path(tmp) / "data/seats/gravity.json", {}) or {}).get("state") == "busy")
+    usage = read_json(Path(tmp) / "data/usage/gravity.json", {}) or {}
+    check("gravity's usage row is the model agy reported",
+          usage.get("source") == "gravity-hook"
+          and dig(usage, "data", "model") == {"display_name": "Gemini 3"}, str(usage))
+    granted = grant_gravity_tools({"colorScheme": "kept", "permissions": {"allow": [
+        "mcp(comms-deck/send_message)"]}, "trustedWorkspaces": ["/work"]})
+    allow = granted["permissions"]["allow"]
+    check("gravity install allows the comms-deck tools and keeps other settings",
+          granted["colorScheme"] == "kept" and granted["trustedWorkspaces"] == ["/work"]
+          and all(allow.count(entry) == 1 for entry in GRAVITY_MCP_ALLOW),
+          str(granted))
+    hooks = agy_hooks("comms-deck")["comms-deck"]
+    check("install registers gravity's SessionStart, PreInvocation and Stop",
+          set(hooks) == {"SessionStart", "PreInvocation", "Stop"}
+          and all(hooks[ev][0]["command"].endswith(f"hook --source agy --event {ev}") for ev in hooks),
+          str(hooks))
     run(["hook", "--source", "grok", "--event", "UserPromptSubmit"], "grok",
         '{"prompt": "Fix the usage clock\\nand more details"}', {"GROK_HOOK_EVENT": "user_prompt_submit"})
     acts = [json.loads(l) for l in Path(f"{tmp}/data/activity.jsonl").read_text().splitlines()]
