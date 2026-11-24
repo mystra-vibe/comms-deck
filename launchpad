@@ -6,6 +6,7 @@
   launchpad note <text...>                              add to the running commentary
   launchpad status                                      who is busy, idle or away
   launchpad watch                                       print notes as they are sent
+  launchpad chat [--hide-private]                       full-screen live view of the notes
   launchpad serve                                       the background service
   launchpad mcp                                         MCP server (send/read as tools)
   launchpad hook --source <claude|grok>                 called by the agents' hooks
@@ -713,6 +714,118 @@ def watch():
             print(f"\n{r['time']}  {head}\n{r['text']}", flush=True)
 
 
+# The live chat view (`launchpad chat`): a full-screen log for a spare
+# workspace. Notes scroll in the top part of the terminal; the bottom line is
+# a status bar that stays put (an ANSI scroll region), showing each seat.
+
+SEAT_COLOURS = {"claude": 208, "grok": 45, "codex": 78, "owner": 220, "push-courier": 245}
+STATE_COLOURS = {"busy": 208, "idle": 78, "away": 240}
+
+
+def colour(seat):
+    """A 256-colour code for `seat` (stable for seats without one)."""
+    return SEAT_COLOURS.get(seat, 140 + sum(map(ord, seat)) % 40)
+
+
+def chat_lines(r, width):
+    """The terminal lines for one record, wrapped to `width`."""
+    import textwrap
+    esc = "\033["
+    who = f"{esc}1;38;5;{colour(r['from'])}m{r['from'].title()}{esc}0m"
+    if r["kind"] == "message":
+        to = "everyone" if r["to"] == "all" else r["to"].title()
+        head = f"{who} {esc}2m→{esc}0m {esc}38;5;{colour(r['to'])}m{to}{esc}0m"
+        tags = "".join(f"  {esc}2m{t}{esc}0m" for t, on in
+                       (("quiet", r.get("quiet")), ("private", r.get("private"))) if on)
+        body_style = ""
+    else:
+        head, tags, body_style = f"{who} {esc}2mcommentary{esc}0m", "", f"{esc}3;2m"
+    lines = [f"{esc}2m{r['time'][11:16]}{esc}0m  {head}{tags}"]
+    for para in r["text"].splitlines() or [""]:
+        for line in textwrap.wrap(para, max(20, width - 9)) or [""]:
+            lines.append(f"       {body_style}{line}{esc}0m")
+    return lines + [""]
+
+
+def chat(history=200, hide_private=False):
+    """Show the last `history` records, then new ones as they arrive."""
+    path = DATA / "log.jsonl"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.touch()
+    out = sys.stdout
+
+    def size():
+        s = shutil.get_terminal_size((100, 40))
+        return s.columns, s.lines
+
+    def setup():
+        cols, rows = size()
+        out.write("\033[?25l\033[2J" + f"\033[1;{rows - 1}r" + f"\033[{rows - 1};1H")
+        out.flush()
+        return cols, rows
+
+    def status_bar(cols, rows):
+        parts = []
+        for seat in AGENTS:
+            s = load_seat(seat)
+            if s["state"] == "away" and seat not in ("claude", "grok"):
+                continue
+            mark = "●" if s["state"] != "away" else "○"
+            waiting = len(pending(seat))
+            extra = f" ({waiting} waiting)" if waiting else ""
+            parts.append(f"\033[1;38;5;{colour(seat)}m{seat.title()}\033[22;39m "
+                         f"\033[38;5;{STATE_COLOURS.get(s['state'], 240)}m{mark} {s['state']}{extra}\033[39m")
+        right = time.strftime("%H:%M")
+        bar = "   ".join(parts)
+        plain = len(re.sub(r"\033\[[0-9;]*m", "", bar))
+        pad = max(1, cols - plain - len(right) - 4)
+        out.write(f"\0337\033[{rows};1H\033[2K\033[48;5;235m  {bar}{' ' * pad}"
+                  f"\033[2m{right}\033[22m  \033[0m\0338")
+        out.flush()
+
+    def show(r):
+        if hide_private and r.get("private"):
+            return
+        for line in chat_lines(r, cols):
+            out.write(line + "\n")
+        out.flush()
+
+    cols, rows = setup()
+    with open(path) as f:
+        records = []
+        for line in f:
+            try:
+                records.append(json.loads(line))
+            except ValueError:
+                pass
+        out.write(f"\033[1mlaunchpad\033[0m \033[2m· live notes on {MACHINE}\033[0m\n\n")
+        for r in records[-history:]:
+            show(r)
+        last_bar = 0.0
+        try:
+            while True:
+                if size() != (cols, rows):
+                    cols, rows = setup()
+                    for r in records[-20:]:
+                        show(r)
+                line = f.readline()
+                if line:
+                    try:
+                        r = json.loads(line)
+                    except ValueError:
+                        continue
+                    records.append(r)
+                    show(r)
+                    continue
+                if time.time() - last_bar >= 2:
+                    status_bar(cols, rows)
+                    last_bar = time.time()
+                time.sleep(0.25)
+        finally:
+            out.write("\033[r\033[?25h\n")
+            out.flush()
+
+
 def status_text():
     """A short table of every agent seat."""
     rows = []
@@ -1034,6 +1147,9 @@ def main():
     p.add_argument("text", nargs="+")
     sub.add_parser("status")
     sub.add_parser("watch")
+    p = sub.add_parser("chat")
+    p.add_argument("--hide-private", action="store_true")
+    p.add_argument("--history", type=int, default=200)
     sub.add_parser("serve")
     sub.add_parser("mcp")
     p = sub.add_parser("hook")
@@ -1070,6 +1186,8 @@ def main():
             print(status_text())
         elif args.cmd == "watch":
             watch()
+        elif args.cmd == "chat":
+            chat(args.history, args.hide_private)
         elif args.cmd == "serve":
             serve()
         elif args.cmd == "mcp":

@@ -97,8 +97,23 @@ launchpad read                 # take your notes (--peek to just look)
 launchpad note "Switched X to Y because ..."              # the commentary
 launchpad status               # who's busy, idle or away
 launchpad watch                # print notes as they're sent
+launchpad chat                 # full-screen live view, with a status bar
 launchpad self-test            # the tests, in a throwaway folder
 journalctl --user -u launchpad -f                         # the service's log
+```
+
+**A live screen.** `launchpad chat` shows every note as it's sent, coloured
+by agent, with a status bar of who's busy, idle or away. To give it a
+workspace of its own, open it in a kitty window with class `launchpad-chat`
+and add a Hyprland rule, e.g. (Lua config):
+
+```lua
+hl.window_rule({ name = "launchpad-chat", match = { class = "^launchpad-chat$" },
+                 workspace = "5 silent", fullscreen = true })
+```
+
+```bash
+kitty --class launchpad-chat -o font_size=15 launchpad chat
 ```
 
 Extra seats (for example a second Claude): `LAUNCHPAD_SEATS="foot-claude:claude"`
