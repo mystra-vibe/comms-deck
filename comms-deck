@@ -672,6 +672,37 @@ def take(seat, include_quiet=True, limit_chars=None):
 # -----------------------------------------------------------------------------
 
 
+def note_age(record):
+    """How long ago a note was sent, e.g. '4m ago', for judging if it's stale."""
+    try:
+        sent = time.mktime(time.strptime(record["time"], "%Y-%m-%d %H:%M:%S"))
+    except (KeyError, ValueError):
+        return "time unknown"
+    return ago(time.time() - sent)
+
+
+def team_snapshot(seat, records):
+    """The team as this note is delivered: who's busy or idle, since when,
+    and how many notes each has waiting. Built by the service at delivery,
+    so every agent can judge what the others are likely doing, and avoid two
+    agents doing the same work (asked for by the owner)."""
+    rows = []
+    for other, st, since in current_states():
+        if other == seat:
+            continue
+        began = f" since {when(since)}" if since else ""
+        waiting = len(pending(other))
+        rows.append(f"{other} {st}{began}, {waiting} waiting")
+    text = f"Team at {time.strftime('%H:%M')}: " + "; ".join(rows) + "."
+    shared = [r for r in records if r.get("to") == "all" or "+" in str(r.get("to"))]
+    if shared:
+        text += (" This note went to more than one agent. Before starting work on it, check "
+                 "who is already on it (team_status, or ask). If it was sent a while ago and "
+                 "the others have been idle since, ask whether your part is still needed "
+                 "rather than doing it twice.")
+    return text
+
+
 def render(records, seat):
     """Turn notes into one block of text for `seat` to read."""
     lines = []
@@ -679,7 +710,8 @@ def render(records, seat):
         tags = [t for t, on in (("quiet", r.get("quiet")), ("private", r.get("private"))) if on]
         to = "" if r.get("to") == seat else f" (to {str(r.get('to')).replace('+', ', ')})"
         tag = f" [{', '.join(tags)}]" if tags else ""
-        lines.append(f"From {r['from']}{to} at {r['time'][11:16]}{tag}:\n{r['text']}")
+        lines.append(f"From {r['from']}{to} at {r['time'][11:16]} ({note_age(r)}){tag}:\n{r['text']}")
+    lines.append(team_snapshot(seat, records))
     senders = sorted({r["from"] for r in records} & set(SEATS))
     reply = (f"\n\nReply with the send_message tool (to: {senders[0]})"
              f" or `comms-deck send {senders[0]} \"...\"`." if senders else "")
@@ -3625,6 +3657,10 @@ def self_test():
           len(owner_side) == 2 and all(p for _, p, _ in owner_side)
           and any(t.startswith("done: would open https://example.com/a") for t, _, _ in owner_side)
           and any(t.startswith("Task from owner") and asks for t, _, asks in owner_side), r.stdout + r.stderr)
+    team = render([{"from": "owner", "to": "claude+grok", "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+                    "text": "do the thing"}], "grok")
+    check("delivered notes carry their age and a team snapshot, and flag shared work",
+          "(0s ago)" in team and "Team at " in team and "more than one agent" in team, team)
     check("app seats are told to reply in their chat, not with tools",
           "Reply here in this chat" in app_text and "send_message" not in app_text, app_text)
     check("Grok's Notification hook matches idle_prompt only",

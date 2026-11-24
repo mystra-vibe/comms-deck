@@ -128,7 +128,13 @@ Cognition's Devin agent (`devin`) is being added as a terminal seat.
    the first line of whatever started your turn.
 4. **Before starting new work**, skim today's commentary in flight-log
    (`~/flight-log/commentary/`), so you don't repeat or undo someone's work.
-5. **Don't ping-pong.** Every note you send costs the other agent a turn.
+5. **Don't do the same work twice.** Every note shows when it was sent and a
+   snapshot of the team at delivery: who is busy or idle, since when, and
+   how many notes each has waiting. When a note went to several agents,
+   agree who does what before starting. If it was sent a while ago and the
+   others have been idle since, ask them whether your part is still needed
+   (`send_message`, or `team_status`) instead of starting it in parallel.
+6. **Don't ping-pong.** Every note you send costs the other agent a turn.
    Batch what you have to say; don't send thanks or acknowledgements. After
    20 automatic hand-overs in a row, comms-deck pauses that agent until the
    owner sends something.
