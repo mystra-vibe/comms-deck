@@ -1668,11 +1668,11 @@ def self_test():
     check("chat box routing (@seat, several, @all, unknown, no @ = all, not emails)",
           r.stdout.strip() == "['grok'] ['claude', 'grok'] ['all'] True True True", r.stdout + r.stderr)
     run(["send", "claude", "for claude"], "grok")
+    r = run(["hook", "--source", "claude", "--event", "UserPromptSubmit"], "claude", '{"prompt": "hi"}')
+    check("Claude gets notes with the owner's prompt", "for claude" in r.stdout, r.stdout + r.stderr)
     run(["hook", "--source", "claude", "--event", "Stop"], "claude", "{}")
     check("Claude is idle after an allowed Stop",
           (read_json(Path(tmp) / "data/seats/claude.json", {}) or {}).get("state") == "idle")
-    r = run(["hook", "--source", "claude", "--event", "UserPromptSubmit"], "claude", '{"prompt": "hi"}')
-    check("Claude gets notes with the owner's prompt", "for claude" in r.stdout, r.stdout + r.stderr)
     r = run(["send", "grok", "token: abc123secret"], "claude")
     check("secret-looking notes go private", "private" in r.stdout and
           not list(Path(f"{tmp}/data").glob("queue/discord/*")), r.stdout)
