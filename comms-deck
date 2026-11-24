@@ -569,6 +569,7 @@ def send(sender, to, text, quiet=False, private=False):
             write_json(DATA / "inbox" / seat / f"{record['id']}.json", record)
     queue_out(record)
     append_log(record)
+    queue_actions(record)
     return record, warning
 
 
@@ -679,7 +680,9 @@ def render(records, seat):
         return (f"{MARK} {len(records)} note(s) for {seat}:\n\n" + "\n\n".join(lines)
                 + f"\n\nReply here in this chat. Your reply goes to {'the owner' if who == 'owner' else who}"
                   " on the comms-deck screen; start it with @claude, @grok or another seat to send it"
-                  " to that agent instead. Say \"the owner\", never a name.")
+                  " to that agent instead. To have something done on this iMac (the scratchpad,"
+                  " a workspace, a link, a YouTube search), write a line starting @deck, e.g."
+                  " \"@deck scratchpad\"; \"@deck help\" lists them. Say \"the owner\", never a name.")
     if "owner" in senders:
         reply = ("\n\nThe owner sent this from the comms-deck chat screen and reads the answer "
                  "there, not in this window. Answer with the send_message tool, to: owner "
@@ -2001,6 +2004,156 @@ def post_discord():
 # -----------------------------------------------------------------------------
 
 
+# -----------------------------------------------------------------------------
+# SECTION 8b: desktop actions - "@deck <action>" in any note
+# -----------------------------------------------------------------------------
+#
+# Any seat (an app seat like alice included) can ask comms-deck itself to do
+# something on this desktop by writing a line that starts "@deck", e.g.
+#   @deck scratchpad          @deck workspace 3        @deck layout
+#   @deck open https://...    @deck youtube lofi beats @deck help
+# The service runs a FIXED list of actions with the desktop session's own
+# environment, so it works whether or not the asker can run commands, and
+# without any LLM. Nothing else is run: no shell, no arbitrary programs.
+# That matters because app seats read the web, and a page must not be able
+# to make one of them run commands here. A request that isn't on the list is
+# handed to a free agent (claude, grok, gravity) as a task note, and that
+# agent's own permission checks apply. Every action is logged, answered with
+# a note "from deck", and shown on the chat screen.
+
+DECK_LINE = re.compile(r"^\s*@deck\b[ \t]*(.*)$", re.IGNORECASE | re.MULTILINE)
+ACTION_RATE = 10  # at most this many actions a minute, from everyone together
+
+
+def hypr_dispatch(expr):
+    """Run one Hyprland dispatcher (Lua form). Raise if Hyprland refuses."""
+    result = subprocess.run(["hyprctl", "dispatch", expr], capture_output=True, text=True, timeout=5)
+    if result.returncode or result.stdout.strip() != "ok":
+        raise RuntimeError((result.stdout or result.stderr).strip() or "hyprctl failed")
+
+
+def launch(*cmd):
+    """Start a program detached from the service, so it outlives it."""
+    if setting("DRY_ACTIONS"):
+        log(f"(dry run) would start: {' '.join(cmd)}")
+        return
+    subprocess.Popen(cmd, start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def act_scratchpad(arg):
+    if setting("DRY_ACTIONS"):
+        return "would toggle the scratchpad"
+    hypr_dispatch('hl.dsp.workspace.toggle_special("magic")')
+    return "toggled the scratchpad"
+
+
+def act_workspace(arg):
+    if not re.fullmatch(r"(10|[1-9])", arg.strip()):
+        raise ValueError("give a workspace number from 1 to 10")
+    if setting("DRY_ACTIONS"):
+        return f"would switch to workspace {arg.strip()}"
+    hypr_dispatch(f"hl.dsp.focus({{ workspace = {int(arg)} }})")
+    return f"switched to workspace {int(arg)}"
+
+
+def act_open(arg):
+    url = arg.strip()
+    if not re.fullmatch(r"https://[^\s\"'<>]+", url) or len(url) > 2000:
+        raise ValueError("only a single https:// link can be opened")
+    launch("firefox", "--new-tab", url)
+    return f"opened {url[:80]} in Firefox"
+
+
+def act_youtube(arg):
+    query = re.sub(r"\s+", " ", arg).strip()
+    if not query or len(query) > 200:
+        raise ValueError("give a YouTube search of up to 200 characters")
+    import urllib.parse
+    launch("firefox", "--new-tab", "https://www.youtube.com/results?search_query=" + urllib.parse.quote_plus(query))
+    return f"opened a YouTube search for {query[:60]!r} in Firefox"
+
+
+def act_layout(arg):
+    launch(str(HOME / ".local/bin/scratchpad-layout"))
+    return "arranged the scratchpad"
+
+
+def act_chat(arg):
+    launch(str(HOME / ".local/bin/comms-deck-chat"))
+    return "opened the chat screen"
+
+
+ACTIONS = {
+    "scratchpad": (act_scratchpad, "show or hide the scratchpad"),
+    "workspace": (act_workspace, "switch to workspace N (1-10)"),
+    "open": (act_open, "open an https:// link in Firefox"),
+    "youtube": (act_youtube, "open a YouTube search in Firefox"),
+    "layout": (act_layout, "arrange the agents on the scratchpad"),
+    "chat": (act_chat, "open the comms-deck chat screen"),
+}
+
+
+def queue_actions(record):
+    """Queue every '@deck ...' line in a note for the service to carry out."""
+    if record.get("kind") != "message" or record.get("from") == "deck":
+        return
+    for request in DECK_LINE.findall(record.get("text", "")):
+        write_json(DATA / "queue/actions" / f"{new_id()}.json",
+                   {"from": record["from"], "request": request.strip()[:500], "time": time.time()})
+
+
+def free_agent():
+    """The agent to hand a task to: an idle one first, then a busy one."""
+    for want in ("idle", "busy"):
+        for seat in ("claude", "grok", "gravity"):
+            if seat in AGENTS and load_seat(seat)["state"] == want:
+                return seat
+    return "claude"
+
+
+def run_action(asker, request):
+    """Carry out one request. Returns the text of the answer to `asker`."""
+    words = request.split(None, 1)
+    name, arg = (words[0].lower() if words else ""), (words[1] if len(words) > 1 else "")
+    if name in ("", "help"):
+        return "comms-deck can do: " + "; ".join(f"@deck {n} ({d})" for n, (_, d) in ACTIONS.items())
+    if name in ACTIONS:
+        try:
+            done = ACTIONS[name][0](arg)
+        except (ValueError, RuntimeError, OSError, subprocess.SubprocessError) as error:
+            log(f"deck: {asker} asked for {name}: refused or failed: {error}")
+            return f"couldn't do '{name}': {error}"
+        log(f"deck: {asker} asked for {name}: {done}")
+        return f"done: {done}"
+    agent = free_agent()
+    send("deck", agent, f"Task from {asker}, asked of comms-deck: {request}\n\n"
+                        f"It isn't one of comms-deck's own actions, so it's yours. Do it on this "
+                        f"machine if it's appropriate and your rules allow it, then tell {asker} "
+                        f"the result with send_message.")
+    log(f"deck: {asker} asked for something not on the list; handed to {agent}")
+    return f"that isn't one of my actions, so I've passed it to {agent}"
+
+
+def do_actions():
+    """Carry out queued '@deck' requests, oldest first, within the rate limit."""
+    queue = DATA / "queue/actions"
+    if not queue.is_dir():
+        return
+    recent = [t for t in getattr(do_actions, "recent", []) if time.time() - t < 60]
+    for path in sorted(queue.glob("*.json")):
+        if len(recent) >= ACTION_RATE:
+            break
+        job = read_json(path)
+        path.unlink(missing_ok=True)
+        if not job:
+            continue
+        recent.append(time.time())
+        answer = run_action(job["from"], job["request"])
+        if job["from"] in SEATS:
+            send("deck", job["from"], answer, quiet=job["from"] in AGENTS)
+    do_actions.recent = recent
+
+
 def serve():
     """Run forever: wake agents, drive Grok Bot seats, refresh usage, copy records, mirror to Discord."""
     log(f"comms-deck serving on {MACHINE}; data in {DATA}")
@@ -2015,6 +2168,10 @@ def serve():
             try_app_seats()
         except Exception as error:
             log(f"app seat check failed: {type(error).__name__}")
+        try:
+            do_actions()
+        except Exception as error:  # an action must never stop the service
+            log(f"desktop actions failed: {error}")
         if time.time() - last_usage >= 30:
             last_usage = time.time()
             try:
@@ -3144,6 +3301,37 @@ def self_test():
           wake_failure_reason(RuntimeError("no composer")) == "no composer"
           and wake_failure_reason(RuntimeError(MARK + " 1 note(s) for alice:\nhello")) == "RuntimeError"
           and wake_failure_reason(RuntimeError("line one\nline two")) == "line one")
+    code = "\n".join([
+        "import importlib.machinery as m, importlib.util as u, json, glob",
+        f"l = m.SourceFileLoader('cd', {me!r}); s = u.spec_from_loader('cd', l)",
+        "x = u.module_from_spec(s); l.exec_module(x)",
+        "x.send('alice', 'owner', 'sure\\n@deck scratchpad\\n@deck open http://plain.example\\n"
+        "@deck youtube lofi beats\\n@deck workspace 42\\n@deck make me a coffee')",
+        "x.do_actions()",
+        "got = [json.load(open(f)) for f in sorted(glob.glob(str(x.DATA / 'inbox' / 'alice' / '*.json')))]",
+        "print(json.dumps([g['text'] for g in got if g['from'] == 'deck']))",
+        "task = [json.load(open(f)) for f in glob.glob(str(x.DATA / 'inbox' / '*' / '*.json'))",
+        "        if 'make me a coffee' in json.load(open(f))['text'] and json.load(open(f))['from'] == 'deck']",
+        "print(len(task))",
+    ])
+    Path(f"{tmp}/actions-config").mkdir(parents=True, exist_ok=True)
+    Path(f"{tmp}/actions-config/app-seats").write_text("alice\n")
+    r = subprocess.run([sys.executable, "-c", code],  # its own data and config: other tests count inboxes
+                       env=dict(env, COMMS_DECK_DRY_ACTIONS="1", LAUNCHPAD_HOME=f"{tmp}/actions-data",
+                                COMMS_DECK_HOME=f"{tmp}/actions-data",
+                                LAUNCHPAD_CONFIG=f"{tmp}/actions-config",
+                                COMMS_DECK_CONFIG=f"{tmp}/actions-config"),
+                       capture_output=True, text=True, timeout=30)
+    lines = [l for l in r.stdout.strip().splitlines() if not re.match(r"\d{4}-\d\d-\d\d ", l)]  # skip log lines
+    try:
+        answers = json.loads(lines[0]) if lines else []
+    except ValueError:
+        answers = []
+    check("@deck runs listed actions, refuses unsafe ones, and hands the rest to an agent",
+          len(answers) == 5 and answers[0].startswith("done: would toggle the scratchpad")
+          and answers[1].startswith("couldn't do 'open'") and "YouTube search" in answers[2]
+          and answers[3].startswith("couldn't do 'workspace'") and "passed it to" in answers[4]
+          and lines[-1] == "1", r.stdout + r.stderr)
     check("app seats are told to reply in their chat, not with tools",
           "Reply here in this chat" in app_text and "send_message" not in app_text, app_text)
     check("Grok's Notification hook matches idle_prompt only",
