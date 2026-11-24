@@ -121,7 +121,15 @@ AGENTS = {"claude": "claude", "grok": "grok", "codex": "codex"}
 for _pair in filter(None, os.environ.get("LAUNCHPAD_SEATS", "").split(",")):
     _name, _, _proc = _pair.partition(":")
     AGENTS[_name.strip()] = (_proc or _name).strip()
-SEATS = tuple(AGENTS) + ("owner",)
+# App seats: bots in the Grok Bot app (e.g. alice). They use the MCP tools to
+# send and read, but have no hooks and no kitty window, so nothing wakes them;
+# they read their notes when they check. One name per line in
+# ~/.config/launchpad/app-seats ("#" starts a comment).
+_app_file = CONFIG / "app-seats"
+APP_SEATS = tuple(line.split("#")[0].strip() for line in
+                  (_app_file.read_text().splitlines() if _app_file.exists() else [])
+                  if line.split("#")[0].strip())
+SEATS = tuple(AGENTS) + APP_SEATS + ("owner",)
 
 # The repos the notes are copied to. A missing clone just means no copy.
 PUBLIC_REPO = Path(os.environ.get("LAUNCHPAD_PUBLIC_REPO") or HOME / "flight-log")
@@ -313,7 +321,7 @@ def send(sender, to, text, quiet=False, private=False):
     if not text:
         raise ValueError("the note is empty")
     if to == "all":
-        targets = [s for s in AGENTS if s != sender]
+        targets = [s for s in tuple(AGENTS) + APP_SEATS if s != sender]
     elif to in SEATS:
         targets = [to]
     else:
@@ -834,6 +842,8 @@ def status_text():
         wake = "can wake" if s.get("kitty_socket") and s.get("kitty_window") else "no wake"
         paused = ", PAUSED (loop guard)" if s["auto"] >= AUTO_LIMIT else ""
         rows.append(f"{seat:8} {s['state']:5}  {len(pending(seat))} waiting  {wake}{paused}")
+    for seat in APP_SEATS:
+        rows.append(f"{seat:8} app    {len(pending(seat))} waiting  reads when asked")
     hook_state = "Discord mirror: on" if WEBHOOK_FILE.exists() else "Discord mirror: off"
     return "\n".join(rows + [hook_state])
 
