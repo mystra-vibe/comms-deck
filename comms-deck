@@ -13,6 +13,8 @@
   comms-deck statusline --source <claude|grok|agy>       status line (feeds the usage panel; agy has none)
   comms-deck install [--yes]                             set this machine up
   comms-deck self-test                                   run the tests in a temp folder
+  comms-deck spent <seat> <+166h|06:20|YYYY-MM-DD HH:MM|clear>
+                                                         show a seat spent, counting down to its reset
 """
 
 # =============================================================================
@@ -131,6 +133,7 @@ import base64
 import fcntl
 import hashlib
 import json
+import math
 import os
 import re
 import secrets
@@ -699,12 +702,14 @@ def render(records, seat):
 #   SessionStart       remember the window; Claude is told about waiting notes
 #   UserPromptSubmit   mark busy; record promptId; reset the loop count if the
 #                      owner typed it. Claude also gets waiting notes.
-#   Stop               hand over a waiting note and keep working. Never marks
-#                      idle. channel_closed / shutdown mark away.
+#   Stop               hand over a waiting note and keep working. An allowed
+#                      Stop marks Claude idle immediately. Grok's Stop does
+#                      not. channel_closed / shutdown mark away.
 #   StopCancelled      a late cancel can arrive after the next prompt, so this
 #                      does not mark idle. Older promptIds are ignored on Stop.
-#   Notification       idle_prompt only: mark idle. StopFailure is not hooked:
-#                      idle_prompt also fires after an errored turn.
+#   Notification       idle_prompt only: mark idle. For Grok this is what
+#                      settles idle. StopFailure is not hooked: idle_prompt
+#                      also fires after an errored turn.
 #   SessionEnd         mark away
 #
 # A child session's events carry subagentType. They are not this seat's.
@@ -2136,6 +2141,106 @@ def ago(seconds):
     return f"{seconds // 3600}h ago"
 
 
+def limit_reset(data, now=None):
+    """When a full plan limit in `data` resets: a time, math.inf if unknown, or None.
+
+    None means nothing is full. With several full limits, the latest reset
+    wins, since the agent is blocked until every one of them clears.
+    """
+    now = time.time() if now is None else now
+    limits = data.get("rate_limits") if isinstance(data, dict) else None
+    if not isinstance(limits, dict):
+        return None
+    latest = None
+    for entry in limits.values():
+        if not isinstance(entry, dict):
+            continue
+        used = entry.get("used_percentage")
+        if isinstance(used, bool) or not isinstance(used, (int, float)) or used < 100:
+            continue
+        reset = entry.get("resets_at")
+        if isinstance(reset, bool) or not isinstance(reset, (int, float)):
+            reset = math.inf
+        elif reset > 1e12:  # milliseconds, the shape some meters emit
+            reset = reset / 1000
+        if reset > now:
+            latest = reset if latest is None else max(latest, reset)
+    return latest
+
+
+SPENT_DIR = "limits"  # DATA/limits/<seat>.json: {"resets_at": unix time} set by `comms-deck spent`
+
+
+def spent_mark(seat, now=None):
+    """The reset time from a `comms-deck spent` mark, or None if unset or past.
+
+    For an agent with no usage meter (Gravity's agy has none). A mark that
+    has passed counts as cleared, so the row reverts with no agent and no
+    service; the file is only tidied by the next `comms-deck spent`.
+    """
+    now = time.time() if now is None else now
+    mark = read_json(DATA / SPENT_DIR / f"{seat}.json") or {}
+    reset = mark.get("resets_at")
+    if isinstance(reset, bool) or not isinstance(reset, (int, float)) or reset <= now:
+        return None
+    return float(reset)
+
+
+def spent_reset(data, marked=None, now=None):
+    """The later of the meter's reset and the mark's, or None if neither says spent."""
+    times = [t for t in (limit_reset(data, now), marked) if t is not None]
+    return max(times) if times else None
+
+
+def countdown(reset, now=None):
+    """'back in 6d 19h 12m', 'back in 1h 12m 05s', 'back in 42m 05s', or 'back: time unknown'."""
+    if reset is None or reset == math.inf:
+        return "back: time unknown"
+    left = max(0, int(reset - (time.time() if now is None else now)))
+    days, rest = divmod(left, 86400)
+    hours, rest = divmod(rest, 3600)
+    minutes, seconds = divmod(rest, 60)
+    if days:
+        return f"back in {days}d {hours}h {minutes:02d}m"
+    if hours:
+        return f"back in {hours}h {minutes:02d}m {seconds:02d}s"
+    return f"back in {minutes}m {seconds:02d}s"
+
+
+def parse_until(text, now=None):
+    """A reset time from '+166h', '+90m', '+2d', '06:20' (the next one), or 'YYYY-MM-DD HH:MM'."""
+    import datetime
+    now = time.time() if now is None else now
+    text = text.strip()
+    m = re.fullmatch(r"\+(\d+(?:\.\d+)?)\s*([mhd])", text, re.IGNORECASE)
+    if m:
+        return now + float(m.group(1)) * {"m": 60, "h": 3600, "d": 86400}[m.group(2).lower()]
+    m = re.fullmatch(r"(\d{1,2}):(\d\d)", text)
+    if m:
+        base = datetime.datetime.fromtimestamp(now)
+        at = base.replace(hour=int(m.group(1)), minute=int(m.group(2)), second=0, microsecond=0)
+        if at.timestamp() <= now:
+            at += datetime.timedelta(days=1)
+        return at.timestamp()
+    try:
+        return datetime.datetime.strptime(text, "%Y-%m-%d %H:%M").timestamp()
+    except ValueError:
+        raise ValueError("give the reset as +166h, +90m, +2d, 06:20 or 'YYYY-MM-DD HH:MM'") from None
+
+
+def mark_spent(seat, until, who):
+    """Mark `seat` spent until `until` ('clear' removes the mark). Returns a line to print."""
+    if seat not in SEATS or seat == "owner":
+        raise ValueError(f"no seat called {seat!r}")
+    path = DATA / SPENT_DIR / f"{seat}.json"
+    if until.strip().lower() == "clear":
+        path.unlink(missing_ok=True)
+        return f"{seat}: spent mark cleared"
+    reset = parse_until(until)
+    write_json(path, {"resets_at": reset, "set_by": who, "set_at": time.time()})
+    return f"{seat}: spent until {when(reset)} ({countdown(reset)})"
+
+
 def limit_spent(data, now=None):
     """True when a plan limit in `data` is full and has not reset yet.
 
@@ -2146,35 +2251,21 @@ def limit_spent(data, now=None):
     row reverts on the next redraw with no agent. The context percentage
     is not a plan limit. No rate_limits means not spent.
     """
-    now = time.time() if now is None else now
-    limits = data.get("rate_limits") if isinstance(data, dict) else None
-    if not isinstance(limits, dict):
-        return False
-    for entry in limits.values():
-        if not isinstance(entry, dict):
-            continue
-        used = entry.get("used_percentage")
-        if isinstance(used, bool) or not isinstance(used, (int, float)) or used < 100:
-            continue
-        reset = entry.get("resets_at")
-        if isinstance(reset, bool) or not isinstance(reset, (int, float)):
-            return True
-        if reset > 1e12:  # milliseconds, the shape some meters emit
-            reset = reset / 1000
-        if reset > now:
-            return True
-    return False
+    return limit_reset(data, now) is not None
 
 
-def activity_view(state, usage_data, now=None):
+def activity_view(state, usage_data, now=None, waiting=0, marked=None):
     """How one activity row looks: (mark, word, colour).
 
-    A full plan limit draws spent, in red. This does not write the seat
-    file, so wake and the loop guard still see idle, busy or away.
+    A full plan limit, or a `comms-deck spent` mark (`marked`, its reset
+    time), draws spent, in red. Otherwise idle with notes waiting is stuck.
+    Spent wins: an agent that can't run isn't stuck. This does not write the
+    seat file, so wake and the loop guard still see idle, busy or away.
     """
-    if limit_spent(usage_data, now):
+    if limit_spent(usage_data, now) or marked is not None:
         return "✕", "spent", 196
-    return STATE_MARKS.get(state, "◌"), (state or "")[:13], STATE_COLOURS.get(state, 245)
+    mark, shade, word = row_status(state, waiting)
+    return mark, (word or "")[:13], shade
 
 
 def waiting_summary(notes):
@@ -2263,28 +2354,46 @@ def usage_panel(width):
         lines.append(f"\033[2m  updated {ago(time.time() - record.get('time', 0))}\033[0m")
         lines.append("")
     # ACTIVITY: one row per agent. The mark, the word and the colour come
-    # from activity_view, which can say spent while the seat file stays as
-    # it was. Under the row, one line lists notes still in the inbox. Nothing
-    # ticks. (The history stays in activity.jsonl.)
+    # from activity_view, which can say spent (a full plan limit, from the
+    # agent's meter or a mark set with `comms-deck spent`) or stuck (idle
+    # with notes waiting) while the seat file stays as it was. Spent beats
+    # stuck. Under the row, one line lists notes still in the inbox. Only a
+    # spent row ticks: it counts down to the reset, and the screen redraws
+    # every second while one is shown. (The history stays in activity.jsonl.)
     lines.append("\033[1mACTIVITY\033[0m")
     lines.append("")
+    usage_panel.ticking = False
     for seat, st, since in current_states():
-        # Static clock: when this state began. Spent does not replace it;
-        # the reset time is already on the usage bar above.
         usage = (read_json(DATA / "usage" / f"{seat}.json") or {}).get("data") or {}
-        mark, word, shade = activity_view(st, usage)
-        began = when(since) if since else ""  # "03:27" today, "Fri 18:00" otherwise
         notes = pending(seat)
         waiting = len(notes)
+        mark, word, shade = activity_view(st, usage, waiting=waiting, marked=spent_mark(seat))
+        if word == "spent":
+            usage_panel.ticking = True
+            reset = spent_reset(usage, spent_mark(seat))
+            began = countdown(reset)
+        else:
+            began = when(since) if since else ""  # static: "03:27" today, "Fri 18:00" otherwise
         squares = "■" * min(waiting, 5) + (f"+{waiting - 5}" if waiting > 5 else "")
         lines.append(f"  \033[38;5;{colour(seat)}m{seat.title():8}\033[0m "
-                     f"\033[38;5;{shade}m{mark} {word:13}\033[0m "
-                     f"\033[2m{began}\033[0m"
+                     f"\033[38;5;{shade}m{mark} {word:9}\033[0m "
+                     + (f"\033[38;5;196m{began}\033[0m" if word == "spent" else f"\033[2m{began}\033[0m")
                      + (f" \033[38;5;33m{squares}\033[0m" if squares else ""))
         summary = waiting_summary(notes)
         if summary:
             lines.append(f"    \033[2m{summary}\033[0m")
     return [fit(" " + line, width) for line in lines]
+
+
+def row_status(state, waiting):
+    """The mark, colour and word for one activity row.
+
+    Idle with notes still in the inbox is stuck: a red row that says stuck,
+    so a queue nobody has picked up stands out from a genuinely idle agent.
+    """
+    if state == "idle" and waiting:
+        return "●", 196, "stuck"
+    return STATE_MARKS.get(state, "◌"), STATE_COLOURS.get(state, 245), state
 
 
 def current_states():
@@ -2296,8 +2405,8 @@ def current_states():
     out = []
     for seat in AGENTS:
         st = load_seat(seat)
-        if st["state"] == "away" and seat not in ("claude", "grok"):
-            continue
+        if st["state"] == "away" and seat not in ("claude", "grok") and spent_mark(seat) is None:
+            continue  # a spent seat stays shown, so its countdown can be seen
         out.append((seat, st["state"], st.get("since")))
     for seat in APP_SEATS:
         if seat in HIDDEN_SEATS:
@@ -2445,7 +2554,7 @@ def chat(history=200, hide_private=False):
                 shown = shown[-2000:]
                 if handle_keys():
                     changed = True
-                if changed or time.time() - last_draw >= 2:
+                if changed or time.time() - last_draw >= (1 if getattr(usage_panel, "ticking", False) else 2):
                     body = rows - (1 if tty else 0)  # the chat box is the last line
                     left = shown[-body:]
                     left = [""] * (body - len(left)) + left
@@ -3200,6 +3309,10 @@ def self_test():
           abs(view[1]["duration"] - 9.8) < 0.01 and not view[1]["live"]
           and view[0]["live"] and 9.5 < view[0]["duration"] < 12,
           str(view))
+    check("idle with notes waiting shows stuck, in red",
+          row_status("idle", 1) == ("●", 196, "stuck"))
+    check("idle with an empty inbox stays idle", row_status("idle", 0)[2] == "idle")
+    check("busy with notes waiting stays busy", row_status("busy", 4)[2] == "busy")
     check("a pasted note's wrapper tags are left out of its description",
           describe('<pasted_content id="x1">\n[comms-deck] 1 note(s) for claude:\n\nFrom alice at 03:21:\n'
                    'Alice here, for the owner\n</pasted_content id="x1">') == "note from alice: Alice here, for the owner")
@@ -3312,6 +3425,26 @@ def self_test():
         "assert not x.limit_spent({'rate_limits': {'five_hour': {'used_percentage': True, 'resets_at': future}}}, now)",
         "assert x.activity_view('idle', {'rate_limits': {'five_hour': full(future)}}, now) == ('✕', 'spent', 196)",
         "assert x.activity_view('busy', {'rate_limits': {'five_hour': full(past)}}, now)[1] == 'busy'",
+        "assert x.activity_view('idle', {}, now, waiting=3) == ('●', 'stuck', 196)",
+        "assert x.activity_view('idle', {'rate_limits': {'five_hour': full(future)}}, now, waiting=3)[1] == 'spent'",
+        "assert x.activity_view('idle', {}, now, waiting=3, marked=future)[1] == 'spent'",
+        "assert x.limit_reset({'rate_limits': {'five_hour': full(future), 'seven_day': full(future + 50)}}, now) == future + 50",
+        "assert x.countdown(now + 6*86400 + 19*3600 + 12*60 + 7, now) == 'back in 6d 19h 12m'",
+        "assert x.countdown(now + 3600 + 12*60 + 5, now) == 'back in 1h 12m 05s'",
+        "assert x.countdown(now + 42*60 + 5, now) == 'back in 42m 05s'",
+        "assert x.countdown(float('inf'), now) == 'back: time unknown'",
+        "assert x.parse_until('+166h', now) == now + 166*3600",
+        "assert x.parse_until('+90m', now) == now + 5400",
+        "import datetime as dt",
+        "t = x.parse_until('06:20', now); d = dt.datetime.fromtimestamp(t)",
+        "assert (d.hour, d.minute) == (6, 20) and now < t <= now + 86400",
+        "x.mark_spent('gravity', '+2h', 'claude')",
+        "assert x.spent_mark('gravity') and abs(x.spent_mark('gravity') - (x.time.time() + 7200)) < 5",
+        "assert x.spent_mark('gravity', now=x.time.time() + 7300) is None",
+        "x.mark_spent('gravity', 'clear', 'claude')",
+        "assert x.spent_mark('gravity') is None",
+        "try:\n    x.mark_spent('nobody', '+1h', 'claude'); raise SystemExit('bad seat accepted')\nexcept ValueError: pass",
+        "try:\n    x.parse_until('soonish', now); raise SystemExit('bad time accepted')\nexcept ValueError: pass",
         "box = x.DATA / 'inbox' / 'scratch-seat'",
         "box.mkdir(parents=True, exist_ok=True)",
         "(box / '1.json').write_text(json.dumps({'from': 'owner', 'text': 'token: ghp_' + 'a' * 30, 'private': True}))",
@@ -3367,6 +3500,9 @@ def main():
     p = sub.add_parser("install")
     p.add_argument("--yes", action="store_true")
     sub.add_parser("self-test")
+    p = sub.add_parser("spent", help="mark a seat spent until its limit resets (for agents with no meter)")
+    p.add_argument("seat")
+    p.add_argument("until", nargs="+", help="+166h, +90m, +2d, 06:20, 'YYYY-MM-DD HH:MM', or clear")
     args = parser.parse_args()
 
     def me():
@@ -3415,6 +3551,8 @@ def main():
             install(args.yes)
         elif args.cmd == "self-test":
             sys.exit(self_test())
+        elif args.cmd == "spent":
+            print(mark_spent(args.seat.lower(), " ".join(args.until), me()))
     except ValueError as error:
         sys.exit(f"comms-deck: {error}")
     except KeyboardInterrupt:
