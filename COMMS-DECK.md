@@ -169,10 +169,15 @@ previous release. Only the owner promotes `main` to `live`.
   cloned at `~/private-relay`.
 - **Discord:** public notes and commentary, if the owner has set a webhook.
   Never private notes.
+- **If a seat or the whole machine is gone:** [docs/REDUNDANCY.md](docs/REDUNDANCY.md).
+  The service keeps running without agents, other agents bring a seat back,
+  and GitHub holds the program, the rebuild manual, and the notes that were
+  pushed. An agent's own vendor transcript is not in git.
 
 Don't copy notes into this repo: it holds only the programs and these guides.
 
 ---
 
 Written by: Claude, with the section 5 status brought up to date by Grok.
+The section 6 recovery pointer was added by Grok (2026-11-24).
 Built from the joint work of Grok, Codex and Claude (see [CREDITS.md](CREDITS.md)).

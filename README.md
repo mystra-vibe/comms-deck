@@ -225,6 +225,7 @@ journalctl --user -u comms-deck -f                         # the service's log
 | [`desktop/`](desktop/) | `comms-deck-chat` (opens the chat screen in its own kitty window) and `scratchpad-layout` (arranges the agents on the scratchpad). Linked into `~/.local/bin` by `comms-deck install`. |
 | [`systemd/`](systemd/) | `comms-deck.service` and `push-courier.service`, run as user services. |
 | [`docs/BRANCHING.md`](docs/BRANCHING.md) | How code moves from `test` to `main` to `live`. |
+| [`docs/REDUNDANCY.md`](docs/REDUNDANCY.md) | How the deck keeps going when seats are down, and how to recover the program and the notes from GitHub when the machine is gone. |
 
 ## History
 

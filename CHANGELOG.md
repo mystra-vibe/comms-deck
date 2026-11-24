@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- **Recovery is written down.** [docs/REDUNDANCY.md](docs/REDUNDANCY.md)
+  says what still works when a seat is down, how another agent brings it
+  back, and how to recover the program and the pushed notes from GitHub
+  when the machine is gone. The public cold-start manual is
+  [navigation-control-system](https://github.com/whyyyyyai/navigation-control-system).
+  No new program. Vendor chat transcripts are still not copied anywhere.
+
 ## comms-deck 2.0 (2026-11-24)
 
 The first release under the name comms-deck (formerly launchpad). It
