@@ -2741,7 +2741,7 @@ def usage_panel(width):
             usage_panel.ticking = True  # it polls rather than being woken, so show when it next looks
             began = poll_countdown(load_seat(seat))
         else:
-            began = when(since) if since else ""  # static: "03:27" today, "Fri 18:00" otherwise
+            began = when(since) if since else ""  # static: "03:27" today, "Fri 18:00" this week, "Nov 12 18:00" further back
         squares = "■" * min(waiting, 5) + (f"+{waiting - 5}" if waiting > 5 else "")
         state_text = f"{mark} {began}" if word == "spent" else f"{mark} {word:9}\033[0m \033[2m{began}"
         summary = task_summary(load_seat(seat).get("doing") if word == "busy" else "", pending(seat))
