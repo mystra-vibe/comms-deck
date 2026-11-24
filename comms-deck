@@ -2824,6 +2824,10 @@ def install(yes):
 
 def self_test():
     """Check the mailbox, hooks, loop guard and MCP server. Exit 1 on failure."""
+    global APP_SEATS, APP_PROCESS
+    if "alice" not in APP_SEATS:
+        APP_PROCESS = dict(APP_PROCESS, alice="grok-bot")
+        APP_SEATS = tuple(APP_PROCESS)
     tmp = tempfile.mkdtemp(prefix="comms-deck-test-")
     env = dict(os.environ, COMMS_DECK_HOME=f"{tmp}/data", COMMS_DECK_CONFIG=f"{tmp}/config",
                COMMS_DECK_AUTO_LIMIT="2")
