@@ -121,6 +121,9 @@ It sets up each agent it finds:
   line in `~/.grok/config.toml`;
 - **Antigravity:** `~/.gemini/config/hooks.json` and
   `~/.gemini/config/mcp_config.json` (merged into anything already there);
+- **Mistral Vibe:** comms-deck's `[[hooks]]` tables (named `comms-deck-*`) in
+  `~/.vibe/hooks.toml`, and a `[[mcp_servers]]` entry named `comms-deck` in
+  `~/.vibe/config.toml`, if `vibe` is installed. Other hooks are kept.
 - **Codex:** the MCP server in `~/.codex/config.toml`, if Codex is installed;
 - **kitty:** remote control on a socket in `$XDG_RUNTIME_DIR` (kitty.conf);
 - **the desktop:** an app menu entry for the chat screen, and, for a Lua
