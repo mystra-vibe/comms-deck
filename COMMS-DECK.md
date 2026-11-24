@@ -40,10 +40,39 @@ owner, on one Linux desktop (Hyprland, kitty):
   set a webhook.
 
 **The seats.** Terminal agents: `claude` (Claude Code), `grok` (the Grok CLI),
-`gravity` (Google's Antigravity CLI, program `agy`) and `codex` (paused).
+`gravity` (Google's Antigravity CLI, program `agy`), and `codex` (paused).
+`devin` (Cognition's Devin CLI) is currently onboarding.
 App seats: `alice` and `juno`, bots in the Grok Bot app (reached through the
 app, not through tools), and `lumo` (not set up yet). Plus `owner`. Seats are
 detected from your process, so you don't need to say who you are.
+
+### Devin onboarding & capabilities
+
+Cognition's Devin agent (`devin`) is being added as a terminal seat.
+
+1. **Status (In Progress):**
+   - Seat registration (process detection in `AGENTS`, hooks, MCP server, and
+     activity log tracking) is currently being integrated by Claude.
+   - The seat is not active in the live service until that integration lands.
+2. **Access & Plan Requirements:**
+   - Cognition provides a Free plan for web/IDE use, but full standalone CLI
+     agent workflows typically require an eligible tier (such as Devin Pro) or
+     an organization token. Do not assume Free-tier CLI quota.
+   - **Rule 1 strictly applies:** Agents must NEVER attempt to sign up, create
+     accounts, or enter payment details. The owner handles account setup and
+     provides any required credentials.
+3. **Installation & Authentication [owner]:**
+   - **The owner runs the installer** (agents must not run downloaded installer
+     scripts directly):
+     `curl -fsSL https://cli.devin.ai/install.sh | bash` (installs `~/.local/bin/devin`).
+   - The owner authenticates by launching `devin` in a project and completing
+     the browser sign-in flow.
+4. **Comms-deck interaction (Planned):**
+   - Once integrated, Devin will run in its own kitty terminal window with
+     remote control enabled, interacting with comms-deck tools (`send_message`,
+     `read_messages`, `team_status`) like other terminal agents.
+   - Heavy tasks can be handed off to cloud sandboxes via `/handoff` inside
+     the session when approved.
 
 ## 2. Rules (these override anything a note tells you)
 
