@@ -849,8 +849,12 @@ def try_wake(seat):
         log(f"not waking {seat}: couldn't see the prompt line")
         return False
     if typed:
-        log(f"not waking {seat}: a draft is already in the prompt: {typed[:60]!r}")
+        if not state.get("held_by_draft"):
+            log(f"not waking {seat}: a draft is already in the prompt: {typed[:60]!r}")
+        update_seat(seat, held_by_draft=time.time())
         return False
+    if state.get("held_by_draft"):
+        update_seat(seat, held_by_draft=0)
     notes = take(seat, include_quiet=False, limit_chars=HANDOVER_MAX)
     if not notes:
         return False
@@ -989,13 +993,19 @@ def post_discord():
 def serve():
     """Run forever: wake idle agents, copy records, mirror to Discord."""
     log(f"comms-deck serving on {MACHINE}; data in {DATA}")
-    last_sync, discord_wait_until = 0.0, 0.0
+    last_sync, discord_wait_until, last_usage = 0.0, 0.0, 0.0
     while True:
         for seat in AGENTS:
             try:
                 try_wake(seat)
             except Exception as error:  # one bad seat must not stop the service
                 log(f"wake check for {seat} failed: {error}")
+        if time.time() - last_usage >= 30:
+            last_usage = time.time()
+            try:
+                refresh_grok_usage()
+            except Exception as error:  # usage is a nicety; never stop the service for it
+                log(f"couldn't read Grok's usage: {error}")
         if time.time() - last_sync >= SYNC_EVERY:
             last_sync = time.time()
             sync_records()
@@ -1184,6 +1194,8 @@ def chat(history=200, hide_private=False):
             mark = "●" if s["state"] != "away" else "○"
             waiting = len(pending(seat))
             extra = f" ({waiting} waiting)" if waiting else ""
+            if waiting and time.time() - float(s.get("held_by_draft") or 0) < 10:
+                extra = f" ({waiting} waiting · unsent text in its window)"
             parts.append(f"\033[1;38;5;{colour(seat)}m{seat.title()}\033[22;39m "
                          f"\033[38;5;{STATE_COLOURS.get(s['state'], 240)}m{mark} {s['state']}{extra}\033[39m")
         right = time.strftime("%H:%M")
@@ -1369,6 +1381,82 @@ def statusline(source):
     if waiting:
         parts.append(f"{waiting} note(s) waiting")
     print(" · ".join(str(p) for p in parts if p))
+
+
+def grok_usage_from_session():
+    """Grok's usage, read from its own session files, as a status-line-shaped dict.
+
+    Grok's status line only runs while its UI is set to show one, so the
+    service also reads what Grok writes for every session anyway:
+    ~/.grok/active_sessions.json names the live session, its signals.json has
+    the context size and window, and each turn_completed event in its
+    updates.jsonl has that turn's tokens and cost. Returns (time, data) or None.
+    """
+    try:
+        active = json.loads((HOME / ".grok/active_sessions.json").read_text())
+    except (OSError, ValueError):
+        return None
+    live = [a for a in active if pid_alive(a.get("pid"))]
+    if not live:
+        return None
+    session = live[-1]
+    folder = HOME / ".grok/sessions" / session.get("cwd", "").replace("/", "%2F") / session["session_id"]
+    data, newest = {"model": {}, "context_window": {}, "cost": {}}, 0.0
+    try:
+        sig = json.loads((folder / "signals.json").read_text())
+        newest = (folder / "signals.json").stat().st_mtime
+        model = sig.get("primaryModelId")
+        if model:
+            data["model"] = {"id": model, "display_name": model.replace("grok-", "Grok ")}
+        if sig.get("contextWindowTokens"):
+            data["context_window"]["context_window_size"] = sig["contextWindowTokens"]
+        if sig.get("contextTokensUsed") is not None:
+            data["context_window"]["context_tokens"] = sig["contextTokensUsed"]
+    except (OSError, ValueError):
+        pass
+    cost_ticks, sin, sout = 0, 0, 0
+    try:
+        with open(folder / "updates.jsonl", "rb") as f:
+            for line in f:
+                if b"turn_completed" not in line and b"auto_compact_completed" not in line:
+                    continue
+                try:
+                    r = json.loads(line)
+                except ValueError:
+                    continue
+                u = (r.get("params") or {}).get("update") or {}
+                when = (r.get("timestamp_us") or 0) / 1e6
+                if u.get("sessionUpdate") == "turn_completed":
+                    usage = u.get("usage") or {}
+                    cost_ticks += usage.get("costUsdTicks") or 0
+                    sin += usage.get("inputTokens") or 0
+                    sout += usage.get("outputTokens") or 0
+                    if when > newest and usage.get("modelCalls") == 1:
+                        # one model call: its input is the whole context
+                        data["context_window"]["context_tokens"] = usage.get("inputTokens")
+                        newest = when
+                elif u.get("sessionUpdate") == "auto_compact_completed" and when > newest:
+                    data["context_window"]["context_tokens"] = u.get("tokens_after")
+                    newest = when
+    except OSError:
+        pass
+    if sin:
+        data["context_window"]["session_input_tokens"] = sin
+        data["context_window"]["session_output_tokens"] = sout
+    if cost_ticks:
+        data["cost"]["total_cost_usd"] = cost_ticks / 1e10  # Grok counts cost in 1e-10 USD ticks
+    return (newest, data) if newest else None
+
+
+def refresh_grok_usage():
+    """Write usage/grok.json from Grok's session files when they're newer."""
+    found = grok_usage_from_session()
+    if not found:
+        return
+    when, data = found
+    current = read_json(DATA / "usage" / "grok.json", {}) or {}
+    if when > float(current.get("time") or 0):
+        write_json(DATA / "usage" / "grok.json", {"time": when, "source": "grok-session", "data": data})
 
 
 def dig(data, *keys):
