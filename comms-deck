@@ -38,8 +38,11 @@
 #   2. TOOLS, NOT TYPING. `comms-deck mcp` is an MCP server. Claude, Grok,
 #      Codex and Gravity load it, so each has send_message, read_messages,
 #      set_status, add_note and team_status as built-in tools. set_status is
-#      the short "working on" line in the activity log. App seats in the Grok
-#      Bot app do not have these tools; a note is typed into their chat.
+#      the short "working on" line in the activity log. The activity row also
+#      reads the inbox itself on each redraw, and reads usage/<seat>.json for
+#      a full plan limit, so a blocked agent does not freeze either one.
+#      App seats in the Grok Bot app do not have these tools; a note is typed
+#      into their chat.
 #
 #   3. DELIVERY WITHOUT POLLING.
 #      - An agent that is WORKING gets its notes from its own hook. Claude
@@ -2133,6 +2136,65 @@ def ago(seconds):
     return f"{seconds // 3600}h ago"
 
 
+def limit_spent(data, now=None):
+    """True when a plan limit in `data` is full and has not reset yet.
+
+    `data` is the object stored under "data" in usage/<seat>.json. Any
+    rate_limits entry with used_percentage >= 100 counts. A missing
+    resets_at stays spent, because the file can stop updating while that
+    agent is blocked. A resets_at that is already past clears it, so the
+    row reverts on the next redraw with no agent. The context percentage
+    is not a plan limit. No rate_limits means not spent.
+    """
+    now = time.time() if now is None else now
+    limits = data.get("rate_limits") if isinstance(data, dict) else None
+    if not isinstance(limits, dict):
+        return False
+    for entry in limits.values():
+        if not isinstance(entry, dict):
+            continue
+        used = entry.get("used_percentage")
+        if isinstance(used, bool) or not isinstance(used, (int, float)) or used < 100:
+            continue
+        reset = entry.get("resets_at")
+        if isinstance(reset, bool) or not isinstance(reset, (int, float)):
+            return True
+        if reset > 1e12:  # milliseconds, the shape some meters emit
+            reset = reset / 1000
+        if reset > now:
+            return True
+    return False
+
+
+def activity_view(state, usage_data, now=None):
+    """How one activity row looks: (mark, word, colour).
+
+    A full plan limit draws spent, in red. This does not write the seat
+    file, so wake and the loop guard still see idle, busy or away.
+    """
+    if limit_spent(usage_data, now):
+        return "✕", "spent", 196
+    return STATE_MARKS.get(state, "◌"), (state or "")[:13], STATE_COLOURS.get(state, 245)
+
+
+def waiting_summary(notes):
+    """One line for notes still in the inbox, or '' when there are none.
+
+    The count is first, so a narrow panel still shows how many are waiting.
+    The words are the oldest note. A private note adds none of its text.
+    Drawn on every redraw from the inbox, so it does not need an agent.
+    """
+    if not notes:
+        return ""
+    _, record = notes[0]
+    if record.get("private"):
+        detail = "private note"
+    else:
+        detail = describe(f"note from {record.get('from', '?')}: {record.get('text', '')}", 50)
+    extra = f" (+{len(notes) - 1} more)" if len(notes) > 1 else ""
+    return f"{len(notes)} waiting · {detail}{extra}"
+
+
 def usage_panel(width):
     """The lines of the right-hand panel: context, limits and cost per seat."""
     inner = width - 2
@@ -2200,22 +2262,28 @@ def usage_panel(width):
             lines.append(f"  Session  {' · '.join(bits)}")
         lines.append(f"\033[2m  updated {ago(time.time() - record.get('time', 0))}\033[0m")
         lines.append("")
-    # ACTIVITY: one row per agent: its state's symbol, the state, when it
-    # began, and a blue square per note waiting for it. Nothing ticks. (The history stays in
-    # activity.jsonl; the owner asked for just the current picture here.)
+    # ACTIVITY: one row per agent. The mark, the word and the colour come
+    # from activity_view, which can say spent while the seat file stays as
+    # it was. Under the row, one line lists notes still in the inbox. Nothing
+    # ticks. (The history stays in activity.jsonl.)
     lines.append("\033[1mACTIVITY\033[0m")
     lines.append("")
     for seat, st, since in current_states():
-        # Static: when the state began, not a ticking timer. A row changes
-        # only when that agent's state does, and is rewritten in place.
-        shade = STATE_COLOURS.get(st, 245)
+        # Static clock: when this state began. Spent does not replace it;
+        # the reset time is already on the usage bar above.
+        usage = (read_json(DATA / "usage" / f"{seat}.json") or {}).get("data") or {}
+        mark, word, shade = activity_view(st, usage)
         began = when(since) if since else ""  # "03:27" today, "Fri 18:00" otherwise
-        waiting = len(pending(seat))
+        notes = pending(seat)
+        waiting = len(notes)
         squares = "■" * min(waiting, 5) + (f"+{waiting - 5}" if waiting > 5 else "")
         lines.append(f"  \033[38;5;{colour(seat)}m{seat.title():8}\033[0m "
-                     f"\033[38;5;{shade}m{STATE_MARKS.get(st, '◌')} {st[:13]:13}\033[0m "
+                     f"\033[38;5;{shade}m{mark} {word:13}\033[0m "
                      f"\033[2m{began}\033[0m"
                      + (f" \033[38;5;33m{squares}\033[0m" if squares else ""))
+        summary = waiting_summary(notes)
+        if summary:
+            lines.append(f"    \033[2m{summary}\033[0m")
     return [fit(" " + line, width) for line in lines]
 
 
@@ -3223,6 +3291,42 @@ def self_test():
     ])
     r = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True, timeout=30)
     check("app seat replies, guards, usage and websocket mask",
+          r.returncode == 0 and r.stdout.strip() == "ok", r.stdout + r.stderr)
+    now = 1_700_000_000
+    code = "\n".join([
+        "import importlib.machinery as m, importlib.util as u, json",
+        f"l = m.SourceFileLoader('lp', {me!r}); s = u.spec_from_loader('lp', l)",
+        "x = u.module_from_spec(s); l.exec_module(x)",
+        f"now = {now}",
+        "future, past = now + 3600, now - 3600",
+        "full = lambda reset: {'used_percentage': 100, 'resets_at': reset}",
+        "assert x.limit_spent({'rate_limits': {'five_hour': full(future)}}, now)",
+        "assert not x.limit_spent({'rate_limits': {'five_hour': full(past)}}, now)",
+        "assert not x.limit_spent({'rate_limits': {'five_hour': {'used_percentage': 99, 'resets_at': future}}}, now)",
+        "assert x.limit_spent({'rate_limits': {'five_hour': {'used_percentage': 34, 'resets_at': future}, 'seven_day': full(future)}}, now)",
+        "assert not x.limit_spent({'context_window': {'used_percentage': 100}}, now)",
+        "assert not x.limit_spent({}, now)",
+        "assert x.limit_spent({'rate_limits': {'five_hour': {'used_percentage': 100}}}, now)",
+        "assert x.limit_spent({'rate_limits': {'five_hour': full(past), 'seven_day': full(future)}}, now)",
+        "assert x.limit_spent({'rate_limits': {'five_hour': full((future) * 1000)}}, now)",
+        "assert not x.limit_spent({'rate_limits': {'five_hour': {'used_percentage': True, 'resets_at': future}}}, now)",
+        "assert x.activity_view('idle', {'rate_limits': {'five_hour': full(future)}}, now) == ('✕', 'spent', 196)",
+        "assert x.activity_view('busy', {'rate_limits': {'five_hour': full(past)}}, now)[1] == 'busy'",
+        "box = x.DATA / 'inbox' / 'scratch-seat'",
+        "box.mkdir(parents=True, exist_ok=True)",
+        "(box / '1.json').write_text(json.dumps({'from': 'owner', 'text': 'token: ghp_' + 'a' * 30, 'private': True}))",
+        "(box / '2.json').write_text(json.dumps({'from': 'owner', 'text': 'open the scratchpad', 'private': False}))",
+        "summary = x.waiting_summary(x.pending('scratch-seat'))",
+        "assert summary.startswith('2 waiting · private note') and '(+1 more)' in summary",
+        "assert 'ghp_' not in summary and 'scratchpad' not in summary",
+        "seat = json.loads((x.DATA / 'seats' / 'claude.json').read_text()) if (x.DATA / 'seats' / 'claude.json').exists() else {}",
+        "x.activity_view(seat.get('state', 'idle'), {'rate_limits': {'five_hour': full(future)}}, now)",
+        "after = json.loads((x.DATA / 'seats' / 'claude.json').read_text()) if (x.DATA / 'seats' / 'claude.json').exists() else {}",
+        "assert after.get('state') == seat.get('state')",
+        "print('ok')",
+    ])
+    r = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True, timeout=30)
+    check("a full plan limit is spent until its reset, and waiting notes are counted from the inbox",
           r.returncode == 0 and r.stdout.strip() == "ok", r.stdout + r.stderr)
     shutil.rmtree(tmp, ignore_errors=True)
     print(f"\n{'all passed' if not failures else f'{len(failures)} failed'}")
