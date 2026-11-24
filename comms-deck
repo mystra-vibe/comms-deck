@@ -2164,23 +2164,38 @@ def usage_panel(width):
             lines.append(f"  Session  {' · '.join(bits)}")
         lines.append(f"\033[2m  updated {ago(time.time() - record.get('time', 0))}\033[0m")
         lines.append("")
-    activity = recent_activity(10)
-    if activity:
-        lines.append("\033[1mACTIVITY\033[0m")
-        lines.append("")
-        for r in activity:
-            seat, st = r["seat"], r["state"]
-            clock = span(r["duration"])
-            shade = STATE_COLOURS.get(st, 245)
-            mark = STATE_MARKS.get(st, "◌")
-            timer = (f"\033[1;38;5;{shade}m{clock:>8}\033[0m" if r["live"]  # live: bold, counting up
-                     else f"\033[2m{clock:>8}\033[0m")
-            lines.append(f"  \033[2m{time.strftime('%H:%M', time.localtime(r['time']))}\033[0m  "
-                         f"\033[38;5;{colour(seat)}m{seat.title():7}\033[0m "
-                         f"\033[38;5;{shade}m{mark} {st[:12]:12}\033[0m {timer}")
-            if r["live"] and st == "busy" and r.get("doing"):
-                lines.append(f"\033[2m           {r['doing'][:inner - 12]}\033[0m")
+    # ACTIVITY: one row per agent: its state's symbol, the state, and how
+    # long it has been that way, counting up. (The history stays in
+    # activity.jsonl; the owner asked for just the current picture here.)
+    lines.append("\033[1mACTIVITY\033[0m")
+    lines.append("")
+    for seat, st, since in current_states():
+        shade = STATE_COLOURS.get(st, 245)
+        clock = span(time.time() - since) if since else ""
+        lines.append(f"  \033[38;5;{colour(seat)}m{seat.title():8}\033[0m "
+                     f"\033[38;5;{shade}m{STATE_MARKS.get(st, '◌')} {st[:13]:13}\033[0m "
+                     f"\033[1;38;5;{shade}m{clock:>8}\033[0m")
     return [fit(" " + line, width) for line in lines]
+
+
+def current_states():
+    """(seat, state, since) for every seat shown on the chat screen.
+
+    Terminal agents that are away are left out, except Claude and Grok;
+    hidden app seats are never shown.
+    """
+    out = []
+    for seat in AGENTS:
+        st = load_seat(seat)
+        if st["state"] == "away" and seat not in ("claude", "grok"):
+            continue
+        out.append((seat, st["state"], st.get("since")))
+    for seat in APP_SEATS:
+        if seat in HIDDEN_SEATS:
+            continue
+        since = (read_json(seat_file(seat), {}) or {}).get("since")
+        out.append((seat, app_seat_state(seat), since))
+    return out
 
 
 MENTION = re.compile(r"(?<![\w@])@([A-Za-z][\w-]*)")
@@ -2206,29 +2221,6 @@ def chat(history=200, hide_private=False):
     path.parent.mkdir(parents=True, exist_ok=True)
     path.touch()
     out = sys.stdout
-
-    def status_bar(cols):
-        parts = []
-        seats = [(seat, load_seat(seat)) for seat in AGENTS]
-        seats += [(seat, {"state": app_seat_state(seat)}) for seat in APP_SEATS
-                  if seat not in HIDDEN_SEATS]
-        for seat, s in seats:
-            if s["state"] == "away" and seat not in ("claude", "grok") + APP_SEATS:
-                continue
-            mark = "●" if s["state"] != "away" else "○"
-            waiting = len(pending(seat))
-            extra = f" ({waiting} waiting)" if waiting else ""
-            since = (read_json(seat_file(seat), {}) or {}).get("since")
-            if since and s["state"] in ("busy", "idle", "away"):
-                extra = f" {ago(time.time() - since).replace(' ago', '')}" + extra
-            if waiting and time.time() - float(s.get("held_by_draft") or 0) < 10:
-                extra = f" ({waiting} waiting · unsent text in its window)"
-            parts.append(f"\033[1;38;5;{colour(seat)}m{seat.title()}\033[22;39m "
-                         f"\033[38;5;{STATE_COLOURS.get(s['state'], 240)}m{mark} {s['state']}{extra}\033[39m")
-        right = time.strftime("%H:%M")
-        text = "   ".join(parts)
-        pad = max(1, cols - visible_len(text) - len(right) - 4)
-        return f"\033[48;5;235m  {text}{' ' * pad}\033[2m{right}\033[22m  \033[0m"
 
     # The chat box: the owner types on the line above the status bar.
     tty = sys.stdin.isatty()
@@ -2345,7 +2337,7 @@ def chat(history=200, hide_private=False):
                 if handle_keys():
                     changed = True
                 if changed or time.time() - last_draw >= 2:
-                    body = rows - (2 if tty else 1)
+                    body = rows - (1 if tty else 0)  # the chat box is the last line
                     left = shown[-body:]
                     left = [""] * (body - len(left)) + left
                     right = usage_panel(panel_w) if panel_w else []
@@ -2355,10 +2347,9 @@ def chat(history=200, hide_private=False):
                         row = fit(left[i], chat_w)
                         if panel_w:
                             row += f" \033[38;5;238m│\033[0m " + fit(right[i], panel_w)
-                        screen.append(row + "\n")
+                        screen.append(row + ("\n" if i < body - 1 or tty else ""))
                     if tty:
-                        screen.append(f"\033[48;5;234m{fit(input_line(cols), cols)}\n")
-                    screen.append(fit(status_bar(cols), cols))
+                        screen.append(f"\033[48;5;234m{fit(input_line(cols), cols)}")
                     out.write("".join(screen))
                     out.flush()
                     last_draw = time.time()
