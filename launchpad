@@ -478,10 +478,10 @@ def hook(source, event):
         if data.get("reason") in ("channel_closed", "shutdown"):
             update_seat(seat, state="away")
             return
-        if state["auto"] < AUTO_LIMIT:
+        if state["auto"] < AUTO_LIMIT or owner_waiting(seat):
             notes = take(seat, include_quiet=False, limit_chars=HANDOVER_MAX)
             if notes:
-                update_seat(seat, state="busy", auto=state["auto"] + 1)
+                update_seat(seat, state="busy", auto=next_auto(state, notes))
                 reply({"decision": "block", "reason": render(notes, seat)})
                 return
         elif any(not r.get("quiet") for _, r in pending(seat)):
@@ -493,6 +493,18 @@ def hook(source, event):
             update_seat(seat, state="idle")
     elif event == "SessionEnd":
         update_seat(seat, state="away")
+
+
+def owner_waiting(seat):
+    """True if a note from the owner is in `seat`'s inbox. The owner always gets through."""
+    return any(r.get("from") == "owner" for _, r in pending(seat))
+
+
+def next_auto(state, notes):
+    """The loop count after handing `notes` over: reset by the owner, else one more."""
+    if any(r.get("from") == "owner" for r in notes):
+        return 0
+    return state["auto"] + 1
 
 
 def pause_notice(seat):
@@ -541,7 +553,7 @@ def try_wake(seat):
         return False
     if not any(not r.get("quiet") for _, r in pending(seat)):
         return False
-    if state["auto"] >= AUTO_LIMIT:
+    if state["auto"] >= AUTO_LIMIT and not owner_waiting(seat):
         pause_notice(seat)
         return False
     try:
@@ -557,7 +569,7 @@ def try_wake(seat):
     if not notes:
         return False
     text = render(notes, seat)
-    update_seat(seat, state="busy", auto=state["auto"] + 1, woke_at=time.time())
+    update_seat(seat, state="busy", auto=next_auto(state, notes), woke_at=time.time())
     try:
         match = f"id:{window}"
         kitty(socket, "send-text", "--match", match, "--bracketed-paste=enable",
@@ -756,24 +768,137 @@ def chat_lines(r, width):
     return lines + [""]
 
 
+ANSI = re.compile(r"\033\[[0-9;?]*[A-Za-z]")
+
+
+def visible_len(text):
+    """Length of `text` on screen, ignoring colour codes."""
+    return len(ANSI.sub("", text))
+
+
+def fit(text, width):
+    """Pad or cut `text` to exactly `width` columns on screen."""
+    n = visible_len(text)
+    if n <= width:
+        return text + " " * (width - n) + "\033[0m"
+    return ANSI.sub("", text)[:max(0, width - 1)] + "…"
+
+
+def bar(pct, width):
+    """A coloured bar for a 0-100 percentage."""
+    pct = max(0.0, min(100.0, float(pct)))
+    full = round(width * pct / 100)
+    shade = 78 if pct < 60 else 214 if pct < 85 else 196
+    return f"\033[38;5;{shade}m{'█' * full}\033[38;5;238m{'░' * (width - full)}\033[0m"
+
+
+def short_tokens(n):
+    """1234567 -> '1.2M', 228000 -> '228k'."""
+    n = float(n)
+    for unit, size in (("M", 1e6), ("k", 1e3)):
+        if n >= size:
+            return f"{n / size:.1f}{unit}".replace(".0" + unit, unit)
+    return f"{n:.0f}"
+
+
+def when(ts):
+    """A reset time as 'at 03:00' today, or 'Fri 18:00' later on."""
+    t = time.localtime(ts)
+    same_day = time.strftime("%Y%m%d", t) == time.strftime("%Y%m%d")
+    return time.strftime("%H:%M" if same_day else "%a %H:%M", t)
+
+
+def ago(seconds):
+    seconds = int(max(0, seconds))
+    if seconds < 90:
+        return f"{seconds}s ago"
+    if seconds < 5400:
+        return f"{seconds // 60}m ago"
+    return f"{seconds // 3600}h ago"
+
+
+def usage_panel(width):
+    """The lines of the right-hand panel: context, limits and cost per seat."""
+    inner = width - 2
+    bar_w = max(6, inner - 16)
+    lines = [f"\033[1mUSAGE\033[0m", ""]
+    for seat in tuple(AGENTS) + APP_SEATS:
+        record = read_json(DATA / "usage" / f"{seat}.json")
+        state = load_seat(seat) if seat in AGENTS else {"state": "app"}
+        if not record and state["state"] == "away" and seat not in ("claude", "grok"):
+            continue
+        d = (record or {}).get("data", {})
+        model = dig(d, "model", "display_name") or ""
+        title = f"\033[1;38;5;{colour(seat)}m{seat.upper()}\033[0m"
+        lines.append(title + (f" \033[2m· {model}\033[0m" if model else ""))
+        if not record:
+            lines.append("\033[2m  no usage data" + (" (Grok Bot app)" if seat in APP_SEATS else " yet") + "\033[0m")
+            lines.append("")
+            continue
+        pct = context_percent(d)
+        size = dig(d, "context_window", "context_window_size")
+        if pct is not None:
+            lines.append(f"  Context  {bar(pct, bar_w)} {pct:3.0f}%")
+            used = dig(d, "context_window", "context_tokens")
+            if used is None and isinstance(size, (int, float)):
+                used = size * pct / 100
+            if isinstance(used, (int, float)) and isinstance(size, (int, float)):
+                lines.append(f"\033[2m           {short_tokens(used)} of {short_tokens(size)} tokens\033[0m")
+        for label, key in (("5-hour", "five_hour"), ("Weekly", "seven_day")):
+            used = dig(d, "rate_limits", key, "used_percentage")
+            if isinstance(used, (int, float)):
+                lines.append(f"  {label:7}  {bar(used, bar_w)} {used:3.0f}%")
+                reset = dig(d, "rate_limits", key, "resets_at")
+                if isinstance(reset, (int, float)):
+                    lines.append(f"\033[2m           {100 - used:.0f}% left · resets {when(reset)}\033[0m")
+        if dig(d, "rate_limits") is None:
+            lines.append("\033[2m  Plan limits: not reported\033[0m")
+        bits = []
+        sin, sout = dig(d, "context_window", "session_input_tokens"), dig(d, "context_window", "session_output_tokens")
+        if isinstance(sin, (int, float)):
+            bits.append(f"in {short_tokens(sin)}")
+        if isinstance(sout, (int, float)):
+            bits.append(f"out {short_tokens(sout)}")
+        cost = dig(d, "cost", "total_cost_usd")
+        if isinstance(cost, (int, float)):
+            bits.append(f"${cost:.2f}" + (" est." if dig(d, "rate_limits") is not None else ""))
+        if bits:
+            lines.append(f"  Session  {' · '.join(bits)}")
+        lines.append(f"\033[2m  updated {ago(time.time() - record.get('time', 0))}\033[0m")
+        lines.append("")
+    return [fit(" " + line, width) for line in lines]
+
+
+MENTION = re.compile(r"(?<![\w@])@([A-Za-z][\w-]*)")
+
+
+def route(text):
+    """Who the owner's chat-box line goes to: (seats, error or None).
+
+    @seat names a seat (several are fine), @all is everyone; with no @, one
+    agent that isn't away is picked at random.
+    """
+    import random
+    names = [m.lower() for m in MENTION.findall(text)]
+    if not names:
+        awake = [s for s in AGENTS if load_seat(s)["state"] != "away"] + list(APP_SEATS)
+        return [random.choice(awake or ["claude"])], None
+    if "all" in names:
+        return ["all"], None
+    unknown = [n for n in names if n not in SEATS or n == "owner"]
+    if unknown:
+        return [], f"no seat called @{unknown[0]}; try " + " ".join(f"@{s}" for s in SEATS if s != "owner") + " @all"
+    return list(dict.fromkeys(names)), None
+
+
 def chat(history=200, hide_private=False):
-    """Show the last `history` records, then new ones as they arrive."""
+    """Full-screen live view: notes on the left, usage on the right, status at the bottom."""
     path = DATA / "log.jsonl"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.touch()
     out = sys.stdout
 
-    def size():
-        s = shutil.get_terminal_size((100, 40))
-        return s.columns, s.lines
-
-    def setup():
-        cols, rows = size()
-        out.write("\033[?25l\033[2J" + f"\033[1;{rows - 1}r" + f"\033[{rows - 1};1H")
-        out.flush()
-        return cols, rows
-
-    def status_bar(cols, rows):
+    def status_bar(cols):
         parts = []
         for seat in AGENTS:
             s = load_seat(seat)
@@ -785,53 +910,156 @@ def chat(history=200, hide_private=False):
             parts.append(f"\033[1;38;5;{colour(seat)}m{seat.title()}\033[22;39m "
                          f"\033[38;5;{STATE_COLOURS.get(s['state'], 240)}m{mark} {s['state']}{extra}\033[39m")
         right = time.strftime("%H:%M")
-        bar = "   ".join(parts)
-        plain = len(re.sub(r"\033\[[0-9;]*m", "", bar))
-        pad = max(1, cols - plain - len(right) - 4)
-        out.write(f"\0337\033[{rows};1H\033[2K\033[48;5;235m  {bar}{' ' * pad}"
-                  f"\033[2m{right}\033[22m  \033[0m\0338")
-        out.flush()
+        text = "   ".join(parts)
+        pad = max(1, cols - visible_len(text) - len(right) - 4)
+        return f"\033[48;5;235m  {text}{' ' * pad}\033[2m{right}\033[22m  \033[0m"
 
-    def show(r):
-        if hide_private and r.get("private"):
+    # The chat box: the owner types on the line above the status bar.
+    tty = sys.stdin.isatty()
+    typed, notice, notice_until = "", "", 0.0
+    decoder = __import__("codecs").getincrementaldecoder("utf-8")(errors="ignore")
+    pending_esc = ""
+    in_paste = False
+    saved_tty = None
+    if tty:
+        import termios
+        import tty as tty_mod
+        saved_tty = termios.tcgetattr(sys.stdin)
+        tty_mod.setcbreak(sys.stdin)
+        out.write("\033[?2004h")  # bracketed paste: a pasted newline doesn't send
+
+    def submit(line):
+        nonlocal notice, notice_until
+        line = line.strip()
+        if not line:
             return
-        for line in chat_lines(r, cols):
-            out.write(line + "\n")
-        out.flush()
+        seats, error = route(line)
+        if error:
+            notice, notice_until = error, time.time() + 6
+            return False
+        sent = []
+        for seat in seats:
+            record, _ = send("owner", seat, line)
+            sent.append(record["to"])
+        notice, notice_until = "sent to " + ", ".join(sent), time.time() + 4
+        return True
 
-    cols, rows = setup()
+    def handle_keys():
+        """Read whatever was typed. Returns True if the screen should redraw."""
+        nonlocal typed, pending_esc, in_paste
+        import select
+        if not tty or not select.select([sys.stdin], [], [], 0)[0]:
+            return False
+        chars = pending_esc + decoder.decode(os.read(sys.stdin.fileno(), 4096))
+        pending_esc = ""
+        i = 0
+        while i < len(chars):
+            c = chars[i]
+            if c == "\033":
+                m = re.match(r"\033\[[0-9;?]*[ -/]*[@-~]", chars[i:])
+                if m:
+                    seq = m.group(0)
+                    in_paste = {"\033[200~": True, "\033[201~": False}.get(seq, in_paste)
+                    i += len(seq)
+                    continue
+                if i + 1 >= len(chars) or chars[i + 1] == "[":
+                    pending_esc = chars[i:]  # sequence split across reads
+                    break
+                typed = ""  # Esc on its own clears the line
+            elif c in "\r\n":
+                if in_paste:
+                    typed += " "
+                elif submit(typed) is not False:
+                    typed = ""
+            elif c in "\x7f\x08":
+                typed = typed[:-1]
+            elif c == "\x15":
+                typed = ""
+            elif c == "\x17":
+                typed = typed.rstrip().rsplit(" ", 1)[0] + " " if " " in typed.rstrip() else ""
+            elif c >= " ":
+                typed += c
+            i += 1
+        return True
+
+    def input_line(cols):
+        if not tty:
+            return ""
+        if typed:
+            shown_text = typed[-(cols - 12):]
+            highlighted = MENTION.sub(lambda m: f"\033[1;38;5;{colour(m.group(1).lower())}m@{m.group(1)}\033[0m", shown_text)
+            line = f"  \033[1;38;5;{colour('owner')}myou ›\033[0m {highlighted}\033[7m \033[0m"
+        else:
+            line = (f"  \033[1;38;5;{colour('owner')}myou ›\033[0m \033[7m \033[0m\033[2m type a note · "
+                    + " ".join(f"@{s}" for s in SEATS if s != "owner") + " @all · no @ = a random agent\033[0m")
+        if notice and time.time() < notice_until:
+            line += f"   \033[38;5;{196 if notice.startswith('no seat') else 78}m{notice}\033[0m"
+        return line
+
+    records = []
     with open(path) as f:
-        records = []
         for line in f:
             try:
                 records.append(json.loads(line))
             except ValueError:
                 pass
-        out.write(f"\033[1mlaunchpad\033[0m \033[2m· live notes on {MACHINE}\033[0m\n\n")
-        for r in records[-history:]:
-            show(r)
-        last_bar = 0.0
+        out.write("\033[?25l\033[2J")
+        shown, layout, last_draw = [], None, 0.0
         try:
             while True:
-                if size() != (cols, rows):
-                    cols, rows = setup()
-                    for r in records[-20:]:
-                        show(r)
+                cols, rows = shutil.get_terminal_size((100, 40))
+                panel_w = max(34, min(52, cols // 3)) if cols >= 90 else 0
+                chat_w = cols - panel_w - (3 if panel_w else 0)
+                changed = False
+                if layout != (cols, rows):  # first time, or the window was resized
+                    layout, changed = (cols, rows), True
+                    shown = [f"\033[1mlaunchpad\033[0m \033[2m· live notes on {MACHINE}\033[0m", ""]
+                    for r in records[-history:]:
+                        if not (hide_private and r.get("private")):
+                            shown += chat_lines(r, chat_w)
                 line = f.readline()
-                if line:
+                while line:
                     try:
                         r = json.loads(line)
+                        records.append(r)
+                        if not (hide_private and r.get("private")):
+                            shown += chat_lines(r, chat_w)
+                            changed = True
                     except ValueError:
-                        continue
-                    records.append(r)
-                    show(r)
-                    continue
-                if time.time() - last_bar >= 2:
-                    status_bar(cols, rows)
-                    last_bar = time.time()
-                time.sleep(0.25)
+                        pass
+                    line = f.readline()
+                shown = shown[-2000:]
+                if handle_keys():
+                    changed = True
+                if changed or time.time() - last_draw >= 2:
+                    body = rows - (2 if tty else 1)
+                    left = shown[-body:]
+                    left = [""] * (body - len(left)) + left
+                    right = usage_panel(panel_w) if panel_w else []
+                    right = (right + [""] * body)[:body]
+                    screen = ["\033[H"]
+                    for i in range(body):
+                        row = fit(left[i], chat_w)
+                        if panel_w:
+                            row += f" \033[38;5;238m│\033[0m " + fit(right[i], panel_w)
+                        screen.append(row + "\n")
+                    if tty:
+                        screen.append(f"\033[48;5;234m{fit(input_line(cols), cols)}\n")
+                    screen.append(fit(status_bar(cols), cols))
+                    out.write("".join(screen))
+                    out.flush()
+                    last_draw = time.time()
+                if tty:
+                    import select
+                    select.select([sys.stdin], [], [], 0.25)
+                else:
+                    time.sleep(0.25)
         finally:
-            out.write("\033[r\033[?25h\n")
+            if saved_tty is not None:
+                import termios
+                termios.tcsetattr(sys.stdin, termios.TCSADRAIN, saved_tty)
+                out.write("\033[?2004l")
+            out.write("\033[0m\033[2J\033[H\033[?25h")
             out.flush()
 
 
@@ -1162,6 +1390,21 @@ def self_test():
         '{"prompt": "carry on"}', {"GROK_HOOK_EVENT": "user_prompt_submit"})
     r = run(["hook", "--source", "grok", "--event", "Stop"], "grok", "{}", {"GROK_HOOK_EVENT": "stop"})
     check("an owner prompt resets the loop guard", "third" in r.stdout, r.stdout)
+    run(["send", "grok", "fourth"], "claude")
+    run(["send", "grok", "fifth"], "claude")
+    run(["hook", "--source", "grok", "--event", "Stop"], "grok", "{}", {"GROK_HOOK_EVENT": "stop"})
+    run(["hook", "--source", "grok", "--event", "Stop"], "grok", "{}", {"GROK_HOOK_EVENT": "stop"})
+    run(["--from", "owner", "send", "grok", "from the owner"], "owner")
+    r = run(["hook", "--source", "grok", "--event", "Stop"], "grok", "{}", {"GROK_HOOK_EVENT": "stop"})
+    check("an owner note gets through a paused loop guard", "from the owner" in r.stdout, r.stdout)
+    code = ("import importlib.machinery as m, importlib.util as u, sys\n"
+            f"l = m.SourceFileLoader('lp', {me!r}); s = u.spec_from_loader('lp', l)\n"
+            "x = u.module_from_spec(s); l.exec_module(x)\n"
+            "print(x.route('@grok hi')[0], x.route('hi @Claude and @grok')[0], x.route('@all go')[0],"
+            " bool(x.route('@bob hi')[1]), x.route('no mention')[0][0] in x.SEATS, x.MENTION.findall('mail a@grok.com') == [])")
+    r = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True, timeout=30)
+    check("chat box routing (@seat, several, @all, unknown, random, not emails)",
+          r.stdout.strip() == "['grok'] ['claude', 'grok'] ['all'] True True True", r.stdout + r.stderr)
     run(["send", "claude", "for claude"], "grok")
     r = run(["hook", "--source", "claude", "--event", "UserPromptSubmit"], "claude", '{"prompt": "hi"}')
     check("Claude gets notes with the owner's prompt", "for claude" in r.stdout, r.stdout + r.stderr)
