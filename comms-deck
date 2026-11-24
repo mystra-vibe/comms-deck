@@ -8,11 +8,14 @@
   comms-deck watch                                       print notes as they are sent
   comms-deck chat [--hide-private]                       full-screen live view of the notes
   comms-deck serve                                       the background service
-  comms-deck mcp                                         MCP server (send/read as tools)
-  comms-deck hook --source <claude|grok>                 called by the agents' hooks
-  comms-deck statusline --source <claude|grok>           the agents' status line (feeds the usage panel)
+  comms-deck mcp                                         MCP server (send, read, status as tools)
+  comms-deck hook --source <claude|grok|agy>             called by the agents' hooks
+  comms-deck statusline --source <claude|grok|agy>       status line (feeds the usage panel; agy has none)
   comms-deck install [--yes]                             set this machine up
   comms-deck self-test                                   run the tests in a temp folder
+  comms-deck spent <seat> <+166h|06:20|YYYY-MM-DD HH:MM|clear>
+                                                         show a seat spent, counting down to its reset
+  comms-deck review-check <PR#>                          fail unless another seat reviewed it
 """
 
 # =============================================================================
@@ -20,10 +23,11 @@
 # =============================================================================
 #
 # THE PROBLEM
-#   Several AI agents (Claude Code, the Grok CLI, Codex) each run in their
-#   own kitty window and can't see each other. They need to pass notes, fast,
-#   without spending tokens on polling and without anyone's typing being
-#   interrupted.
+#   Several AI agents each run in their own window and can't see each other:
+#   Claude Code, the Grok CLI, Antigravity (the program `agy`, the seat
+#   `gravity`) and Codex. App seats such as alice and juno live in the Grok
+#   Bot app. They need to pass notes, fast, without spending tokens on
+#   polling and without anyone's typing being interrupted.
 #
 # THE DESIGN, IN FOUR PARTS
 #   1. A MAILBOX ON DISK. Sending a note writes one JSON file into the
@@ -31,39 +35,57 @@
 #      touches the network to deliver it. A note is "taken" by renaming its
 #      file into delivered/<seat>/. A rename is atomic, so if two readers race
 #      (a hook and a tool call, say) exactly one of them gets the note.
+#      `to` may name several seats ("claude, grok"): one note, one file per
+#      recipient, recorded as to=claude+grok.
 #
-#   2. TOOLS, NOT TYPING. `comms-deck mcp` is an MCP server. Claude, Grok and
-#      Codex all load it, so each has send_message / read_messages /
-#      add_note / team_status as built-in tools.
+#   2. TOOLS, NOT TYPING. `comms-deck mcp` is an MCP server. Claude, Grok,
+#      Codex and Gravity load it, so each has send_message, read_messages,
+#      set_status, add_note and team_status as built-in tools. set_status is
+#      the short "working on" line in the activity log. The activity row also
+#      reads the inbox itself on each redraw, and reads usage/<seat>.json for
+#      a full plan limit, so a blocked agent does not freeze either one.
+#      App seats in the Grok Bot app do not have these tools; a note is typed
+#      into their chat.
 #
 #   3. DELIVERY WITHOUT POLLING.
-#      - An agent that is WORKING gets its notes from its own Stop hook: when
-#        it is about to end a turn and a note is waiting, the hook hands the
-#        note over and the agent carries on. With an empty inbox the hook
-#        costs nothing. Stop does not decide idle; Grok's idle_prompt does.
+#      - An agent that is WORKING gets its notes from its own hook. Claude
+#        and Grok get them when a turn is about to end (Stop). Gravity gets
+#        them before the next model call (PreInvocation). With an empty inbox
+#        the hook costs nothing. Claude is idle once its Stop lets the turn
+#        end (comms-deck's is its only Stop hook); Grok waits for its
+#        idle_prompt notification. Gravity's Stop marks idle only when the
+#        payload says fullyIdle (missing means yes).
 #      - An agent that is IDLE is woken by `comms-deck serve`, which uses
 #        kitty's remote control to paste the note into that agent's exact
 #        window. Focus never moves. If the owner is in that window, or a draft
 #        is already typed there, nothing is pasted: the note waits, and is
 #        handed over with the owner's next prompt (Claude) or at the end of
 #        that turn (any agent).
-#      - Hooks keep a small state file per seat (busy / idle, and which kitty
-#        window it lives in), so the service knows who can be woken.
+#      - Hooks keep a small state file per seat (busy / idle, what it is
+#        working on, and which kitty window it lives in), so the service
+#        knows who can be woken.
 #      - An app seat that lives in the Grok Bot window has no hook. The service
 #        reads that chat through the app's debugging port, which has to be on
 #        127.0.0.1, and types a waiting note when the seat is idle, the
-#        composer is empty and the window is not focused. New replies are
-#        filed as notes. Other app seats are left alone.
+#        composer is empty and the window is not focused. The Send button is
+#        what submits; Enter does not. New replies are filed as notes. An
+#        app seat in some other program (lumo) counts as connected only while
+#        a `comms-deck mcp` child is running as that seat.
 #
 #   4. RECORDS, BATCHED. The service copies notes to the flight-log repo
 #      (private ones to private-relay) every few minutes in one commit, and
 #      mirrors them to a Discord channel through a webhook, if one is set.
+#      Names listed in ~/.config/comms-deck/private-names are replaced before
+#      a copy leaves the machine. The local log keeps the original. The
+#      activity log stays on this machine.
 #
 # WHO IS SENDING? (seat detection)
 #   Every command works out its seat by walking up its parent processes until
-#   it finds `claude`, `grok` or `codex`. A Bash tool call, a hook and the MCP
-#   server all descend from the agent, so no setup per window is needed.
-#   $COMMS_DECK_SEAT overrides it (`--from` on the command line, too).
+#   it finds `claude`, `grok`, `codex` or `agy` (`agy` is the seat gravity).
+#   A Bash tool call, a hook and the MCP server all descend from the agent,
+#   so no setup per window is needed. $COMMS_DECK_SEAT overrides it (`--from`
+#   on the command line, too). A hook command does not set that variable;
+#   the MCP server for Gravity does.
 #
 #   Grok also reads hooks from ~/.claude/settings.json. Each hook is installed
 #   with --source, and a hook whose source doesn't match the agent running it
@@ -85,27 +107,34 @@
 #   delivered/<seat>/<id>.json  notes it has taken
 #   seats/<seat>.json           busy/idle, agent pid, kitty window, loop count
 #   log.jsonl                   every note and commentary entry, in order
+#   activity.jsonl              state changes; local only, not copied out
+#   usage/<seat>.json           what the usage panel shows for that seat
 #   queue/sync/, queue/discord/ records waiting to be copied out
 #   push/                       push-courier's request and answer folders
 #   ~/.config/comms-deck/discord-webhook   the webhook address (mode 600), if any
+#   ~/.config/comms-deck/private-names     names to redact; never committed
+#   ~/.config/comms-deck/app-seats         app seats, one per line
 #
 # SECTIONS: search for "SECTION" to jump between them.
 #   1 settings  2 small helpers  3 seats  4 the mailbox  5 delivery text
-#   6 hooks  7 kitty wake  7b grok-bot page  8 records (git, Discord)
-#   9 the service  10 MCP server  11 install  12 self-test  13 command line
+#   6 hooks (claude, grok, agy)  7 kitty wake  7b grok-bot page
+#   8 records (git, Discord)  9 service, chat screen and usage
+#   10 MCP server  11 install  12 self-test  13 command line
 #
 # Standard library only. Python 3.9+.
 #
 # Written by: Claude (2026-11-24), replacing relay-protocol, scheduler and
 # relay-watch (joint work by Grok, Codex and Claude; see CREDITS.md).
 # Hook idle rules, promptId, and the kitty draft check: Grok (2026-11-24).
-# Grok Bot page adapter: Grok (2026-11-24).
+# Grok Bot page adapter, Gravity's model line and tool allow list, and the
+# reason on a failed app-seat send: Grok (2026-11-24).
 
 import argparse
 import base64
 import fcntl
 import hashlib
 import json
+import math
 import os
 import re
 import secrets
@@ -267,8 +296,8 @@ def parent_of(pid):
 def find_agent():
     """Walk up from this process to the nearest agent. Return (seat, pid).
 
-    $COMMS_DECK_SEAT wins if set. Returns (None, 0) outside any agent, e.g.
-    in a plain terminal.
+    $COMMS_DECK_SEAT wins if set. The program agy is the seat gravity.
+    Returns (None, 0) outside any agent, e.g. in a plain terminal.
     """
     forced = setting("SEAT")
     if forced:
@@ -296,6 +325,7 @@ def agent_env(pid):
 
 
 def seat_file(seat):
+    """Path of this seat's state file (busy, window, loop count)."""
     return DATA / "seats" / f"{seat}.json"
 
 
@@ -350,16 +380,19 @@ def app_seat_state(seat):
     state = read_json(seat_file(seat), {}) or {}
     seen = float(state.get("app_seen") or 0)
     if time.time() - seen < 15 and state.get("state") in (
-            "busy", "idle", "away", "not connected", "chat not open", "no chat yet"):
+            "busy", "idle", "away", "not connected", "chat not open", "no chat yet", "draft in box"):
         return state["state"]
     if APP_PROCESS.get(seat, "grok-bot") != "grok-bot":
         # Not a Grok Bot seat: it can only connect through its own app's MCP.
+        # Nothing tells us when its turn ends, so busy is time-based: it set
+        # a status in the last MCP_BUSY_FOR seconds. Otherwise idle.
         for d in Path("/proc").iterdir():
             try:
                 cmd = (d / "cmdline").read_bytes()
                 if b"comms-deck\0mcp" in cmd and f"COMMS_DECK_SEAT={seat}".encode() in \
                         (d / "environ").read_bytes().split(b"\0"):
-                    return "connected"
+                    busy = time.time() - float(state.get("status_at") or 0) < MCP_BUSY_FOR
+                    return "busy" if busy else "idle"
             except OSError:
                 continue
         return "not set up"
@@ -546,6 +579,7 @@ def send(sender, to, text, quiet=False, private=False):
             write_json(DATA / "inbox" / seat / f"{record['id']}.json", record)
     queue_out(record)
     append_log(record)
+    queue_actions(record)
     return record, warning
 
 
@@ -638,6 +672,37 @@ def take(seat, include_quiet=True, limit_chars=None):
 # -----------------------------------------------------------------------------
 
 
+def note_age(record):
+    """How long ago a note was sent, e.g. '4m ago', for judging if it's stale."""
+    try:
+        sent = time.mktime(time.strptime(record["time"], "%Y-%m-%d %H:%M:%S"))
+    except (KeyError, ValueError):
+        return "time unknown"
+    return ago(time.time() - sent)
+
+
+def team_snapshot(seat, records):
+    """The team as this note is delivered: who's busy or idle, since when,
+    and how many notes each has waiting. Built by the service at delivery,
+    so every agent can judge what the others are likely doing, and avoid two
+    agents doing the same work (asked for by the owner)."""
+    rows = []
+    for other, st, since in current_states():
+        if other == seat:
+            continue
+        began = f" since {when(since)}" if since else ""
+        waiting = len(pending(other))
+        rows.append(f"{other} {st}{began}, {waiting} waiting")
+    text = f"Team at {time.strftime('%H:%M')}: " + "; ".join(rows) + "."
+    shared = [r for r in records if r.get("to") == "all" or "+" in str(r.get("to"))]
+    if shared:
+        text += (" This note went to more than one agent. Before starting work on it, check "
+                 "who is already on it (team_status, or ask). If it was sent a while ago and "
+                 "the others have been idle since, ask whether your part is still needed "
+                 "rather than doing it twice.")
+    return text
+
+
 def render(records, seat):
     """Turn notes into one block of text for `seat` to read."""
     lines = []
@@ -645,7 +710,8 @@ def render(records, seat):
         tags = [t for t, on in (("quiet", r.get("quiet")), ("private", r.get("private"))) if on]
         to = "" if r.get("to") == seat else f" (to {str(r.get('to')).replace('+', ', ')})"
         tag = f" [{', '.join(tags)}]" if tags else ""
-        lines.append(f"From {r['from']}{to} at {r['time'][11:16]}{tag}:\n{r['text']}")
+        lines.append(f"From {r['from']}{to} at {r['time'][11:16]} ({note_age(r)}){tag}:\n{r['text']}")
+    lines.append(team_snapshot(seat, records))
     senders = sorted({r["from"] for r in records} & set(SEATS))
     reply = (f"\n\nReply with the send_message tool (to: {senders[0]})"
              f" or `comms-deck send {senders[0]} \"...\"`." if senders else "")
@@ -656,7 +722,9 @@ def render(records, seat):
         return (f"{MARK} {len(records)} note(s) for {seat}:\n\n" + "\n\n".join(lines)
                 + f"\n\nReply here in this chat. Your reply goes to {'the owner' if who == 'owner' else who}"
                   " on the comms-deck screen; start it with @claude, @grok or another seat to send it"
-                  " to that agent instead. Say \"the owner\", never a name.")
+                  " to that agent instead. To have something done on this iMac (the scratchpad,"
+                  " a workspace, a link, a YouTube search), write a line starting @deck, e.g."
+                  " \"@deck scratchpad\"; \"@deck help\" lists them. Say \"the owner\", never a name.")
     if "owner" in senders:
         reply = ("\n\nThe owner sent this from the comms-deck chat screen and reads the answer "
                  "there, not in this window. Answer with the send_message tool, to: owner "
@@ -666,22 +734,29 @@ def render(records, seat):
 
 
 # -----------------------------------------------------------------------------
-# SECTION 6: hooks - called by Claude Code and the Grok CLI
+# SECTION 6: hooks - Claude Code, the Grok CLI, and Antigravity (agy)
 # -----------------------------------------------------------------------------
 #
-# Events used, and what each does:
+# Claude and Grok events, and what each does:
 #   SessionStart       remember the window; Claude is told about waiting notes
 #   UserPromptSubmit   mark busy; record promptId; reset the loop count if the
 #                      owner typed it. Claude also gets waiting notes.
-#   Stop               hand over a waiting note and keep working. Never marks
-#                      idle. channel_closed / shutdown mark away.
+#   Stop               hand over a waiting note and keep working. An allowed
+#                      Stop marks Claude idle immediately. Grok's Stop does
+#                      not. channel_closed / shutdown mark away.
 #   StopCancelled      a late cancel can arrive after the next prompt, so this
 #                      does not mark idle. Older promptIds are ignored on Stop.
-#   Notification       idle_prompt only: mark idle. StopFailure is not hooked:
-#                      idle_prompt also fires after an errored turn.
+#   Notification       idle_prompt only: mark idle. For Grok this is what
+#                      settles idle. StopFailure is not hooked: idle_prompt
+#                      also fires after an errored turn.
 #   SessionEnd         mark away
 #
 # A child session's events carry subagentType. They are not this seat's.
+#
+# Antigravity (agy, the seat gravity) uses different events, in agy_hook:
+#   SessionStart     remember the window
+#   PreInvocation    notes before the next model call; save the model name
+#   Stop             mark idle only when fullyIdle; a waiting note continues
 
 
 def event_prompt_id(data):
@@ -1190,6 +1265,23 @@ def GROK_BOT_SEATS():
     return [seat for seat in APP_SEATS if APP_PROCESS.get(seat, "grok-bot") == "grok-bot"]
 GROK_BOT_PAGE = "renderer/index.html"
 APP_USAGE_EVERY = 60
+DRAFT_STALE = int(setting("DRAFT_STALE", "600"))  # an unchanged draft this old is abandoned
+
+
+def draft_status(state, composer, now):
+    """Track the text left in an app seat's chat box. Returns (changes, stale).
+
+    The deck never types over a draft, in case the owner is writing one. But
+    a draft left unchanged for DRAFT_STALE seconds (a stray "w" held Alice's
+    notes for hours) is abandoned: `stale` is True, and the caller saves the
+    text to the owner and clears the box, so delivery can't be blocked forever.
+    """
+    text = composer or ""
+    if not text.strip():
+        return ({"app_draft": "", "app_draft_since": 0} if state.get("app_draft") else {}), False
+    if text != state.get("app_draft"):
+        return {"app_draft": text, "app_draft_since": now}, False
+    return {}, now - float(state.get("app_draft_since") or now) >= DRAFT_STALE
 _WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
 _SCROLL_JS = r"""(() => {
@@ -1362,20 +1454,24 @@ class Cdp:
     """A small Chrome DevTools Protocol client over one websocket."""
 
     def __init__(self, sock, leftover=b""):
+        """Keep the socket, any bytes past the handshake, and the next call id."""
         self.sock = sock
         self.buf = leftover
         self.next_id = 0
 
     def close(self):
+        """Close the socket. Closing twice is fine."""
         try:
             self.sock.close()
         except OSError:
             pass
 
     def send_frame(self, opcode, payload):
+        """Send one masked client frame."""
         self.sock.sendall(ws_client_frame(opcode, payload, secrets.token_bytes(4)))
 
     def _read_more(self):
+        """Read more bytes, or raise if the socket closed."""
         chunk = self.sock.recv(65536)
         if not chunk:
             raise RuntimeError("websocket closed")
@@ -1407,6 +1503,7 @@ class Cdp:
                 return opcode, b"".join(parts)
 
     def call(self, method, params=None, timeout=8):
+        """Send one DevTools command and return its result. Raise on error or timeout."""
         self.next_id += 1
         mid = self.next_id
         self.send_frame(1, json.dumps({"id": mid, "method": method, "params": params or {}}).encode())
@@ -1472,6 +1569,7 @@ def open_grok_bot_page():
 
 
 def cdp_eval(cdp, expression):
+    """Run JavaScript in the page and return its value."""
     result = cdp.call("Runtime.evaluate", {"expression": expression, "returnByValue": True})
     if not isinstance(result, dict) or result.get("exceptionDetails"):
         raise RuntimeError("page script failed")
@@ -1479,10 +1577,12 @@ def cdp_eval(cdp, expression):
 
 
 def page_script(template, seat):
+    """Put this seat's name into a page script, in place of __SEAT__."""
     return template.replace("__SEAT__", json.dumps(seat))
 
 
 def app_snapshot(cdp, seat, with_usage):
+    """Read one seat's chat from the page: rows, composer, and usage when asked."""
     script = _SNAP_JS.replace("__SEAT__", json.dumps(seat)).replace(
         "__USAGE__", "true" if with_usage else "false")
     snap = cdp_eval(cdp, script)
@@ -1687,6 +1787,7 @@ def file_app_replies(seat, state, snap):
 
 
 def app_key(cdp, kind, key, code, vk, modifiers=0, text=None):
+    """Send one key event to the Grok Bot page."""
     params = {"type": kind, "key": key, "code": code, "windowsVirtualKeyCode": vk,
               "nativeVirtualKeyCode": vk, "modifiers": modifiers}
     if text is not None:
@@ -1695,6 +1796,7 @@ def app_key(cdp, kind, key, code, vk, modifiers=0, text=None):
 
 
 def app_press_enter(cdp):
+    """Press Enter. This page submits on the Send click; Enter is only a fallback."""
     app_key(cdp, "keyDown", "Enter", "Enter", 13, text="\r")
     app_key(cdp, "keyUp", "Enter", "Enter", 13)
 
@@ -1717,6 +1819,7 @@ def app_click_send_button(cdp):
 
 
 def app_clear_composer(cdp):
+    """Select all and delete, so a note that did not send is not left in the box."""
     app_key(cdp, "keyDown", "a", "KeyA", 65, modifiers=2)
     app_key(cdp, "keyUp", "a", "KeyA", 65, modifiers=2)
     app_key(cdp, "keyDown", "Backspace", "Backspace", 8)
@@ -1724,11 +1827,16 @@ def app_clear_composer(cdp):
 
 
 def composer_text_now(cdp):
+    """The composer's text right now, or None if the page has no composer."""
     value = cdp_eval(cdp, _COMPOSER_JS)
     return None if value is None else str(value)
 
 
 def restore_notes(seat, notes):
+    """Write the notes back into the inbox after a send that did not land.
+
+    take() has already renamed them into delivered/. Those copies stay.
+    """
     for record in notes:
         write_json(DATA / "inbox" / seat / f"{record['id']}.json", record)
 
@@ -1807,9 +1915,31 @@ def drive_app_seat(seat, cdp, focused):
         update_seat(seat, state="chat not open", app_seen=time.time(), app_page="grok-bot")
         return False
     file_app_replies(seat, state, snap)
-    page_state = "busy" if snap.get("replying") else "idle"
+    waiting = any(not record.get("quiet") for _, record in pending(seat))
+    changes, stale = draft_status(state, snap.get("composer"), time.time())
+    if changes:
+        state.update(update_seat(seat, **changes))
+    if stale and waiting and focused is False and not snap.get("replying"):
+        draft = snap.get("composer") or ""
+        minutes = int((time.time() - float(state.get("app_draft_since") or time.time())) // 60)
+        cdp_eval(cdp, _FOCUS_JS)
+        app_clear_composer(cdp)
+        time.sleep(0.2)
+        if not (composer_text_now(cdp) or "").strip():
+            send("deck", "owner", f"{seat.title()}'s chat box held an unsent draft for {minutes} minutes, "
+                                  f"so no notes could be typed in. I cleared it; here is what it said:\n\n{draft}",
+                 private=True)
+            log(f"{seat}: cleared a draft left unchanged for {minutes} min")
+            state.update(update_seat(seat, app_draft="", app_draft_since=0))
+            snap["composer"] = ""
+    if snap.get("replying"):
+        page_state = "busy"
+    elif waiting and (snap.get("composer") or "").strip():
+        page_state = "draft in box"  # not idle: a draft is holding the notes back
+    else:
+        page_state = "idle"
     update_seat(seat, state=page_state, app_seen=time.time(), app_page="grok-bot")
-    if not any(not record.get("quiet") for _, record in pending(seat)):
+    if not waiting:
         return False
     if state.get("auto", 0) >= AUTO_LIMIT and not owner_waiting(seat):
         pause_notice(seat)
@@ -1852,6 +1982,7 @@ def try_app_seats():
 
 
 def git(repo, *args, timeout=120):
+    """Run one git command in a repo and return its stdout, or raise."""
     result = subprocess.run(["git", "-C", str(repo), *args], capture_output=True,
                             text=True, timeout=timeout)
     if result.returncode:
@@ -1952,12 +2083,173 @@ def post_discord():
 
 
 # -----------------------------------------------------------------------------
-# SECTION 9: the service
+# SECTION 9: the service, the chat screen and usage
 # -----------------------------------------------------------------------------
 
 
+# -----------------------------------------------------------------------------
+# SECTION 8b: desktop actions - "@deck <action>" in any note
+# -----------------------------------------------------------------------------
+#
+# Any seat (an app seat like alice included) can ask comms-deck itself to do
+# something on this desktop by writing a line that starts "@deck", e.g.
+#   @deck scratchpad          @deck workspace 3        @deck layout
+#   @deck open https://...    @deck youtube lofi beats @deck help
+# The service runs a FIXED list of actions with the desktop session's own
+# environment, so it works whether or not the asker can run commands, and
+# without any LLM. Nothing else is run: no shell, no arbitrary programs.
+# That matters because app seats read the web, and a page must not be able
+# to make one of them run commands here. A request that isn't on the list is
+# handed to a free agent (claude, grok, gravity) as a task note only when the
+# owner or one of those agents asked; from anyone else (an app seat) it is
+# refused with "not on the list", so a web page can't give an agent orders
+# through an app seat's reply (found by Grok). The answer keeps the note's
+# private flag. Every action is logged, answered with a note "from deck",
+# and shown on the chat screen.
+
+DECK_LINE = re.compile(r"^\s*@deck\b[ \t]*(.*)$", re.IGNORECASE | re.MULTILINE)
+ACTION_RATE = 10  # at most this many actions a minute, from everyone together
+HANDOFF_FROM = ("owner", "claude", "grok", "gravity")  # who may pass an unlisted request to an agent
+
+
+def hypr_dispatch(expr):
+    """Run one Hyprland dispatcher (Lua form). Raise if Hyprland refuses."""
+    result = subprocess.run(["hyprctl", "dispatch", expr], capture_output=True, text=True, timeout=5)
+    if result.returncode or result.stdout.strip() != "ok":
+        raise RuntimeError((result.stdout or result.stderr).strip() or "hyprctl failed")
+
+
+def launch(*cmd):
+    """Start a program detached from the service, so it outlives it.
+
+    Returns "" when it started, or "would " on a dry run, to put before the answer."""
+    if setting("DRY_ACTIONS"):
+        log(f"(dry run) would start: {' '.join(cmd)}")
+        return "would "
+    subprocess.Popen(cmd, start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return ""
+
+
+def act_scratchpad(arg):
+    if setting("DRY_ACTIONS"):
+        return "would toggle the scratchpad"
+    hypr_dispatch('hl.dsp.workspace.toggle_special("magic")')
+    return "toggled the scratchpad"
+
+
+def act_workspace(arg):
+    if not re.fullmatch(r"(10|[1-9])", arg.strip()):
+        raise ValueError("give a workspace number from 1 to 10")
+    if setting("DRY_ACTIONS"):
+        return f"would switch to workspace {arg.strip()}"
+    hypr_dispatch(f"hl.dsp.focus({{ workspace = {int(arg)} }})")
+    return f"switched to workspace {int(arg)}"
+
+
+def act_open(arg):
+    url = arg.strip()
+    if not re.fullmatch(r"https://[^\s\"'<>]+", url) or len(url) > 2000:
+        raise ValueError("only a single https:// link can be opened")
+    return launch("firefox", "--new-tab", url) + f"open {url[:80]} in Firefox"
+
+
+def act_youtube(arg):
+    query = re.sub(r"\s+", " ", arg).strip()
+    if not query or len(query) > 200:
+        raise ValueError("give a YouTube search of up to 200 characters")
+    import urllib.parse
+    return (launch("firefox", "--new-tab", "https://www.youtube.com/results?search_query=" + urllib.parse.quote_plus(query))
+            + f"open a YouTube search for {query[:60]!r} in Firefox")
+
+
+def act_layout(arg):
+    return launch(str(HOME / ".local/bin/scratchpad-layout")) + "arrange the scratchpad"
+
+
+def act_chat(arg):
+    return launch(str(HOME / ".local/bin/comms-deck-chat")) + "open the chat screen"
+
+
+ACTIONS = {
+    "scratchpad": (act_scratchpad, "show or hide the scratchpad"),
+    "workspace": (act_workspace, "switch to workspace N (1-10)"),
+    "open": (act_open, "open an https:// link in Firefox"),
+    "youtube": (act_youtube, "open a YouTube search in Firefox"),
+    "layout": (act_layout, "arrange the agents on the scratchpad"),
+    "chat": (act_chat, "open the comms-deck chat screen"),
+}
+
+
+def queue_actions(record):
+    """Queue every '@deck ...' line in a note for the service to carry out."""
+    if record.get("kind") != "message" or record.get("from") == "deck":
+        return
+    for request in DECK_LINE.findall(record.get("text", "")):
+        write_json(DATA / "queue/actions" / f"{new_id()}.json",
+                   {"from": record["from"], "request": request.strip()[:500], "time": time.time(),
+                    "private": bool(record.get("private"))})
+
+
+def free_agent():
+    """The agent to hand a task to: an idle one first, then a busy one."""
+    for want in ("idle", "busy"):
+        for seat in ("claude", "grok", "gravity"):
+            if seat in AGENTS and load_seat(seat)["state"] == want:
+                return seat
+    return "claude"
+
+
+def run_action(asker, request, private=False):
+    """Carry out one request. Returns the text of the answer to `asker`."""
+    words = request.split(None, 1)
+    name, arg = (words[0].lower() if words else ""), (words[1] if len(words) > 1 else "")
+    if name in ("", "help"):
+        return "comms-deck can do: " + "; ".join(f"@deck {n} ({d})" for n, (_, d) in ACTIONS.items())
+    if name in ACTIONS:
+        try:
+            done = ACTIONS[name][0](arg)
+        except (ValueError, RuntimeError, OSError, subprocess.SubprocessError) as error:
+            log(f"deck: {asker} asked for {name}: refused or failed: {error}")
+            return f"couldn't do '{name}': {error}"
+        log(f"deck: {asker} asked for {name}: {done}")
+        return f"done: {done}"
+    if asker not in HANDOFF_FROM:
+        log(f"deck: {asker} asked for something not on the list; refused")
+        return f"'{name}' is not on the list, so I did nothing. Try @deck help."
+    agent = free_agent()
+    send("deck", agent, f"Task from {asker}, asked of comms-deck: {request}\n\n"
+                        f"It isn't one of comms-deck's own actions, so it's yours. Do it on this "
+                        f"machine if it's appropriate and your rules allow it, then tell {asker} "
+                        f"the result with send_message"
+                        + (", with private set: this request was private." if private else "."),
+                        private=private)
+    log(f"deck: {asker} asked for something not on the list; handed to {agent}")
+    return f"that isn't one of my actions, so I've passed it to {agent}"
+
+
+def do_actions():
+    """Carry out queued '@deck' requests, oldest first, within the rate limit."""
+    queue = DATA / "queue/actions"
+    if not queue.is_dir():
+        return
+    recent = [t for t in getattr(do_actions, "recent", []) if time.time() - t < 60]
+    for path in sorted(queue.glob("*.json")):
+        if len(recent) >= ACTION_RATE:
+            break
+        job = read_json(path)
+        path.unlink(missing_ok=True)
+        if not job:
+            continue
+        recent.append(time.time())
+        private = bool(job.get("private"))
+        answer = run_action(job["from"], job["request"], private)
+        if job["from"] in SEATS:
+            send("deck", job["from"], answer, quiet=job["from"] in AGENTS, private=private)
+    do_actions.recent = recent
+
+
 def serve():
-    """Run forever: wake idle agents, copy records, mirror to Discord."""
+    """Run forever: wake agents, drive Grok Bot seats, refresh usage, copy records, mirror to Discord."""
     log(f"comms-deck serving on {MACHINE}; data in {DATA}")
     last_sync, discord_wait_until, last_usage = 0.0, 0.0, 0.0
     while True:
@@ -1970,6 +2262,10 @@ def serve():
             try_app_seats()
         except Exception as error:
             log(f"app seat check failed: {type(error).__name__}")
+        try:
+            do_actions()
+        except Exception as error:  # an action must never stop the service
+            log(f"desktop actions failed: {error}")
         if time.time() - last_usage >= 30:
             last_usage = time.time()
             try:
@@ -2078,23 +2374,165 @@ def when(ts):
     return time.strftime("%H:%M" if same_day else "%a %H:%M", t)
 
 
-def span(seconds):
-    """A duration for the activity timers: 45s, 12m 05s, 1h 12m."""
-    seconds = int(max(0, seconds))
-    if seconds < 60:
-        return f"{seconds}s"
-    if seconds < 3600:
-        return f"{seconds // 60}m {seconds % 60:02d}s"
-    return f"{seconds // 3600}h {seconds % 3600 // 60:02d}m"
-
-
 def ago(seconds):
+    """How long ago, for the panel: '45s ago', '12m ago', '3h ago'."""
     seconds = int(max(0, seconds))
     if seconds < 90:
         return f"{seconds}s ago"
     if seconds < 5400:
         return f"{seconds // 60}m ago"
     return f"{seconds // 3600}h ago"
+
+
+def limit_reset(data, now=None):
+    """When a full plan limit in `data` resets: a time, math.inf if unknown, or None.
+
+    None means nothing is full. With several full limits, the latest reset
+    wins, since the agent is blocked until every one of them clears.
+    """
+    now = time.time() if now is None else now
+    limits = data.get("rate_limits") if isinstance(data, dict) else None
+    if not isinstance(limits, dict):
+        return None
+    latest = None
+    for entry in limits.values():
+        if not isinstance(entry, dict):
+            continue
+        used = entry.get("used_percentage")
+        if isinstance(used, bool) or not isinstance(used, (int, float)) or used < 100:
+            continue
+        reset = entry.get("resets_at")
+        if isinstance(reset, bool) or not isinstance(reset, (int, float)):
+            reset = math.inf
+        elif reset > 1e12:  # milliseconds, the shape some meters emit
+            reset = reset / 1000
+        if reset > now:
+            latest = reset if latest is None else max(latest, reset)
+    return latest
+
+
+SPENT_DIR = "limits"  # DATA/limits/<seat>.json: {"resets_at": unix time} set by `comms-deck spent`
+
+
+def spent_mark(seat, now=None):
+    """The reset time from a `comms-deck spent` mark, or None if unset or past.
+
+    For an agent with no usage meter (Gravity's agy has none). A mark that
+    has passed counts as cleared, so the row reverts with no agent and no
+    service; the file is only tidied by the next `comms-deck spent`.
+    """
+    now = time.time() if now is None else now
+    mark = read_json(DATA / SPENT_DIR / f"{seat}.json") or {}
+    reset = mark.get("resets_at")
+    if isinstance(reset, bool) or not isinstance(reset, (int, float)) or reset <= now:
+        return None
+    return float(reset)
+
+
+def seat_spent(seat, now=None):
+    """True when `seat` is spent, by its usage meter or a `comms-deck spent` mark."""
+    usage = (read_json(DATA / "usage" / f"{seat}.json") or {}).get("data") or {}
+    return spent_reset(usage, spent_mark(seat, now), now) is not None
+
+
+def spent_reset(data, marked=None, now=None):
+    """The later of the meter's reset and the mark's, or None if neither says spent."""
+    times = [t for t in (limit_reset(data, now), marked) if t is not None]
+    return max(times) if times else None
+
+
+def countdown(reset, now=None):
+    """'back in 6d 19h 12m', 'back in 1h 12m 05s', 'back in 42m 05s', or 'back: time unknown'."""
+    if reset is None or reset == math.inf:
+        return "back: time unknown"
+    left = max(0, int(reset - (time.time() if now is None else now)))
+    days, rest = divmod(left, 86400)
+    hours, rest = divmod(rest, 3600)
+    minutes, seconds = divmod(rest, 60)
+    if days:
+        return f"back in {days}d {hours}h {minutes:02d}m"
+    if hours:
+        return f"back in {hours}h {minutes:02d}m {seconds:02d}s"
+    return f"back in {minutes}m {seconds:02d}s"
+
+
+def parse_until(text, now=None):
+    """A reset time from '+166h', '+90m', '+2d', '06:20' (the next one), or 'YYYY-MM-DD HH:MM'."""
+    import datetime
+    now = time.time() if now is None else now
+    text = text.strip()
+    m = re.fullmatch(r"\+(\d+(?:\.\d+)?)\s*([mhd])", text, re.IGNORECASE)
+    if m:
+        return now + float(m.group(1)) * {"m": 60, "h": 3600, "d": 86400}[m.group(2).lower()]
+    m = re.fullmatch(r"(\d{1,2}):(\d\d)", text)
+    if m:
+        base = datetime.datetime.fromtimestamp(now)
+        at = base.replace(hour=int(m.group(1)), minute=int(m.group(2)), second=0, microsecond=0)
+        if at.timestamp() <= now:
+            at += datetime.timedelta(days=1)
+        return at.timestamp()
+    try:
+        return datetime.datetime.strptime(text, "%Y-%m-%d %H:%M").timestamp()
+    except ValueError:
+        raise ValueError("give the reset as +166h, +90m, +2d, 06:20 or 'YYYY-MM-DD HH:MM'") from None
+
+
+def mark_spent(seat, until, who):
+    """Mark `seat` spent until `until` ('clear' removes the mark). Returns a line to print."""
+    if seat not in SEATS or seat == "owner":
+        raise ValueError(f"no seat called {seat!r}")
+    path = DATA / SPENT_DIR / f"{seat}.json"
+    if until.strip().lower() == "clear":
+        path.unlink(missing_ok=True)
+        return f"{seat}: spent mark cleared"
+    reset = parse_until(until)
+    write_json(path, {"resets_at": reset, "set_by": who, "set_at": time.time()})
+    return f"{seat}: spent until {when(reset)} ({countdown(reset)})"
+
+
+def limit_spent(data, now=None):
+    """True when a plan limit in `data` is full and has not reset yet.
+
+    `data` is the object stored under "data" in usage/<seat>.json. Any
+    rate_limits entry with used_percentage >= 100 counts. A missing
+    resets_at stays spent, because the file can stop updating while that
+    agent is blocked. A resets_at that is already past clears it, so the
+    row reverts on the next redraw with no agent. The context percentage
+    is not a plan limit. No rate_limits means not spent.
+    """
+    return limit_reset(data, now) is not None
+
+
+def activity_view(state, usage_data, now=None, waiting=0, marked=None):
+    """How one activity row looks: (mark, word, colour).
+
+    A full plan limit, or a `comms-deck spent` mark (`marked`, its reset
+    time), draws spent, in red. Otherwise idle with notes waiting is stuck.
+    Spent wins: an agent that can't run isn't stuck. This does not write the
+    seat file, so wake and the loop guard still see idle, busy or away.
+    """
+    if limit_spent(usage_data, now) or marked is not None:
+        return "○", "spent", 196  # a red empty circle: out of usage, not working (the owner's choice)
+    mark, shade, word = row_status(state, waiting)
+    return mark, (word or "")[:13], shade
+
+
+def waiting_summary(notes):
+    """One line for notes still in the inbox, or '' when there are none.
+
+    The count is first, so a narrow panel still shows how many are waiting.
+    The words are the oldest note. A private note adds none of its text.
+    Drawn on every redraw from the inbox, so it does not need an agent.
+    """
+    if not notes:
+        return ""
+    _, record = notes[0]
+    if record.get("private"):
+        detail = "private note"
+    else:
+        detail = describe(f"note from {record.get('from', '?')}: {record.get('text', '')}", 50)
+    extra = f" (+{len(notes) - 1} more)" if len(notes) > 1 else ""
+    return f"{len(notes)} waiting · {detail}{extra}"
 
 
 def usage_panel(width):
@@ -2164,18 +2602,52 @@ def usage_panel(width):
             lines.append(f"  Session  {' · '.join(bits)}")
         lines.append(f"\033[2m  updated {ago(time.time() - record.get('time', 0))}\033[0m")
         lines.append("")
-    # ACTIVITY: one row per agent: its state's symbol, the state, and how
-    # long it has been that way, counting up. (The history stays in
-    # activity.jsonl; the owner asked for just the current picture here.)
+    # ACTIVITY: one row per agent. The mark, the word and the colour come
+    # from activity_view, which can say spent (a full plan limit, from the
+    # agent's meter or a mark set with `comms-deck spent`) or stuck (idle
+    # with notes waiting) while the seat file stays as it was. Spent beats
+    # stuck. Under the row, one line lists notes still in the inbox. Only a
+    # spent row counts down to its reset. Seconds show only in the last hour,
+    # so only then does the screen redraw every second; otherwise every 2 s,
+    # as before. (The history stays in activity.jsonl.)
     lines.append("\033[1mACTIVITY\033[0m")
     lines.append("")
+    usage_panel.ticking = False
     for seat, st, since in current_states():
-        shade = STATE_COLOURS.get(st, 245)
-        clock = span(time.time() - since) if since else ""
+        usage = (read_json(DATA / "usage" / f"{seat}.json") or {}).get("data") or {}
+        notes = pending(seat)
+        waiting = len(notes)
+        mark, word, shade = activity_view(st, usage, waiting=waiting, marked=spent_mark(seat))
+        if word == "spent":
+            reset = spent_reset(usage, spent_mark(seat))
+            began = countdown(reset)
+            if reset is not None and reset - time.time() < 3600:
+                usage_panel.ticking = True  # seconds are shown only in the last hour
+        elif seat in APP_SEATS and APP_PROCESS.get(seat, "grok-bot") != "grok-bot" and st != "not set up":
+            usage_panel.ticking = True  # it polls rather than being woken, so show when it next looks
+            began = poll_countdown(load_seat(seat))
+        else:
+            began = when(since) if since else ""  # static: "03:27" today, "Fri 18:00" otherwise
+        squares = "■" * min(waiting, 5) + (f"+{waiting - 5}" if waiting > 5 else "")
+        state_text = f"{mark} {began}" if word == "spent" else f"{mark} {word:9}\033[0m \033[2m{began}"
         lines.append(f"  \033[38;5;{colour(seat)}m{seat.title():8}\033[0m "
-                     f"\033[38;5;{shade}m{STATE_MARKS.get(st, '◌')} {st[:13]:13}\033[0m "
-                     f"\033[1;38;5;{shade}m{clock:>8}\033[0m")
+                     f"\033[38;5;{shade}m{state_text}\033[0m"
+                     + (f" \033[38;5;33m{squares}\033[0m" if squares else ""))
+        summary = waiting_summary(notes)
+        if summary:
+            lines.append(f"    \033[2m{summary}\033[0m")
     return [fit(" " + line, width) for line in lines]
+
+
+def row_status(state, waiting):
+    """The mark, colour and word for one activity row.
+
+    Idle with notes still in the inbox is stuck: a red row that says stuck,
+    so a queue nobody has picked up stands out from a genuinely idle agent.
+    """
+    if state == "idle" and waiting:
+        return "●", 196, "stuck"
+    return STATE_MARKS.get(state, "◌"), STATE_COLOURS.get(state, 245), state
 
 
 def current_states():
@@ -2187,8 +2659,8 @@ def current_states():
     out = []
     for seat in AGENTS:
         st = load_seat(seat)
-        if st["state"] == "away" and seat not in ("claude", "grok"):
-            continue
+        if st["state"] == "away" and seat not in ("claude", "grok") and not seat_spent(seat):
+            continue  # a spent seat stays shown, so its countdown can be seen
         out.append((seat, st["state"], st.get("since")))
     for seat in APP_SEATS:
         if seat in HIDDEN_SEATS:
@@ -2313,7 +2785,7 @@ def chat(history=200, hide_private=False):
         try:
             while True:
                 cols, rows = shutil.get_terminal_size((100, 40))
-                panel_w = max(34, min(52, cols // 3)) if cols >= 90 else 0
+                panel_w = max(40, min(52, cols // 3)) if cols >= 90 else 0  # 40: a full ACTIVITY row fits
                 chat_w = cols - panel_w - (3 if panel_w else 0)
                 changed = False
                 if layout != (cols, rows):  # first time, or the window was resized
@@ -2336,7 +2808,7 @@ def chat(history=200, hide_private=False):
                 shown = shown[-2000:]
                 if handle_keys():
                     changed = True
-                if changed or time.time() - last_draw >= 2:
+                if changed or time.time() - last_draw >= (1 if getattr(usage_panel, "ticking", False) else 2):
                     body = rows - (1 if tty else 0)  # the chat box is the last line
                     left = shown[-body:]
                     left = [""] * (body - len(left)) + left
@@ -2512,7 +2984,7 @@ def status_text():
 
 
 # -----------------------------------------------------------------------------
-# SECTION 10: MCP server - send/read as built-in tools
+# SECTION 10: MCP server - send, read and status as built-in tools
 # -----------------------------------------------------------------------------
 #
 # Newline-delimited JSON-RPC 2.0 on stdin/stdout (the MCP stdio transport).
@@ -2547,8 +3019,45 @@ MCP_TOOLS = [
 ]
 
 
+MCP_BUSY_FOR = 180       # an MCP-only app seat counts as busy this long after set_status
+POLL_DEFAULT = 60        # seconds between checks assumed for an app seat that polls
+POLL_RANGE = (30, 86400)  # a measured gap between checks is kept inside this (Lumo's app can only schedule daily)
+
+
+def note_mcp_call(seat, name, now=None):
+    """Record an MCP-only app seat's tool call: when it last checked its mail,
+    and the gap since the check before, which sets its countdown."""
+    if seat not in APP_SEATS or APP_PROCESS.get(seat, "grok-bot") == "grok-bot":
+        return
+    now = time.time() if now is None else now
+    changes = {"mcp_seen": now}
+    if name == "read_messages":
+        last = float(load_seat(seat).get("polled_at") or 0)
+        changes["polled_at"] = now
+        if last and now - last > 5:  # two reads in one turn aren't a cadence
+            changes["poll_gap"] = min(max(now - last, POLL_RANGE[0]), POLL_RANGE[1])
+    if name == "set_status":
+        changes["status_at"] = now
+    update_seat(seat, **changes)
+
+
+def poll_countdown(state, now=None):
+    """'next check in 0:42', or 'check late 1:05' once the expected time has passed."""
+    now = time.time() if now is None else now
+    polled = float(state.get("polled_at") or 0)
+    if not polled:
+        return "hasn't checked yet"
+    left = int(polled + float(state.get("poll_gap") or POLL_DEFAULT) - now)
+    clock = lambda n: f"{n // 3600}:{n % 3600 // 60:02d}:{n % 60:02d}" if n >= 3600 else f"{n // 60}:{n % 60:02d}"
+    return f"next check in {clock(left)}" if left >= 0 else f"check late {clock(-left)}"
+
+
 def mcp_call(seat, name, args):
     """Run one MCP tool. Returns (text, is_error)."""
+    try:
+        note_mcp_call(seat, name)
+    except OSError:
+        pass  # the record is for the screen only; never fail the tool for it
     if name == "send_message":
         record, warning = send(seat, str(args.get("to", "")), str(args.get("text", "")),
                                bool(args.get("quiet")), bool(args.get("private")))
@@ -3091,6 +3600,10 @@ def self_test():
           abs(view[1]["duration"] - 9.8) < 0.01 and not view[1]["live"]
           and view[0]["live"] and 9.5 < view[0]["duration"] < 12,
           str(view))
+    check("idle with notes waiting shows stuck, in red",
+          row_status("idle", 1) == ("●", 196, "stuck"))
+    check("idle with an empty inbox stays idle", row_status("idle", 0)[2] == "idle")
+    check("busy with notes waiting stays busy", row_status("busy", 4)[2] == "busy")
     check("a pasted note's wrapper tags are left out of its description",
           describe('<pasted_content id="x1">\n[comms-deck] 1 note(s) for claude:\n\nFrom alice at 03:21:\n'
                    'Alice here, for the owner\n</pasted_content id="x1">') == "note from alice: Alice here, for the owner")
@@ -3103,6 +3616,51 @@ def self_test():
           wake_failure_reason(RuntimeError("no composer")) == "no composer"
           and wake_failure_reason(RuntimeError(MARK + " 1 note(s) for alice:\nhello")) == "RuntimeError"
           and wake_failure_reason(RuntimeError("line one\nline two")) == "line one")
+    code = "\n".join([
+        "import importlib.machinery as m, importlib.util as u, json, glob",
+        f"l = m.SourceFileLoader('cd', {me!r}); s = u.spec_from_loader('cd', l)",
+        "x = u.module_from_spec(s); l.exec_module(x)",
+        "x.send('alice', 'owner', 'sure\\n@deck scratchpad\\n@deck open http://plain.example\\n"
+        "@deck youtube lofi beats\\n@deck workspace 42\\n@deck make me a coffee')",
+        "x.do_actions()",
+        "got = [json.load(open(f)) for f in sorted(glob.glob(str(x.DATA / 'inbox' / 'alice' / '*.json')))]",
+        "print(json.dumps([g['text'] for g in got if g['from'] == 'deck']))",
+        "task = [json.load(open(f)) for f in glob.glob(str(x.DATA / 'inbox' / '*' / '*.json'))",
+        "        if 'make me a coffee' in json.load(open(f))['text'] and json.load(open(f))['from'] == 'deck']",
+        "print(len(task))",
+        "x.send('owner', 'claude', 'hi\\n@deck open https://example.com/a\\n@deck make tea', private=True)",
+        "x.do_actions()",
+        "mine = [json.loads(l) for l in open(x.DATA / 'log.jsonl')]",
+        "mine = [g for g in mine if g['from'] == 'deck' and ('example.com/a' in g['text'] or 'make tea' in g['text'])]",
+        "print(json.dumps(sorted([g['text'][:40], g['private'], 'with private set' in g['text']] for g in mine)))",
+    ])
+    Path(f"{tmp}/actions-config").mkdir(parents=True, exist_ok=True)
+    Path(f"{tmp}/actions-config/app-seats").write_text("alice\n")
+    r = subprocess.run([sys.executable, "-c", code],  # its own data and config: other tests count inboxes
+                       env=dict(env, COMMS_DECK_DRY_ACTIONS="1", LAUNCHPAD_HOME=f"{tmp}/actions-data",
+                                COMMS_DECK_HOME=f"{tmp}/actions-data",
+                                LAUNCHPAD_CONFIG=f"{tmp}/actions-config",
+                                COMMS_DECK_CONFIG=f"{tmp}/actions-config"),
+                       capture_output=True, text=True, timeout=30)
+    lines = [l for l in r.stdout.strip().splitlines() if not re.match(r"\d{4}-\d\d-\d\d ", l)]  # skip log lines
+    try:
+        answers = json.loads(lines[0]) if lines else []
+        owner_side = json.loads(lines[2]) if len(lines) > 2 else []
+    except ValueError:
+        answers, owner_side = [], []
+    check("@deck runs listed actions, refuses unsafe ones, and refuses unlisted ones from an app seat",
+          len(answers) == 5 and answers[0].startswith("done: would toggle the scratchpad")
+          and answers[1].startswith("couldn't do 'open'") and "would open a YouTube search" in answers[2]
+          and answers[3].startswith("couldn't do 'workspace'") and "not on the list" in answers[4]
+          and len(lines) > 1 and lines[1] == "0", r.stdout + r.stderr)
+    check("@deck from the owner: a dry-run https link, a handoff, and both stay private",
+          len(owner_side) == 2 and all(p for _, p, _ in owner_side)
+          and any(t.startswith("done: would open https://example.com/a") for t, _, _ in owner_side)
+          and any(t.startswith("Task from owner") and asks for t, _, asks in owner_side), r.stdout + r.stderr)
+    team = render([{"from": "owner", "to": "claude+grok", "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+                    "text": "do the thing"}], "grok")
+    check("delivered notes carry their age and a team snapshot, and flag shared work",
+          "(0s ago)" in team and "Team at " in team and "more than one agent" in team, team)
     check("app seats are told to reply in their chat, not with tools",
           "Reply here in this chat" in app_text and "send_message" not in app_text, app_text)
     check("Grok's Notification hook matches idle_prompt only",
@@ -3131,6 +3689,12 @@ def self_test():
         "assert fresh == [] and cur == 't1@3'",
         "idle = {'open': True, 'replying': False, 'composer': ''}",
         "assert x.app_delivery_allowed({'open':True,'replying':True,'composer':''}, False, {'auto':0}, 'alice') is False",
+        "ch, st = x.draft_status({}, 'w', 1000.0); assert ch == {'app_draft': 'w', 'app_draft_since': 1000.0} and not st",
+        "ch, st = x.draft_status({'app_draft': 'w', 'app_draft_since': 1000.0}, 'w', 1000.0 + x.DRAFT_STALE - 1); assert not ch and not st",
+        "ch, st = x.draft_status({'app_draft': 'w', 'app_draft_since': 1000.0}, 'w', 1000.0 + x.DRAFT_STALE); assert st",
+        "ch, st = x.draft_status({'app_draft': 'w', 'app_draft_since': 1000.0}, 'wh', 5000.0); assert ch['app_draft_since'] == 5000.0 and not st",
+        "ch, st = x.draft_status({'app_draft': 'w', 'app_draft_since': 1000.0}, '', 5000.0); assert ch == {'app_draft': '', 'app_draft_since': 0} and not st",
+        "ch, st = x.draft_status({}, None, 5000.0); assert ch == {} and not st",
         "assert x.app_delivery_allowed({'open':True,'replying':False,'composer':'draft'}, False, {'auto':0}, 'alice') is False",
         "assert x.app_delivery_allowed(idle, True, {'auto':0}, 'alice') is False",
         "assert x.app_delivery_allowed(idle, False, {'auto':2}, 'alice') is False",
@@ -3183,6 +3747,99 @@ def self_test():
     r = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True, timeout=30)
     check("app seat replies, guards, usage and websocket mask",
           r.returncode == 0 and r.stdout.strip() == "ok", r.stdout + r.stderr)
+    now = 1_700_000_000
+    code = "\n".join([
+        "import importlib.machinery as m, importlib.util as u, json",
+        f"l = m.SourceFileLoader('lp', {me!r}); s = u.spec_from_loader('lp', l)",
+        "x = u.module_from_spec(s); l.exec_module(x)",
+        f"now = {now}",
+        "future, past = now + 3600, now - 3600",
+        "full = lambda reset: {'used_percentage': 100, 'resets_at': reset}",
+        "assert x.limit_spent({'rate_limits': {'five_hour': full(future)}}, now)",
+        "assert not x.limit_spent({'rate_limits': {'five_hour': full(past)}}, now)",
+        "assert not x.limit_spent({'rate_limits': {'five_hour': {'used_percentage': 99, 'resets_at': future}}}, now)",
+        "assert x.limit_spent({'rate_limits': {'five_hour': {'used_percentage': 34, 'resets_at': future}, 'seven_day': full(future)}}, now)",
+        "assert not x.limit_spent({'context_window': {'used_percentage': 100}}, now)",
+        "assert not x.limit_spent({}, now)",
+        "assert x.limit_spent({'rate_limits': {'five_hour': {'used_percentage': 100}}}, now)",
+        "assert x.limit_spent({'rate_limits': {'five_hour': full(past), 'seven_day': full(future)}}, now)",
+        "assert x.limit_spent({'rate_limits': {'five_hour': full((future) * 1000)}}, now)",
+        "assert not x.limit_spent({'rate_limits': {'five_hour': {'used_percentage': True, 'resets_at': future}}}, now)",
+        "assert x.activity_view('idle', {'rate_limits': {'five_hour': full(future)}}, now) == ('○', 'spent', 196)",
+        "assert x.activity_view('busy', {'rate_limits': {'five_hour': full(past)}}, now)[1] == 'busy'",
+        "assert x.activity_view('idle', {}, now, waiting=3) == ('●', 'stuck', 196)",
+        "assert x.activity_view('idle', {'rate_limits': {'five_hour': full(future)}}, now, waiting=3)[1] == 'spent'",
+        "assert x.activity_view('idle', {}, now, waiting=3, marked=future)[1] == 'spent'",
+        "assert x.limit_reset({'rate_limits': {'five_hour': full(future), 'seven_day': full(future + 50)}}, now) == future + 50",
+        "assert x.countdown(now + 6*86400 + 19*3600 + 12*60 + 7, now) == 'back in 6d 19h 12m'",
+        "assert x.countdown(now + 3600 + 12*60 + 5, now) == 'back in 1h 12m 05s'",
+        "assert x.countdown(now + 42*60 + 5, now) == 'back in 42m 05s'",
+        "assert x.countdown(float('inf'), now) == 'back: time unknown'",
+        "assert x.parse_until('+166h', now) == now + 166*3600",
+        "assert x.parse_until('+90m', now) == now + 5400",
+        "import datetime as dt",
+        "t = x.parse_until('06:20', now); d = dt.datetime.fromtimestamp(t)",
+        "assert (d.hour, d.minute) == (6, 20) and now < t <= now + 86400",
+        "x.mark_spent('gravity', '+2h', 'claude')",
+        "assert x.spent_mark('gravity') and abs(x.spent_mark('gravity') - (x.time.time() + 7200)) < 5",
+        "assert x.spent_mark('gravity', now=x.time.time() + 7300) is None",
+        "assert x.seat_spent('gravity')",
+        "x.mark_spent('gravity', 'clear', 'claude')",
+        "assert not x.seat_spent('gravity')",
+        "x.write_json(x.DATA / 'usage' / 'gravity.json', {'time': now, 'data': {'rate_limits': {'five_hour': full(x.time.time() + 600)}}})",
+        "x.update_seat('gravity', state='away')",
+        "assert x.seat_spent('gravity') and any(s == 'gravity' for s, _, _ in x.current_states())",
+        "(x.DATA / 'usage' / 'gravity.json').unlink()",
+        "assert not any(s == 'gravity' for s, _, _ in x.current_states())",
+        "assert x.spent_mark('gravity') is None",
+        "try:\n    x.mark_spent('nobody', '+1h', 'claude'); raise SystemExit('bad seat accepted')\nexcept ValueError: pass",
+        "try:\n    x.parse_until('soonish', now); raise SystemExit('bad time accepted')\nexcept ValueError: pass",
+        "assert x.poll_countdown({}, now) == \"hasn't checked yet\"",
+        "assert x.poll_countdown({'polled_at': now - 18}, now) == 'next check in 0:42'",
+        "assert x.poll_countdown({'polled_at': now - 125, 'poll_gap': 60}, now) == 'check late 1:05'",
+        "assert x.poll_countdown({'polled_at': now - 5, 'poll_gap': 1800}, now) == 'next check in 29:55'",
+        "x.APP_SEATS = x.APP_SEATS + ('pollseat',); x.APP_PROCESS['pollseat'] = 'some-app'",
+        "x.note_mcp_call('pollseat', 'read_messages', now)",
+        "x.note_mcp_call('pollseat', 'read_messages', now + 1)",
+        "assert 'poll_gap' not in x.load_seat('pollseat')",
+        "x.note_mcp_call('pollseat', 'read_messages', now + 300)",
+        "assert x.load_seat('pollseat')['poll_gap'] == 299",
+        "x.note_mcp_call('pollseat', 'read_messages', now + 300 + 90000)",
+        "assert x.load_seat('pollseat')['poll_gap'] == 86400",
+        "assert x.poll_countdown({'polled_at': now, 'poll_gap': 86400}, now) == 'next check in 24:00:00'",
+        "x.note_mcp_call('pollseat', 'set_status', now + 301)",
+        "assert x.load_seat('pollseat')['status_at'] == now + 301",
+        "x.note_mcp_call('alice', 'read_messages', now)",
+        "assert 'polled_at' not in x.load_seat('alice')",
+        "box = x.DATA / 'inbox' / 'scratch-seat'",
+        "box.mkdir(parents=True, exist_ok=True)",
+        "(box / '1.json').write_text(json.dumps({'from': 'owner', 'text': 'token: ghp_' + 'a' * 30, 'private': True}))",
+        "(box / '2.json').write_text(json.dumps({'from': 'owner', 'text': 'open the scratchpad', 'private': False}))",
+        "summary = x.waiting_summary(x.pending('scratch-seat'))",
+        "assert summary.startswith('2 waiting · private note') and '(+1 more)' in summary",
+        "assert 'ghp_' not in summary and 'scratchpad' not in summary",
+        "seat = json.loads((x.DATA / 'seats' / 'claude.json').read_text()) if (x.DATA / 'seats' / 'claude.json').exists() else {}",
+        "x.activity_view(seat.get('state', 'idle'), {'rate_limits': {'five_hour': full(future)}}, now)",
+        "after = json.loads((x.DATA / 'seats' / 'claude.json').read_text()) if (x.DATA / 'seats' / 'claude.json').exists() else {}",
+        "assert after.get('state') == seat.get('state')",
+        "print('ok')",
+    ])
+    r = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True, timeout=30)
+    check("a full plan limit is spent until its reset, and waiting notes are counted from the inbox",
+          r.returncode == 0 and r.stdout.strip() == "ok", r.stdout + r.stderr)
+    body = Path(tmp) / "pr-body.txt"
+    body.write_text("Written by: Grok\nReviewed by: Claude\n")
+    r = run(["review-check", "--file", str(body)], "grok")
+    check("a review from another seat passes", r.returncode == 0 and "claude" in r.stdout, r.stdout + r.stderr)
+    body.write_text("Written by: Grok\nReviewed by: Grok\n")
+    r = run(["review-check", "--file", str(body)], "grok")
+    check("the author's own review does not count", r.returncode != 0, r.stdout + r.stderr)
+    body.write_text("Written by: Grok\n")
+    r = run(["review-check", "--file", str(body)], "grok")
+    check("a missing review line fails", r.returncode != 0 and "no Reviewed by" in r.stderr, r.stderr)
+    body.write_text("Reviewed by: Claude\n")
+    r = run(["review-check", "--file", str(body)], "grok")
+    check("a review with no author line fails", r.returncode != 0 and "no Written by" in r.stderr, r.stderr)
     shutil.rmtree(tmp, ignore_errors=True)
     print(f"\n{'all passed' if not failures else f'{len(failures)} failed'}")
     return 1 if failures else 0
@@ -3193,7 +3850,55 @@ def self_test():
 # -----------------------------------------------------------------------------
 
 
+def credited_seats(text, label):
+    """Seat names on lines like 'Reviewed by: Claude'. 'owner' is not a seat here."""
+    found = []
+    for line in text.splitlines():
+        if not re.match(rf"(?i)^\s*{label}\s+by\s*:", line):
+            continue
+        for seat in SEATS:
+            if seat != "owner" and re.search(rf"(?i)\b{seat}\b", line) and seat not in found:
+                found.append(seat)
+    return found
+
+
+def review_gap(text):
+    """None if another seat reviewed this text, otherwise a short reason.
+
+    The author is whoever `Written by:` names. A `Reviewed by:` line counts
+    only when it names a different seat, so an author cannot pass their own PR.
+    """
+    writers = credited_seats(text, "Written")
+    reviewers = credited_seats(text, "Reviewed")
+    if not writers:
+        return "no Written by line naming a seat"
+    others = [seat for seat in reviewers if seat not in writers]
+    if not reviewers:
+        return "no Reviewed by line"
+    if not others:
+        return "Reviewed by names only the author (" + ", ".join(writers) + ")"
+    return None
+
+
+def pr_review_text(number):
+    """The PR body plus review and comment text, from GitHub. Raises on failure."""
+    result = subprocess.run(
+        ["gh", "pr", "view", str(number), "--repo", "whyyyyyai/comms-deck",
+         "--json", "body,comments,reviews"],
+        capture_output=True, text=True, timeout=30)
+    if result.returncode != 0:
+        raise RuntimeError((result.stderr or result.stdout or "gh pr view failed").strip())
+    data = json.loads(result.stdout or "{}")
+    parts = [data.get("body") or ""]
+    for key in ("comments", "reviews"):
+        for item in data.get(key) or []:
+            if isinstance(item, dict):
+                parts.append(item.get("body") or "")
+    return "\n".join(parts)
+
+
 def main():
+    """The command line: send, read, the chat screen, the service, hooks and install."""
     parser = argparse.ArgumentParser(prog="comms-deck", description=__doc__.split("\n")[0])
     parser.add_argument("--from", dest="sender", help="send as this seat")
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -3221,6 +3926,12 @@ def main():
     p = sub.add_parser("install")
     p.add_argument("--yes", action="store_true")
     sub.add_parser("self-test")
+    p = sub.add_parser("spent", help="mark a seat spent until its limit resets (for agents with no meter)")
+    p.add_argument("seat")
+    p.add_argument("until", nargs="+", help="+166h, +90m, +2d, 06:20, 'YYYY-MM-DD HH:MM', or clear")
+    p = sub.add_parser("review-check")
+    p.add_argument("number", nargs="?", type=int, help="pull request number on this repo")
+    p.add_argument("--file", help="check this text instead of fetching the PR")
     args = parser.parse_args()
 
     def me():
@@ -3269,6 +3980,24 @@ def main():
             install(args.yes)
         elif args.cmd == "self-test":
             sys.exit(self_test())
+        elif args.cmd == "spent":
+            print(mark_spent(args.seat.lower(), " ".join(args.until), me()))
+        elif args.cmd == "review-check":
+            try:
+                if args.file:
+                    text = Path(args.file).read_text()
+                elif args.number:
+                    text = pr_review_text(args.number)
+                else:
+                    sys.exit("comms-deck: review-check needs a PR number or --file")
+            except (OSError, RuntimeError, json.JSONDecodeError, subprocess.SubprocessError) as error:
+                sys.exit(f"comms-deck: {error}")
+            gap = review_gap(text)
+            if gap:
+                sys.exit(f"comms-deck: PR #{args.number or args.file}: {gap}")
+            others = [s for s in credited_seats(text, "Reviewed")
+                      if s not in credited_seats(text, "Written")]
+            print("ok: reviewed by " + ", ".join(others))
     except ValueError as error:
         sys.exit(f"comms-deck: {error}")
     except KeyboardInterrupt:

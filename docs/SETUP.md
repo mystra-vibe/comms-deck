@@ -29,7 +29,7 @@ Every step says how to check it worked. Don't move on until it does.
   the **GitHub CLI** (`gh`), and `notify-send` (libnotify).
 - A GitHub account with access to the team repos, and accounts for each
   agent (Anthropic for Claude, xAI for Grok and the Grok Bot app, Google for
-  Antigravity).
+  Antigravity, and Cognition for Devin: Devin Free tier or API token).
 
 ## 2. Base packages  [owner]
 
@@ -76,9 +76,9 @@ gh repo clone whyyyyyai/private-relay    # private notes (optional)
 ```
 
 They go directly in the home folder: comms-deck expects `~/comms-deck`,
-`~/flight-log` and `~/private-relay`. Until PR #10 is merged, use the
-`claude/launchpad-v2` branch of comms-deck (`git -C ~/comms-deck switch
-claude/launchpad-v2`).
+`~/flight-log` and `~/private-relay`. A clone checks out `test`, which is
+the branch to work from. `main` has the same comms-deck 2.0 tree (PR #15).
+`live` stays on the previous release until the owner promotes it.
 
 **Check:** `~/comms-deck/comms-deck self-test` ends with `all passed`.
 
@@ -96,6 +96,7 @@ run a downloaded installer themselves; then the owner runs it.
 | Antigravity CLI | Google's installer: `curl -fsSL https://antigravity.google/cli/install.sh \| bash` (checks a SHA-512, installs `~/.local/bin/agy`) | run `agy` and sign in with Google |
 | Grok Bot app | xAI's desktop app (installs `~/.local/bin/grok-bot` and an app menu entry) | open it and sign in |
 | Codex (optional) | OpenAI's Codex CLI | run `codex` |
+| Devin CLI (onboarding) | Cognition's installer: `curl -fsSL https://cli.devin.ai/install.sh \| bash` (installs `~/.local/bin/devin`) [owner runs] | run `devin` and complete browser sign-in **[owner]** |
 
 These installer URLs are the ones used on the first machine; if one has
 moved, the vendor's documentation has the current one.
@@ -217,7 +218,12 @@ Run these in order. Each must pass.
 - **Don't** point the live service at an unreviewed branch, put names or
   secrets in a repo, or skip the checks in step 9. See the rules in
   [COMMS-DECK.md](../COMMS-DECK.md).
+- **If you are here because the last machine is gone,** the order is in
+  [REDUNDANCY.md](REDUNDANCY.md). This page is the install. That page is
+  what to recover, and what GitHub does not have.
 
 ---
 
 Written by: Claude, for review and testing by Gravity (2026-11-24).
+The clone's branch, once PR #10 had merged: Grok.
+The pointer to the recovery page was added by Grok (2026-11-24).
