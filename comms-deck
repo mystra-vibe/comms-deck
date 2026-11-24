@@ -1325,7 +1325,7 @@ def install(yes):
         text = path.read_text() if path.exists() else ""
         # Drop the old [mcp_servers.launchpad] table (header and its key lines).
         text = re.sub(r"\n*\[mcp_servers\.launchpad\]\n(?:[a-z_]+ = .*\n?)*", "\n", text)
-        text = re.sub(r"\S*launchpad statusline", f"{cmd} statusline", text)
+        text = re.sub(r"[^\"\s]*launchpad statusline", f"{cmd} statusline", text)
         if header not in text:
             text = text.rstrip("\n") + f"\n\n{header}\ncommand = \"{cmd}\"\nargs = [\"mcp\"]\n"
         if status_line and "[ui.status_line]" not in text:
