@@ -2291,7 +2291,7 @@ def grok_usage_from_session():
         return None
     session = live[-1]
     folder = HOME / ".grok/sessions" / session.get("cwd", "").replace("/", "%2F") / session["session_id"]
-    data, newest = {"model": {}, "context_window": {}, "cost": {}}, 0.0
+    data, newest, context_time = {"model": {}, "context_window": {}, "cost": {}}, 0.0, 0.0
     try:
         sig = json.loads((folder / "signals.json").read_text())
         newest = (folder / "signals.json").stat().st_mtime
@@ -2302,6 +2302,7 @@ def grok_usage_from_session():
             data["context_window"]["context_window_size"] = sig["contextWindowTokens"]
         if sig.get("contextTokensUsed") is not None:
             data["context_window"]["context_tokens"] = sig["contextTokensUsed"]
+        context_time = newest
     except (OSError, ValueError):
         pass
     cost_ticks, sin, sout = 0, 0, 0
@@ -2321,13 +2322,15 @@ def grok_usage_from_session():
                     cost_ticks += usage.get("costUsdTicks") or 0
                     sin += usage.get("inputTokens") or 0
                     sout += usage.get("outputTokens") or 0
-                    if when > newest and usage.get("modelCalls") == 1:
-                        # one model call: its input is the whole context
-                        data["context_window"]["context_tokens"] = usage.get("inputTokens")
-                        newest = when
-                elif u.get("sessionUpdate") == "auto_compact_completed" and when > newest:
+                    # Every finished turn moves the clock: the session totals
+                    # changed. Its inputTokens sum all of the turn's model
+                    # calls, so they're not the context size; that comes from
+                    # signals.json or a compaction. (Review by Grok.)
+                    newest = max(newest, when)
+                elif u.get("sessionUpdate") == "auto_compact_completed" and when >= context_time:
                     data["context_window"]["context_tokens"] = u.get("tokens_after")
-                    newest = when
+                    context_time = when
+                    newest = max(newest, when)
     except OSError:
         pass
     if sin:
