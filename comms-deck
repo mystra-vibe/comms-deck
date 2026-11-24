@@ -471,15 +471,21 @@ def recent_activity(limit, path=None):
         if later is not None and later - r["time"] < 3:
             continue
         keep.append(r)
-    out = []
-    for r in keep:
-        if out and out[-1]["seat"] == r["seat"] and out[-1]["state"] == r["state"] \
-                and out[-1].get("doing", "") == r.get("doing", ""):
-            continue
-        out.append(r)
-        if len(out) >= limit:
-            break
-    return out
+    # Fold repeats, then give each entry its duration: until that seat's next
+    # change, or (the newest one per seat) until now, marked live.
+    folded = []
+    for r in reversed(keep):  # oldest first
+        if folded and any(f["seat"] == r["seat"] for f in folded):
+            last = next(f for f in reversed(folded) if f["seat"] == r["seat"])
+            if last["state"] == r["state"] and last.get("doing", "") == r.get("doing", ""):
+                continue
+        folded.append(dict(r))
+    ends = {}
+    for r in reversed(folded):  # newest first
+        r["live"] = r["seat"] not in ends
+        r["duration"] = (time.time() if r["live"] else ends[r["seat"]]) - r["time"]
+        ends[r["seat"]] = r["time"]
+    return list(reversed(folded))[:limit]
 
 
 def remember_window(seat, pid):
@@ -507,17 +513,23 @@ def new_id():
 def send(sender, to, text, quiet=False, private=False):
     """Send a note. Returns (record, warning or None).
 
-    `to` is a seat or "all" (every agent seat except the sender).
+    `to` is a seat, several seats ("claude, grok", "claude+grok" or a list),
+    or "all" (every agent seat except the sender). Several seats make one
+    note with several recipients, so it's shown and logged once.
     """
     text = text.strip()
     if not text:
         raise ValueError("the note is empty")
-    if to == "all":
-        targets = [s for s in tuple(AGENTS) + APP_SEATS if s != sender]
-    elif to in SEATS:
-        targets = [to]
+    names = to if isinstance(to, (list, tuple)) else re.split(r"[\s,+]+", str(to).strip().lower())
+    names = list(dict.fromkeys(n.strip().lstrip("@") for n in names if n.strip()))
+    unknown = [n for n in names if n not in SEATS and n != "all"]
+    if unknown or not names:
+        raise ValueError(f"unknown seat {(unknown or [to])[0]!r}; seats are: {', '.join(SEATS)}, all")
+    if "all" in names:
+        to, targets = "all", [s for s in tuple(AGENTS) + APP_SEATS if s != sender]
     else:
-        raise ValueError(f"unknown seat {to!r}; seats are: {', '.join(SEATS)}, all")
+        targets = names
+        to = "+".join(names)
     warning = None
     if looks_secret(text) and not private:
         private = True
@@ -629,7 +641,7 @@ def render(records, seat):
     lines = []
     for r in records:
         tags = [t for t, on in (("quiet", r.get("quiet")), ("private", r.get("private"))) if on]
-        to = "" if r.get("to") == seat else f" (to {r.get('to')})"
+        to = "" if r.get("to") == seat else f" (to {str(r.get('to')).replace('+', ', ')})"
         tag = f" [{', '.join(tags)}]" if tags else ""
         lines.append(f"From {r['from']}{to} at {r['time'][11:16]}{tag}:\n{r['text']}")
     senders = sorted({r["from"] for r in records} & set(SEATS))
@@ -1912,7 +1924,8 @@ def post_discord():
             path.unlink(missing_ok=True)
             continue
         who = r["from"].title()
-        name = f"{who} → {r['to'].title()}" if r["kind"] == "message" else f"{who} (commentary)"
+        to_names = "Everyone" if r["to"] == "all" else ", ".join(t.title() for t in r["to"].split("+"))
+        name = f"{who} → {to_names}" if r["kind"] == "message" else f"{who} (commentary)"
         text = r["text"] if len(r["text"]) <= 1900 else r["text"][:1900] + " …"
         body = json.dumps({"username": name[:80], "content": text,
                            "allowed_mentions": {"parse": []}}).encode()
@@ -2007,7 +2020,7 @@ def chat_lines(r, width):
     name = lambda seat: "You" if seat == "owner" else seat.title()
     who = f"{esc}1;38;5;{colour(r['from'])}m{name(r['from'])}{esc}0m"
     if r["kind"] == "message":
-        to = "everyone" if r["to"] == "all" else name(r["to"])
+        to = "everyone" if r["to"] == "all" else ", ".join(name(t) for t in r["to"].split("+"))
         head = f"{who} {esc}2m→{esc}0m {esc}38;5;{colour(r['to'])}m{to}{esc}0m"
         tags = "".join(f"  {esc}2m{t}{esc}0m" for t, on in
                        (("quiet", r.get("quiet")), ("private", r.get("private"))) if on)
@@ -2059,6 +2072,16 @@ def when(ts):
     t = time.localtime(ts)
     same_day = time.strftime("%Y%m%d", t) == time.strftime("%Y%m%d")
     return time.strftime("%H:%M" if same_day else "%a %H:%M", t)
+
+
+def span(seconds):
+    """A duration for the activity timers: 45s, 12m 05s, 1h 12m."""
+    seconds = int(max(0, seconds))
+    if seconds < 60:
+        return f"{seconds}s"
+    if seconds < 3600:
+        return f"{seconds // 60}m {seconds % 60:02d}s"
+    return f"{seconds // 3600}h {seconds % 3600 // 60:02d}m"
 
 
 def ago(seconds):
@@ -2143,11 +2166,14 @@ def usage_panel(width):
         lines.append("")
         for r in activity:
             seat, st = r["seat"], r["state"]
+            clock = span(r["duration"])
+            timer = (f"\033[1;38;5;{STATE_COLOURS.get(st, 245)}m{clock:>8} ▶\033[0m" if r["live"]
+                     else f"\033[2m{clock:>8}  \033[0m")
             lines.append(f"  \033[2m{time.strftime('%H:%M', time.localtime(r['time']))}\033[0m  "
                          f"\033[38;5;{colour(seat)}m{seat.title():7}\033[0m "
-                         f"\033[38;5;{STATE_COLOURS.get(st, 245)}m{st}\033[0m")
-            if st == "busy" and r.get("doing"):
-                lines.append(f"\033[2m           {r['doing']}\033[0m")
+                         f"\033[38;5;{STATE_COLOURS.get(st, 245)}m{st[:13]:13}\033[0m {timer}")
+            if r["live"] and st == "busy" and r.get("doing"):
+                lines.append(f"\033[2m           {r['doing'][:inner - 12]}\033[0m")
     return [fit(" " + line, width) for line in lines]
 
 
@@ -2221,11 +2247,8 @@ def chat(history=200, hide_private=False):
         if error:
             notice, notice_until = error, time.time() + 6
             return False
-        sent = []
-        for seat in seats:
-            record, _ = send("owner", seat, line)
-            sent.append(record["to"])
-        notice, notice_until = "sent to " + ", ".join(sent), time.time() + 4
+        record, _ = send("owner", seats, line)
+        notice, notice_until = "sent to " + record["to"].replace("+", ", "), time.time() + 4
         return True
 
     def handle_keys():
@@ -2503,8 +2526,9 @@ MCP_TOOLS = [
                     "seconds: at the end of their current turn, or typed into their window "
                     "if they're idle. Use quiet for FYIs that shouldn't wake anyone.",
      "inputSchema": {"type": "object", "required": ["to", "text"], "properties": {
-         "to": {"type": "string", "enum": list(SEATS) + ["all"],
-                "description": "A seat, 'owner' (desktop notification) or 'all' agents."},
+         "to": {"type": "string",
+                "description": "A seat, several seats separated by commas (e.g. 'claude, grok'), "
+                               "'owner', or 'all'. Seats: " + ", ".join(SEATS) + "."},
          "text": {"type": "string"},
          "quiet": {"type": "boolean", "description": "Don't wake them; they get it next time."},
          "private": {"type": "boolean", "description": "Keep out of the public log and Discord."}}}},
@@ -2879,6 +2903,11 @@ def self_test():
     check("private names are redacted in copies that leave the machine",
           any(q and q["text"] == "the owner asked; Zanzibarish stays" for q in queued)
           and "zanzibar asked" in logged, str([q["text"] for q in queued if q])[-200:])
+    r = run(["send", "grok, gravity", "for two"], "claude")
+    two = [json.loads(l) for l in Path(f"{tmp}/data/log.jsonl").read_text().splitlines()][-1]
+    check("a note to several seats is one note, in each inbox",
+          two["to"] == "grok+gravity" and list(Path(f"{tmp}/data/inbox/gravity").glob(f"{two['id']}.json"))
+          and list(Path(f"{tmp}/data/inbox/grok").glob(f"{two['id']}.json")), str(two))
     r = run(["send", "nobody", "x"], "claude")
     check("unknown seat is refused", r.returncode != 0)
     rpc = "\n".join(json.dumps(m) for m in [
@@ -3055,12 +3084,16 @@ def self_test():
     check("set_status updates what the activity log shows", acts[-1].get("doing") == "reviewing PR #12",
           str(acts[-1]))
     act = Path(f"{tmp}/data/activity.jsonl")
-    base = time.time()
+    base = time.time() - 20  # all in the past, so the live entry has run 10 s
     act.write_text("".join(json.dumps({"time": base + t, "seat": "alice", "state": st, "doing": ""}) + "\n"
                            for t, st in ((0, "busy"), (0.1, "idle"), (0.2, "busy"), (10, "idle"))))
+    view = recent_activity(10, act)
     check("flicker under 3 s is left out of the activity view",
-          [r["state"] for r in recent_activity(10, act)] == ["idle", "busy"],
-          str([r["state"] for r in recent_activity(10, act)]))
+          [r["state"] for r in view] == ["idle", "busy"], str([r["state"] for r in view]))
+    check("activity entries carry timers: a finished span, and a live one",
+          abs(view[1]["duration"] - 9.8) < 0.01 and not view[1]["live"]
+          and view[0]["live"] and 9.5 < view[0]["duration"] < 12,
+          str(view))
     check("an activity line never shows a secret",
           describe("deploy with token: ghp_" + "a" * 30) == "(something private)")
     check("a delivered note is described by its sender and first line",
