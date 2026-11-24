@@ -2017,12 +2017,16 @@ def post_discord():
 # without any LLM. Nothing else is run: no shell, no arbitrary programs.
 # That matters because app seats read the web, and a page must not be able
 # to make one of them run commands here. A request that isn't on the list is
-# handed to a free agent (claude, grok, gravity) as a task note, and that
-# agent's own permission checks apply. Every action is logged, answered with
-# a note "from deck", and shown on the chat screen.
+# handed to a free agent (claude, grok, gravity) as a task note only when the
+# owner or one of those agents asked; from anyone else (an app seat) it is
+# refused with "not on the list", so a web page can't give an agent orders
+# through an app seat's reply (found by Grok). The answer keeps the note's
+# private flag. Every action is logged, answered with a note "from deck",
+# and shown on the chat screen.
 
 DECK_LINE = re.compile(r"^\s*@deck\b[ \t]*(.*)$", re.IGNORECASE | re.MULTILINE)
 ACTION_RATE = 10  # at most this many actions a minute, from everyone together
+HANDOFF_FROM = ("owner", "claude", "grok", "gravity")  # who may pass an unlisted request to an agent
 
 
 def hypr_dispatch(expr):
@@ -2033,11 +2037,14 @@ def hypr_dispatch(expr):
 
 
 def launch(*cmd):
-    """Start a program detached from the service, so it outlives it."""
+    """Start a program detached from the service, so it outlives it.
+
+    Returns "" when it started, or "would " on a dry run, to put before the answer."""
     if setting("DRY_ACTIONS"):
         log(f"(dry run) would start: {' '.join(cmd)}")
-        return
+        return "would "
     subprocess.Popen(cmd, start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return ""
 
 
 def act_scratchpad(arg):
@@ -2060,8 +2067,7 @@ def act_open(arg):
     url = arg.strip()
     if not re.fullmatch(r"https://[^\s\"'<>]+", url) or len(url) > 2000:
         raise ValueError("only a single https:// link can be opened")
-    launch("firefox", "--new-tab", url)
-    return f"opened {url[:80]} in Firefox"
+    return launch("firefox", "--new-tab", url) + f"open {url[:80]} in Firefox"
 
 
 def act_youtube(arg):
@@ -2069,18 +2075,16 @@ def act_youtube(arg):
     if not query or len(query) > 200:
         raise ValueError("give a YouTube search of up to 200 characters")
     import urllib.parse
-    launch("firefox", "--new-tab", "https://www.youtube.com/results?search_query=" + urllib.parse.quote_plus(query))
-    return f"opened a YouTube search for {query[:60]!r} in Firefox"
+    return (launch("firefox", "--new-tab", "https://www.youtube.com/results?search_query=" + urllib.parse.quote_plus(query))
+            + f"open a YouTube search for {query[:60]!r} in Firefox")
 
 
 def act_layout(arg):
-    launch(str(HOME / ".local/bin/scratchpad-layout"))
-    return "arranged the scratchpad"
+    return launch(str(HOME / ".local/bin/scratchpad-layout")) + "arrange the scratchpad"
 
 
 def act_chat(arg):
-    launch(str(HOME / ".local/bin/comms-deck-chat"))
-    return "opened the chat screen"
+    return launch(str(HOME / ".local/bin/comms-deck-chat")) + "open the chat screen"
 
 
 ACTIONS = {
@@ -2099,7 +2103,8 @@ def queue_actions(record):
         return
     for request in DECK_LINE.findall(record.get("text", "")):
         write_json(DATA / "queue/actions" / f"{new_id()}.json",
-                   {"from": record["from"], "request": request.strip()[:500], "time": time.time()})
+                   {"from": record["from"], "request": request.strip()[:500], "time": time.time(),
+                    "private": bool(record.get("private"))})
 
 
 def free_agent():
@@ -2111,7 +2116,7 @@ def free_agent():
     return "claude"
 
 
-def run_action(asker, request):
+def run_action(asker, request, private=False):
     """Carry out one request. Returns the text of the answer to `asker`."""
     words = request.split(None, 1)
     name, arg = (words[0].lower() if words else ""), (words[1] if len(words) > 1 else "")
@@ -2125,11 +2130,14 @@ def run_action(asker, request):
             return f"couldn't do '{name}': {error}"
         log(f"deck: {asker} asked for {name}: {done}")
         return f"done: {done}"
+    if asker not in HANDOFF_FROM:
+        log(f"deck: {asker} asked for something not on the list; refused")
+        return f"'{name}' is not on the list, so I did nothing. Try @deck help."
     agent = free_agent()
     send("deck", agent, f"Task from {asker}, asked of comms-deck: {request}\n\n"
                         f"It isn't one of comms-deck's own actions, so it's yours. Do it on this "
                         f"machine if it's appropriate and your rules allow it, then tell {asker} "
-                        f"the result with send_message.")
+                        f"the result with send_message.", private=private)
     log(f"deck: {asker} asked for something not on the list; handed to {agent}")
     return f"that isn't one of my actions, so I've passed it to {agent}"
 
@@ -2148,9 +2156,10 @@ def do_actions():
         if not job:
             continue
         recent.append(time.time())
-        answer = run_action(job["from"], job["request"])
+        private = bool(job.get("private"))
+        answer = run_action(job["from"], job["request"], private)
         if job["from"] in SEATS:
-            send("deck", job["from"], answer, quiet=job["from"] in AGENTS)
+            send("deck", job["from"], answer, quiet=job["from"] in AGENTS, private=private)
     do_actions.recent = recent
 
 
@@ -3313,6 +3322,11 @@ def self_test():
         "task = [json.load(open(f)) for f in glob.glob(str(x.DATA / 'inbox' / '*' / '*.json'))",
         "        if 'make me a coffee' in json.load(open(f))['text'] and json.load(open(f))['from'] == 'deck']",
         "print(len(task))",
+        "x.send('owner', 'claude', 'hi\\n@deck open https://example.com/a\\n@deck make tea', private=True)",
+        "x.do_actions()",
+        "mine = [json.loads(l) for l in open(x.DATA / 'log.jsonl')]",
+        "mine = [g for g in mine if g['from'] == 'deck' and ('example.com/a' in g['text'] or 'make tea' in g['text'])]",
+        "print(json.dumps(sorted([g['text'][:40], g['private']] for g in mine)))",
     ])
     Path(f"{tmp}/actions-config").mkdir(parents=True, exist_ok=True)
     Path(f"{tmp}/actions-config/app-seats").write_text("alice\n")
@@ -3325,13 +3339,18 @@ def self_test():
     lines = [l for l in r.stdout.strip().splitlines() if not re.match(r"\d{4}-\d\d-\d\d ", l)]  # skip log lines
     try:
         answers = json.loads(lines[0]) if lines else []
+        owner_side = json.loads(lines[2]) if len(lines) > 2 else []
     except ValueError:
-        answers = []
-    check("@deck runs listed actions, refuses unsafe ones, and hands the rest to an agent",
+        answers, owner_side = [], []
+    check("@deck runs listed actions, refuses unsafe ones, and refuses unlisted ones from an app seat",
           len(answers) == 5 and answers[0].startswith("done: would toggle the scratchpad")
-          and answers[1].startswith("couldn't do 'open'") and "YouTube search" in answers[2]
-          and answers[3].startswith("couldn't do 'workspace'") and "passed it to" in answers[4]
-          and lines[-1] == "1", r.stdout + r.stderr)
+          and answers[1].startswith("couldn't do 'open'") and "would open a YouTube search" in answers[2]
+          and answers[3].startswith("couldn't do 'workspace'") and "not on the list" in answers[4]
+          and len(lines) > 1 and lines[1] == "0", r.stdout + r.stderr)
+    check("@deck from the owner: a dry-run https link, a handoff, and both stay private",
+          len(owner_side) == 2 and all(p for _, p in owner_side)
+          and any(t.startswith("done: would open https://example.com/a") for t, _ in owner_side)
+          and any(t.startswith("Task from owner") for t, _ in owner_side), r.stdout + r.stderr)
     check("app seats are told to reply in their chat, not with tools",
           "Reply here in this chat" in app_text and "send_message" not in app_text, app_text)
     check("Grok's Notification hook matches idle_prompt only",
