@@ -68,7 +68,12 @@ the owner.
 - **USAGE** (right): context used, plan limits with time left and reset time
   (Claude's 5-hour and weekly limits), session tokens and cost, and the Grok
   Bot account's weekly limit (shared by all bots, shown once). A seat with
-  no data is left out rather than shown empty. Grok's figures are read from
+  no data is left out rather than shown empty. The USAGE line shows a live
+  **~$ total (estimate)**: the sum of the session costs the agents report
+  themselves. Claude Code estimates its cost at Anthropic's API list prices
+  (on a subscription that's an equivalent, not a bill); Grok reports its
+  own cost ledger. The Grok Bot account only reports a % of its weekly
+  limit, so it isn't in the dollar total. Grok's figures are read from
   its own session files, so they don't depend on Grok's status line.
 - **ACTIVITY** (right): each change of a seat's state, newest first.
 - **The status bar** (bottom): each seat's light and state (busy, idle,

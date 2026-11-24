@@ -1968,7 +1968,26 @@ def usage_panel(width):
     """The lines of the right-hand panel: context, limits and cost per seat."""
     inner = width - 2
     bar_w = max(6, inner - 16)
-    lines = [f"\033[1mUSAGE\033[0m", ""]
+    # A running total of the session costs the agents report themselves
+    # (Claude Code's estimate at Anthropic's API list prices; Grok's own cost
+    # ledger). Recomputed on every redraw. Seats that report no dollars (the
+    # Grok Bot account gives only a % of its weekly limit) aren't counted.
+    total, counted = 0.0, []
+    for seat in tuple(AGENTS) + APP_SEATS:
+        cost = dig((read_json(DATA / "usage" / f"{seat}.json", {}) or {}).get("data", {}),
+                   "cost", "total_cost_usd")
+        if isinstance(cost, (int, float)) and cost > 0:
+            total += cost
+            counted.append(seat.title())
+    head = "\033[1mUSAGE\033[0m"
+    if counted:
+        money = f"~${total:,.2f} est."
+        gap = max(1, inner - 5 - len(money))
+        head += " " * gap + f"\033[1;38;5;220m{money}\033[0m"
+    lines = [head]
+    if counted:
+        lines.append(f"\033[2m  {' + '.join(counted)}'s own figures · Grok Bot: no $\033[0m")
+    lines.append("")
     shown_account = False
     for seat in tuple(AGENTS) + APP_SEATS:
         record = read_json(DATA / "usage" / f"{seat}.json")
