@@ -1854,8 +1854,19 @@ def wake_failure_reason(error):
     return reason[:120]
 
 
+def squash(text):
+    """Text with every run of whitespace made one space. The chat box turns each
+    newline into a paragraph, so an exact match never finds our note in it."""
+    return re.sub(r"\s+", " ", text or "").strip()
+
+
+APP_RETRY = (60, 900)  # after a failed send: wait 60 s, doubling, at most 15 min
+
+
 def deliver_app_notes(seat, state, cdp):
     """take() the waiting notes, type them, and put them back if the send fails."""
+    if time.time() < float(state.get("app_retry_at") or 0):
+        return False  # backing off after a failed send, not retrying every pass
     snap = app_snapshot(cdp, seat, with_usage=False)
     if not app_delivery_allowed(snap, app_window_focused(), state, seat):
         return False
@@ -1863,24 +1874,25 @@ def deliver_app_notes(seat, state, cdp):
     if not notes:
         return False
     text = render(notes, seat)
-    marker = text[:120]
+    marker = squash(text)[:120]
+    in_box = lambda: marker in squash(composer_text_now(cdp))
     update_seat(seat, state="busy", auto=next_auto(state, notes), woke_at=time.time(),
                 app_seen=time.time(), app_page="grok-bot", doing=describe_notes(notes))
     try:
         if not cdp_eval(cdp, _FOCUS_JS):
             raise RuntimeError("no composer")
         cdp.call("Input.insertText", {"text": text})
-        if marker in (composer_text_now(cdp) or ""):
+        if in_box():
             if not app_click_send_button(cdp):
                 app_press_enter(cdp)
             time.sleep(0.4)
-        if marker in (composer_text_now(cdp) or ""):
+        if in_box():
             app_press_enter(cdp)
             time.sleep(0.3)
         deadline = time.time() + 1.5
-        while marker in (composer_text_now(cdp) or "") and time.time() < deadline:
+        while in_box() and time.time() < deadline:
             time.sleep(0.2)
-        if marker in (composer_text_now(cdp) or ""):
+        if in_box():
             cdp_eval(cdp, _FOCUS_JS)
             app_clear_composer(cdp)
             time.sleep(0.2)
@@ -1891,16 +1903,19 @@ def deliver_app_notes(seat, state, cdp):
         # Compare with runs of whitespace collapsed: the chat renders blank lines
         # differently, and a strict match called a sent note failed and sent it twice.
         landed = cdp_eval(cdp, "(() => { const squash = t => (t||'').replace(/\\s+/g,' ').trim();"
-                          " const want = squash(" + json.dumps(marker) + ");"
+                          " const want = " + json.dumps(marker) + ";"
                           " return [...document.querySelectorAll('.sand-message')]"
                           ".some(m => m.getAttribute('data-role')==='user' && squash(m.innerText).includes(want)); })()")
         if not landed:
             raise RuntimeError("the note never reached the chat")
     except Exception as error:
         restore_notes(seat, notes)
-        update_seat(seat, state="idle", app_seen=time.time())
-        log(f"couldn't wake {seat}: send failed: {wake_failure_reason(error)}")
+        fails = int(state.get("app_fails") or 0) + 1
+        wait = min(APP_RETRY[0] * 2 ** (fails - 1), APP_RETRY[1])
+        update_seat(seat, state="idle", app_seen=time.time(), app_fails=fails, app_retry_at=time.time() + wait)
+        log(f"couldn't wake {seat}: send failed: {wake_failure_reason(error)}; next try in {wait}s")
         return False
+    update_seat(seat, app_fails=0, app_retry_at=0)
     log(f"woke {seat} with {len(notes)} note(s)")
     return True
 
@@ -3783,6 +3798,9 @@ def self_test():
         "ch, st = x.draft_status({'app_draft': 'w', 'app_draft_since': 1000.0}, 'wh', 5000.0); assert ch['app_draft_since'] == 5000.0 and not st",
         "ch, st = x.draft_status({'app_draft': 'w', 'app_draft_since': 1000.0}, '', 5000.0); assert ch == {'app_draft': '', 'app_draft_since': 0} and not st",
         "ch, st = x.draft_status({}, None, 5000.0); assert ch == {} and not st",
+        "assert x.squash('a\\n\\n\\n\\n b  c ') == 'a b c'",
+        "assert x.squash(None) == ''",
+        "assert x.deliver_app_notes('alice', {'app_retry_at': x.time.time() + 60}, None) is False",
         "two = [{'from':'owner','to':'alice','time':'2026-11-24 07:00:00','text':'hi'},"
         " {'from':'gravity','to':'all','time':'2026-11-24 07:00:00','text':'yo'}]",
         "x.APP_SEATS = tuple(set(x.APP_SEATS) | {'alice'})",
