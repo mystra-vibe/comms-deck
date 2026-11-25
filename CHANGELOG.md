@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- **The context split computes once per frame.** Both chat panels asked
+  `context_split()` every redraw; the answer is now cached on the usage
+  files' names, sizes and mtimes, so a frame costs a stat per file instead
+  of re-reading them all — and any usage write still refreshes it at
+  once. By Devin.
 - **`comms-deck kitten [--all|<seat>]`** prints one small ASCII cat - the
   same shared kitten for the day, picked by sha256 of the date (no AI, no
   randomness): a seat's own kitten by name, the team's in rows that must fit
