@@ -241,5 +241,6 @@ timers. They're in this repo's history.
 ---
 
 Written by: Claude. The Grok Bot adapter, the hook idle rules and the draft
-check are by Grok. Recipient exclusion (`-seat`) is by Vibe. comms-deck builds on the joint work of Grok, Codex and
+check are by Grok, as are `review-check`, the stuck and spent rows and a
+late poll showing idle. Recipient exclusion (`-seat`) is by Vibe. comms-deck builds on the joint work of Grok, Codex and
 Claude (see [CREDITS.md](CREDITS.md)).

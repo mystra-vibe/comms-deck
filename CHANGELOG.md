@@ -21,47 +21,51 @@
 - **Codex's usage limit read off its screen**, with a countdown to the reset
   (#41). By Claude. Vibe found and reviewed the fix for an unreadable reset
   time that rewrote the mark every 30 seconds.
-
-## quantum-kittens (2026-11-24)
-
-The easy start guide is [quantum-kittens.md](quantum-kittens.md).
-
-- **Out of usage, with a countdown.** An agent whose plan limit is full
-  shows a grey `○ idle until Tue 05:08 · 6d 21h 52m`, from its usage meter
-  or from `comms-deck spent <seat> <time>` for agents with no meter. It
-  clears itself at the reset (#27).
-- **ACTIVITY sorted by availability.** Ready, busy, stuck, away; then
-  fewest notes waiting; idle until is always last. Idle now reads "ready" (#33).
-- **One availability score** (`availability()`, `most_available()`) for the
-  panel and for picking who gets a task, the base for the load balancer. A
-  spent agent whose seat file still says idle is no longer picked (#34).
-- **Lumo's row**: busy or ready from her own tool calls, and a countdown to
-  her next check (#28).
-- **App-seat delivery fixed.** The "did it land" check ignores whitespace,
-  so a sent batch is no longer typed twice. The deck clears its own
-  leftover text. A draft left untouched for 10 minutes is saved to the
-  owner and cleared; the row says "draft in box" meanwhile. Replies go to
-  the owner, not whichever sender sorts first (#29, #31).
-- **`@deck` desktop actions** from a fixed list; unlisted requests from app
-  seats are refused (#18). **`comms-deck review-check`** (#23).
-- **Chat views** full, half and small (#26), and **scratchpad-keeper**, a
-  user service that keeps the scratchpad arranged at login and when windows
-  change, leaving hand moves alone (#32).
-- **Under each ACTIVITY row, six words on what is outstanding**: what the
-  agent says it is doing while busy, otherwise the oldest note waiting
-  (a private note shows only "private note"). No count; the blue squares
-  count. The self-test no longer pops up desktop notifications (#31).
-
-## Unreleased
-
 - **A late check drops to idle.** A seat that only polls (Lumo) shows idle,
-  not stuck and not busy, once her expected check is late. Notes stay queued.
+  not stuck and not busy, once her expected check is late. Notes stay
+  queued. By Grok (#43, reviewed by Vibe).
 - **Recovery is written down.** [docs/REDUNDANCY.md](docs/REDUNDANCY.md)
   says what still works when a seat is down, how another agent brings it
   back, and how to recover the program and the pushed notes from GitHub
   when the machine is gone. The public cold-start manual is
   [navigation-control-system](https://github.com/whyyyyyai/navigation-control-system).
   No new program. Vendor chat transcripts are still not copied anywhere.
+  By Grok (#25).
+
+## quantum-kittens (2026-11-24)
+
+The easy start guide is [quantum-kittens.md](quantum-kittens.md), by Grok,
+with follow-ups by Claude (#35). Each entry names who wrote it.
+
+- **Out of usage, with a countdown.** An agent whose plan limit is full
+  shows a grey `○ idle until Tue 05:08 · 6d 21h 52m`, from its usage meter
+  or from `comms-deck spent <seat> <time>` for agents with no meter. It
+  clears itself at the reset. By Claude (#27), building on Grok's stuck row
+  (#21) and spent row (#24).
+- **ACTIVITY sorted by availability.** Ready, busy, stuck, away; then
+  fewest notes waiting; idle until is always last. Idle now reads "ready". By Claude (#33).
+- **One availability score** (`availability()`, `most_available()`) for the
+  panel and for picking who gets a task, the base for the load balancer. A
+  spent agent whose seat file still says idle is no longer picked. By
+  Claude (#34).
+- **Lumo's row**: busy or ready from her own tool calls, and a countdown to
+  her next check. By Claude (#28).
+- **App-seat delivery fixed.** The "did it land" check ignores whitespace,
+  so a sent batch is no longer typed twice. The deck clears its own
+  leftover text. A draft left untouched for 10 minutes is saved to the
+  owner and cleared; the row says "draft in box" meanwhile. Replies go to
+  the owner, not whichever sender sorts first. By Claude (#29, #31).
+- **`@deck` desktop actions** from a fixed list; unlisted requests from app
+  seats are refused. By Claude (#18). **`comms-deck review-check`**, by
+  Grok (#23).
+- **Chat views** full, half and small (#26), and **scratchpad-keeper**, a
+  user service that keeps the scratchpad arranged at login and when windows
+  change, leaving hand moves alone. By Claude (#26, #32).
+- **Under each ACTIVITY row, six words on what is outstanding**: what the
+  agent says it is doing while busy, otherwise the oldest note waiting
+  (a private note shows only "private note"). No count; the blue squares
+  count. The self-test no longer pops up desktop notifications. By Claude
+  (#31, #35).
 
 ## comms-deck 2.0 (2026-11-24)
 
@@ -133,4 +137,5 @@ folder.
 
 ---
 
-Written by: Claude.
+Written by: Claude, from the pull requests. Each entry names its author:
+Grok, Vibe and Claude so far.
