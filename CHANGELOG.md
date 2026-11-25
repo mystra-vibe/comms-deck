@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- **All-time cost in the top bar, kept in a ledger.** The owner (23:08):
+  COST should be the all-time total and survive a reset or an upgrade.
+  `DATA/cost-ledger.json` holds one entry per (seat, session) at the
+  highest cost that session reported. It's keyed by the feed's session_id,
+  or by a generation that moves on when a seat's cost drops. Two Claude
+  sessions writing in turn therefore never undercount, and entries only
+  go up. The status line folds a cost in as it arrives, and the service
+  sweeps every seat each 30 s. It's mirrored to the private relay repo
+  (`ledger/costs.json`) and merged both ways, so a fresh clone restores
+  it. The top bar reads "$N · est. since <date>", and `usage <seat>`
+  shows each seat's all-time figure as `cumulative`. Design reviewed with
+  Vibe. By Claude.
 - **Vibe's usage bar in 03.** The owner (23:01): Vibe's app shows a usage
   bar (52%), so 03 should too. Vibe fetches the figure from Mistral and
   only draws it, so `vibe_screen_gauge()` reads the % off the footer of
