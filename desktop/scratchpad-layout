@@ -4,8 +4,11 @@
     +-----------+-----------+-----------------------+
     |   Grok    | Grok Bot  |     chat (small)      |
     +-----------+-----------+-----------+-----------+
-    |        Claude         |   Lumo    |  Gravity  |
-    +-----------------------+-----------+-----------+
+    |        Claude         | Lumo, Gravity, Devin  |
+    +-----------------------+-----------------------+
+
+The bottom right is shared by whichever of Lumo, Gravity and Devin are
+open, side by side in that order: one open window gets the whole cell.
 
 Finds each window by what runs in it (the kitty holding `grok`, `claude` or
 `agy`) or by its app (Grok Bot, Lumo, the small comms-deck chat), moves it to
@@ -84,17 +87,31 @@ def plan_layout(mon, clients, tree):
     quarter_w = (half_w - GAP_IN) // 2
     lower_y, lower_h = y0 + half_h + GAP_IN, height - half_h - GAP_IN
     right_x, right_w = x0 + half_w + GAP_IN, width - half_w - GAP_IN
-    lumo_w = (right_w - GAP_IN) // 2
     by_class = lambda cls: next((c for c in clients if c["class"] == cls), None)
+    shared = [("Lumo", by_class("lumo-desktop")), ("Gravity", window_holding(clients, tree, "agy")),
+              ("Devin", window_holding(clients, tree, "devin"))]
     return [
         ("Grok", window_holding(clients, tree, "grok"), x0, y0, quarter_w, half_h),
         ("Grok Bot", by_class("grok-bot"), x0 + quarter_w + GAP_IN, y0, half_w - quarter_w - GAP_IN, half_h),
         ("Chat", by_class("comms-deck-chat-small"), right_x, y0, right_w, half_h),
         ("Claude", window_holding(clients, tree, "claude"), x0, lower_y, half_w, lower_h),
-        ("Lumo", by_class("lumo-desktop"), right_x, lower_y, lumo_w, lower_h),
-        ("Gravity", window_holding(clients, tree, "agy"), right_x + lumo_w + GAP_IN, lower_y,
-         right_w - lumo_w - GAP_IN, lower_h),
-    ]
+    ] + share_row(shared, right_x, lower_y, right_w, lower_h)
+
+
+def share_row(windows, x, y, w, h):
+    """Split one cell side by side among the windows that are open.
+
+    `windows` is [(label, window or None)]. Closed ones are listed with no
+    place (so they're reported as skipped) and take no room.
+    """
+    open_ones = [(label, win) for label, win in windows if win]
+    n = max(len(open_ones), 1)
+    each = (w - GAP_IN * (n - 1)) // n
+    plan = []
+    for i, (label, win) in enumerate(open_ones):
+        width = w - (each + GAP_IN) * (n - 1) if i == n - 1 else each  # the last takes the remainder
+        plan.append((label, win, x + i * (each + GAP_IN), y, width, h))
+    return plan + [(label, None, x, y, w, h) for label, win in windows if not win]
 
 
 def arrange(quiet=False, keep_hand_moves=False):
