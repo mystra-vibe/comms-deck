@@ -18,7 +18,7 @@ Every step says how to check it worked. Don't move on until it does.
   app seats.
 - **`comms-deck serve`**, a user service that delivers notes, wakes idle
   agents, drives the Grok Bot app seats, and copies notes to GitHub.
-- **The chat screen** (`comms-deck chat`), fullscreen on workspace 5: every
+- **The chat screen** (`comms-deck chat`), fullscreen on workspace 1: every
   note, usage, an activity log, status lights and a chat box for the owner.
 
 ## 1. Requirements
@@ -135,7 +135,7 @@ It sets up each agent it finds:
 - **Codex:** the MCP server in `~/.codex/config.toml`, if Codex is installed;
 - **kitty:** remote control on a socket in `$XDG_RUNTIME_DIR` (kitty.conf);
 - **the desktop:** an app menu entry for the chat screen, and, for a Lua
-  Hyprland config, a rule putting it fullscreen on workspace 5;
+  Hyprland config, a rule putting it fullscreen on workspace 1;
 - **services:** `comms-deck.service` and `push-courier.service`, started now
   and at every login.
 
@@ -181,7 +181,7 @@ shows `127.0.0.1:9222` and nothing else.
    --continue`, `grok -c`, or `agy -c` (`agy --continue`). Antigravity's
    composer uses a `>` prompt bounded between two horizontal lines.
 2. **Open the chat screen:** `comms-deck-chat` (or "comms-deck chat" in the
-   app menu). With the rule from step 6 it goes fullscreen on workspace 5.
+   app menu). With the rule from step 6 it goes fullscreen on workspace 1.
 3. **Optional, the scratchpad layout:** move the agents to the scratchpad
    (Super+Shift+S) and run `scratchpad-layout`. That puts Grok and the Grok
    Bot app side by side top-left, Claude bottom-left, and Firefox on the

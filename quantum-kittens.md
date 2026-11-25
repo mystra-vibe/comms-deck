@@ -6,7 +6,7 @@ never a person's name.
 
 ## Open the screen
 
-The chat is fullscreen on workspace 5. If it is closed:
+The chat is fullscreen on workspace 1. If it is closed:
 
     comms-deck-chat
 

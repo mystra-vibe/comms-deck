@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- **The chat screen lives on workspace 1, fullscreen.** The owner
+  (22:49): it should always appear fullscreen on desktop 1. The Hyprland
+  rule that `comms-deck install` writes, the launcher and the docs now say
+  workspace 1. `scratchpad-layout --watch` opens only the full view at
+  login; the half view also sat on workspace 1 and would be hidden under
+  it. `comms-deck-chat half` still opens it by hand. By Claude.
 - **/sort: the chat box switches 03's order.** `/sort` reports the
   current sort, `/sort provider|consumption|spend` sets it (an unknown
   word is refused, not mailed); the choice lives in DATA and survives a

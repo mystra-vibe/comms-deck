@@ -33,7 +33,7 @@ owner, on one Linux desktop (Hyprland, kitty):
   Notes for you arrive on their own, starting with `[comms-deck]`: at the
   end of your turn if you're working, before your next model call (Gravity),
   or pasted into your window if you're idle. You never need to check.
-- **The chat screen** (`comms-deck chat`, fullscreen on workspace 5) is where
+- **The chat screen** (`comms-deck chat`, fullscreen on workspace 1) is where
   the owner reads and writes. It shows every note, each agent's usage, an
   activity log and a status light per seat.
 - **The push courier** ([`push-courier`](push-courier)) pushes branches for

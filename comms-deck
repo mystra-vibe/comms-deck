@@ -5857,7 +5857,7 @@ def install(yes):
     def desktop():
         """The chat screen's launcher, the scratchpad layout, an app menu
         entry, and (for a Lua Hyprland config) the rule that puts the chat
-        screen fullscreen on workspace 5."""
+        screen fullscreen on workspace 1."""
         for name in ("comms-deck-chat", "scratchpad-layout"):
             link(name, here / "desktop" / name)
         apps = HOME / ".local/share/applications"
@@ -5870,13 +5870,13 @@ def install(yes):
         lua = HOME / ".config/hypr/hyprland.lua"
         if lua.exists() and "comms-deck-chat" not in lua.read_text():
             with open(lua, "a") as f:
-                f.write('\n-- comms-deck chat: the agents\' live notes, fullscreen on workspace 5.\n'
+                f.write('\n-- comms-deck chat: the agents\' live notes, fullscreen on workspace 1.\n'
                         'hl.window_rule({\n    name       = "comms-deck-chat",\n'
                         '    match      = { class = "^comms-deck-chat$" },\n'
-                        '    workspace  = "5 silent",\n    fullscreen = true,\n})\n')
+                        '    workspace  = "1 silent",\n    fullscreen = true,\n})\n')
             subprocess.run(["hyprctl", "reload"], capture_output=True)
     step("link the chat screen launcher and scratchpad-layout, add an app menu entry, "
-         "and the Hyprland rule for workspace 5 (Lua config)", desktop)
+         "and the Hyprland rule for workspace 1 (Lua config)", desktop)
 
     def antigravity():
         if not (HOME / ".local/bin/agy").exists() and not shutil.which("agy"):
