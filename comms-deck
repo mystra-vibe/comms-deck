@@ -3110,9 +3110,12 @@ def refresh_screen_limits():
         stored = None if reset == math.inf else reset
         if mark.get("set_by") != "screen" and spent_mark(seat) is not None:
             continue  # a hand-set mark wins
-        if mark.get("set_by") == "screen" and mark.get("resets_at") == stored:
-            continue
+        if mark.get("set_by") == "screen" and (
+                mark.get("resets_at") == stored
+                or (stored is None and mark.get("reset_unknown"))):
+            continue  # already marked from this message; don't rewrite every pass
         write_json(path, {"resets_at": stored if stored is not None else time.time() + 86400 * 7,
+                          "reset_unknown": stored is None,
                           "set_by": "screen", "set_at": time.time()})
         log(f"{seat}: its screen says usage limit; spent until {when(reset) if stored else 'unknown (7d)'}")
 
@@ -4013,6 +4016,14 @@ def self_test():
         "t = x.screen_limit_reset(\"You've hit your usage limit. Try again at 3:02 PM.\", now); d = dt.datetime.fromtimestamp(t)",
         "assert (d.hour, d.minute) == (15, 2) and now < t <= now + 86400",
         "assert x.screen_limit_reset(\"You've hit your usage limit. Try again at teatime.\", now) == x.math.inf",
+        "real_kitty, real_log = x.kitty, x.log; x.log = lambda *a, **k: None; x.kitty = lambda *a: \"You've hit your usage limit. Try again at teatime.\"",
+        "x.update_seat('codex', state='idle', kitty_socket='unix:/nowhere', kitty_window=1)",
+        "x.refresh_screen_limits(); first = x.read_json(x.DATA / x.SPENT_DIR / 'codex.json')",
+        "assert first and first['set_by'] == 'screen' and first['reset_unknown']",
+        "x.refresh_screen_limits(); assert x.read_json(x.DATA / x.SPENT_DIR / 'codex.json') == first, 'unknown reset rewritten'",
+        "x.kitty = lambda *a: 'all fine here'; x.refresh_screen_limits()",
+        "assert x.read_json(x.DATA / x.SPENT_DIR / 'codex.json') is None",
+        "x.kitty, x.log = real_kitty, real_log; x.update_seat('codex', kitty_socket=None, kitty_window=None)",
         "assert x.poll_countdown({}, now) == \"hasn't checked yet\"",
         "assert x.poll_countdown({'polled_at': now - 18}, now) == 'next check in 0:42'",
         "assert x.poll_countdown({'polled_at': now - 125, 'poll_gap': 60}, now) == 'check late 1:05'",
