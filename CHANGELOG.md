@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- **The dot box polished.** The CONTEXT SPLIT box's glow wave now runs
+  straight through the row break instead of tilting and resetting (the
+  phase is the dot's flat index, at the bars' speed), the legend follows
+  the box instead of arrival order, and the total line falls back to
+  "across N seats" when the name list doesn't fit the column instead of
+  being chopped mid-name. From the #82 review. By Vibe.
 - **The context split moves right.** The CONTEXT SPLIT pie and its
   per-seat bars now sit at the foot of the right-hand column, under
   TASKS; the left usage column keeps the per-seat meters and the
