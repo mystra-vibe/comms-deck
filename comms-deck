@@ -2820,7 +2820,7 @@ def context_split():
     return out
 
 
-def context_pie(split, width):
+def context_pie(split, width, step=None):
     """The CONTEXT SPLIT lines: a text pie of live context, colour per seat.
 
     Drawn from characters, since the chat is a terminal: each dot is a cell
@@ -2828,11 +2828,14 @@ def context_pie(split, width):
     quarter of the tokens is a quarter of the disc. Biggest slice starts at
     12 o'clock. beside the disc, one legend row per seat, then one total row
     naming the seats in it (grok's ask). Reports the context now, not
-    lifetime session tokens. Returns [] when nobody reports a figure.
+    lifetime session tokens. The disc breathes with the redraw clock
+    (pulse_step), dimmer and quieter than the bars, so it shimmers without
+    strobing. Returns [] when nobody reports a figure.
     """
     if not split:
         return []
     esc = "\033["
+    step = pulse_step() if step is None else step
     total = sum(used for _, used in split)
     box = max(9, min(width - 2, 17))          # cells across the disc
     height = max(max(box // 2 + 1, len(split)), 5)  # chars are twice as tall as wide
@@ -2855,7 +2858,7 @@ def context_pie(split, width):
             for start, seat in reversed(wedges):
                 if frac >= start - 1e-9:
                     break
-            cells += f"{esc}38;5;{colour(seat)}m·{esc}0m"
+            cells += f"{esc}{pulse_style(colour(seat), (i * 2 + j + step) % 8)}m·{esc}0m"
         disc.append(cells)
     legend = [f"{esc}38;5;{colour(seat)}m■{esc}0m {seat:8} {100 * used / total:4.1f}%  {esc}2m{short_tokens(used)}{esc}0m"
               for seat, used in split]
@@ -2869,26 +2872,61 @@ def context_pie(split, width):
     return lines
 
 
-def context_rows(split, width):
+PULSE_EVERY = 1.2  # seconds per shimmer step; the screen redraws every 1-2 s
+
+
+def pulse_style(colour_code, phase):
+    """The ANSI code for one cell of pulsing material this step.
+
+    The hue never changes -- the seat's colour from the key -- it breathes
+    through dim, normal and bold, so any terminal shows shimmer without
+    inventing a second palette.
+    """
+    if phase in (0, 1):
+        return f"2;38;5;{colour_code}"   # shadow
+    if phase in (4, 5):
+        return f"1;38;5;{colour_code}"   # highlight
+    return f"38;5;{colour_code}"
+
+
+def pulse_step():
+    """The current shimmer step: the redraw clock drives the pulsing."""
+    return int(time.time() // PULSE_EVERY)
+
+
+def context_rows(split, width, step=None):
     """One small bar per reporting seat, under the pie: the seat's colour.
 
     Each bar shows how full that seat's context window is (not its share of
     the total, which is the pie's job), so a seat near its limit stands out
     at a glance. A seat reports over 100% when its meter's tokens pass the
     model's nominal window (compaction pulls it back): the fill caps at
-    full but the number stays honest.
+    full but the number stays honest. The bars pulse -- the owner wants
+    them holographic: a brightness wave along the seat's colour and a white
+    glint sweeping left to right, foil rather than strobe. `step` freezes
+    the phase (tests); None means the redraw clock.
     """
     if not split:
         return []
     esc = "\033["
+    step = pulse_step() if step is None else step
     bar_w = max(4, min(10, width - 15))
     lines = []
     for seat, _ in split:
         d = (read_json(DATA / "usage" / f"{seat}.json", {}) or {}).get("data", {}) or {}
         pct = context_percent(d) or 0.0
+        c = colour(seat)
         full = round(bar_w * min(pct, 100.0) / 100)
-        fill = f"{esc}38;5;{colour(seat)}m{'█' * full}{esc}38;5;238m{'░' * (bar_w - full)}{esc}0m"
-        lines.append(f"{esc}38;5;{colour(seat)}m■{esc}0m {seat:8} {fill} {pct:3.0f}%"
+        glint = (step * 2) % (bar_w + 4) - 2  # the white speck travels with time
+        cells = []
+        for pos in range(bar_w):
+            if pos >= full:
+                cells.append(f"{esc}0;38;5;238m░{esc}0m")  # the track stays still and dim
+            elif pos == glint:
+                cells.append(f"{esc}1;38;5;255m█{esc}0m")  # the foil's white glint
+            else:
+                cells.append(f"{esc}{pulse_style(c, (pos + step) % 8)}m█{esc}0m")
+        lines.append(f"{esc}38;5;{c}m■{esc}0m {seat:8} {''.join(cells)} {pct:3.0f}%"
                      + (" over the window" if pct > 100 else ""))
     return lines
 
@@ -4620,6 +4658,14 @@ def self_test():
         "assert 'grok' in ct and '112%' in ct and 'over the window' in ct, ct  # over the nominal window says so",
         "assert '25%' in ct or '26%' in ct, ct  # gravity is drawn from its % x size figure",
         "assert x.context_rows([], 40) == [], 'no figure, no bars'",
+        "cr0 = x.context_rows(sp2, 40, step=0); cr3 = x.context_rows(sp2, 40, step=3)",
+        "assert cr0 != cr3, 'the shimmer moves with the step'",
+        "assert '38;5;45' in cr0[0], 'grok\\'s line keeps grok\\'s hue'",
+        "assert '38;5;255' in ''.join(cr3), 'a glint sweeps the bar; not a strobe'",
+        "pt0 = x.context_pie(sp, 40, step=0); pt5 = x.context_pie(sp, 40, step=5)",
+        "assert pt0 != pt5, 'the disc breathes too'",
+        "assert '38;5;' + str(x.SEAT_COLOURS['grok']) in ''.join(pt0) or '38;5;45' in ''.join(pt0), 'the disc keeps the key as well'",
+        "assert x.pulse_style(208, 0) == '2;38;5;208' and x.pulse_style(208, 4) == '1;38;5;208', 'dim, then bold'",
         "x.DATA = real_data",
         "assert x.poll_countdown({}, now) == \"hasn't checked yet\"",
         "assert x.poll_countdown({'polled_at': now - 18}, now) == 'next check in 0:42'",

@@ -6,7 +6,9 @@
   panel draws a text pie beside its legend: each seat's share of the live
   context its usage file reports, biggest slice at 12 o'clock, one total
   line naming the seats in it. Under it, one small bar per reporting seat,
-  in the seat's colour, showing how full its own window is. Seats that
+  in the seat's colour, showing how full its own window is. Both pulse,
+  holographic-style: the hue stays the key's, a brightness wave and a
+  white glint ride the redraw clock. Seats that
   report no context figure are left out rather than counted as zero. By
   Vibe, on the owner's ask.
 - **Vibe's usage bar.** The usage panel shows Vibe's context: tokens in use
