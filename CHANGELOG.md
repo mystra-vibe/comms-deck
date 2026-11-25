@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- **Devin joins as the `devin` seat.** It has hooks through Claude's path,
+  the MCP server with `COMMS_DECK_SEAT=devin`, the deck's tools allowed in
+  `~/.config/devin/config.json`, and an install step. Claude's hooks, which
+  Devin also reads, stay quiet inside Devin.
+
 ## quantum-kittens (2026-11-24)
 
 The easy start guide is [quantum-kittens.md](quantum-kittens.md).
