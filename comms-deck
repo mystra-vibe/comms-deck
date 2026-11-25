@@ -219,6 +219,9 @@ def setting(name, default=None):
 
 
 DATA = Path(setting("HOME") or HOME / ".local/share/comms-deck")
+# The top bar's notification queue: mako's on-notify runs bar-ticker-enqueue,
+# which appends {"text": ...} here and waybar scrolls it. The deck mirrors it.
+NOTIFY_QUEUE = Path(setting("NOTIFY_QUEUE") or HOME / ".local/state/bar-ticker/queue.jsonl")
 CONFIG = Path(setting("CONFIG") or HOME / ".config/comms-deck")
 WEBHOOK_FILE = CONFIG / "discord-webhook"
 
@@ -2546,10 +2549,15 @@ def serve():
     """Run forever: wake agents, drive Grok Bot seats, refresh usage, copy records, mirror to Discord."""
     log(f"comms-deck serving on {MACHINE}; data in {DATA}")
     last_sync, discord_wait_until, last_usage = 0.0, 0.0, 0.0
+    notify_pos = 0
     while True:
         if fresh_code():
             log("the program changed on disk; restarting the service on the new code")
             run_fresh()
+        try:
+            notify_pos = refresh_notifications(notify_pos)
+        except Exception as error:  # the bar feed is a nicety; never stop the service for it
+            log(f"couldn't mirror notifications: {error}")
         for seat in AGENTS:
             try:
                 try_wake(seat)
@@ -3360,6 +3368,103 @@ def usage_panel(width):
     return [fit(" " + line, width) for line in lines]
 
 
+def refresh_notifications(pos=0):
+    """Mirror new bar-ticker queue lines into DATA/notifications.jsonl.
+
+    Mako's on-notify already drops do-not-disturb and dismisses the popup;
+    the queue is exactly the text the top bar scrolls, so the deck shows
+    the same feed without replacing waybar or mako. `pos` is the byte
+    offset already copied; returns the new one. A missing queue (other
+    machines, self-test) is a no-op.
+    """
+    try:
+        size = NOTIFY_QUEUE.stat().st_size
+    except OSError:
+        return pos
+    if size < pos:
+        pos = 0
+    if size == pos:
+        return pos
+    try:
+        with NOTIFY_QUEUE.open("r", encoding="utf-8") as handle:
+            handle.seek(pos)
+            raw = handle.read()
+            pos = handle.tell()
+    except OSError:
+        return pos
+    out = DATA / "notifications.jsonl"
+    now = time.time()
+    wrote = False
+    try:
+        DATA.mkdir(parents=True, exist_ok=True)
+        with out.open("a", encoding="utf-8") as handle:
+            for line in raw.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    item = json.loads(line)
+                except ValueError:
+                    continue
+                text = item.get("text") if isinstance(item, dict) else None
+                if text:
+                    handle.write(json.dumps({"time": now, "text": text}, ensure_ascii=False) + "\n")
+                    wrote = True
+    except OSError:
+        return pos
+    if wrote:
+        trim_notifications()
+    return pos
+
+
+def trim_notifications(keep=500, max_lines=5000):
+    """Keep notifications.jsonl bounded: past max_lines, rewrite the tail."""
+    path = DATA / "notifications.jsonl"
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return
+    if len(lines) <= max_lines:
+        return
+    tmp = path.parent / (path.name + ".tmp")
+    try:
+        tmp.write_text("\n".join(lines[-keep:]) + "\n", encoding="utf-8")
+        tmp.replace(path)
+    except OSError:
+        pass
+
+
+def notify_lines(width, count=6):
+    """The NOTIFICATIONS block for the right column: what the top bar scrolled.
+
+    Newest first, dimmed, with the age on the left. Only the tail of
+    notifications.jsonl is read, so the redraw stays cheap as it grows.
+    """
+    path = DATA / "notifications.jsonl"
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()[-count:]
+    except OSError:
+        return []
+    items = []
+    for line in lines:
+        try:
+            r = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(r, dict) and r.get("text"):
+            items.append(r)
+    if not items:
+        return []
+    limit = max(10, width - 14)
+    out = ["", "\033[1mNOTIFICATIONS\033[0m", ""]
+    for r in reversed(items):
+        text = str(r["text"])
+        if len(text) > limit:
+            text = text[: limit - 1] + "…"
+        out.append(f"\033[2m{ago(time.time() - float(r.get('time') or 0)):>7}\033[0m {text}")
+    return out
+
+
 def activity_panel(width):
     """The ready-order column: one row per agent, marks and waiting squares.
 
@@ -3719,7 +3824,7 @@ def chat(history=200, hide_private=False):
                     else:
                         usage_panel.running = False  # no usage column: don't let a stale True spin the clock
                         usg = []
-                    act = activity_panel(panel_w) if panel_w else []
+                    act = (activity_panel(panel_w) + notify_lines(panel_w)) if panel_w else []
                     usg = (fit_column(usg, body) + [""] * body)[:body]
                     right = (fit_column(act, body) + [""] * body)[:body]
                     screen = ["\033[H", deck_header(cols), "\n"]
@@ -5554,6 +5659,25 @@ def self_test():
         "assert 'PLAN USAGE' in pl_t and 'codex' in pl_t and '40%' in pl_t, pl_t  # the 5-hour figure shows",
         "assert pl_t.index('codex') < pl_t.index('gravity') if 'gravity' in pl_t else True, pl_t  # sorted highest first",
         "x.DATA = real_data",
+        # The top bar's notification queue mirrors into the deck's feed.
+        "nd = x.Path(x.tempfile.mkdtemp()); real_nd, real_nq = x.DATA, x.NOTIFY_QUEUE",
+        "x.DATA = nd; x.NOTIFY_QUEUE = nd / 'queue.jsonl'",
+        "assert x.notify_lines(40) == [], 'no queue, no feed'",
+        "nq = x.NOTIFY_QUEUE",
+        "nq.write_text('{\"text\": \"first note\"}\\nnot json\\n{\"text\": \"second — body\"}\\n')",
+        "p = x.refresh_notifications(0); assert p == nq.stat().st_size",
+        "nt = (x.DATA / 'notifications.jsonl').read_text()",
+        "assert nt.count(chr(10)) == 2 and 'first note' in nt and 'second — body' in nt and 'not json' not in nt, nt",
+        "assert x.refresh_notifications(p) == p, 'nothing new, nothing copied'",
+        "with nq.open('a') as h: h.write('{\"text\": \"third\"}\\n')",
+        "x.refresh_notifications(p)",
+        "nl = x.notify_lines(40); nt_t = ' '.join(x.ANSI.sub('', l) for l in nl)",
+        "assert 'NOTIFICATIONS' in nt_t and 'third' in nt_t and 'first note' in nt_t, nt_t",
+        "assert nt_t.index('third') < nt_t.index('first note'), 'newest first'",
+        "x.trim_notifications(keep=2, max_lines=2)",
+        "tl = (x.DATA / 'notifications.jsonl').read_text().splitlines()",
+        "assert len(tl) == 2 and 'first note' not in ''.join(tl) and 'third' in ''.join(tl), tl",
+        "x.DATA, x.NOTIFY_QUEUE = real_nd, real_nq",
         "col = ['USAGE', '', 'A', '  updated 1s ago', '', 'B', '  updated 2s ago', '', 'C']",
         "assert x.fit_column(col, 20) == col",  # fits: untouched
         "assert x.fit_column(col, 7) == ['USAGE', '', 'A', '', 'B', '', 'C']",  # footers go first
