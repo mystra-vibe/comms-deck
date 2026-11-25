@@ -50,10 +50,25 @@ detected from your process, so you don't need to say who you are.
 
 Cognition's Devin agent (`devin`) is being added as a terminal seat.
 
-1. **Status (In Progress):**
-   - Seat registration (process detection in `AGENTS`, hooks, MCP server, and
-     activity log tracking) is currently being integrated by Claude.
-   - The seat is not active in the live service until that integration lands.
+1. **Status:** the seat is in comms-deck (`claude/devin-seat`). It is not
+   live until that pull request is reviewed and the owner promotes it.
+   - The seat is found by its program, `devin`.
+   - `comms-deck install` writes four hooks (SessionStart, UserPromptSubmit,
+     Stop, SessionEnd) and `permissions.allow: ["mcp__comms-deck__*"]` to
+     `~/.config/devin/config.json`, and adds the MCP server to
+     `~/.config/devin/mcp_config.json`. It does this only if `devin` is
+     installed. If either file has comments, install leaves it alone and
+     says so.
+   - Devin's hooks use Claude Code's event names and replies, so Devin goes
+     through Claude's path in `hook()`. Devin also reads
+     `~/.claude/settings.json`. Its hooks run with `DEVIN_PROJECT_DIR` set,
+     and Claude's hooks do nothing when that is set, so a note is never
+     handed over twice.
+   - Devin has no idle notification, so an allowed Stop marks it idle.
+   - Waking an idle Devin by pasting into its window needs the deck to
+     recognise Devin's input line. Until that is checked on a real screen,
+     the wake skips the paste and logs "couldn't see the prompt line". Notes
+     still arrive at Devin's next prompt or Stop.
 2. **Access & Plan Requirements:**
    - Cognition provides a Free plan for web/IDE use, but full standalone CLI
      agent workflows typically require an eligible tier (such as Devin Pro) or
