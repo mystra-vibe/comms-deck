@@ -81,8 +81,16 @@ the owner.
   limit, so it isn't in the dollar total. Grok's figures are read from
   its own session files, so they don't depend on Grok's status line.
   Gravity's row is the model name from its hooks. agy does not report
-  token or quota figures there, so that row has no bar.
+  token or quota figures there, so that row has no bar. Devin has no
+  status line either; its row comes from the OTLP metrics the CLI exports
+  to the service (session tokens and model, no cost or plan limit).
 - **ACTIVITY** (right): each change of a seat's state, newest first.
+- **NOTIFICATIONS** (under ACTIVITY, right): the notifications the top
+  bar scrolls, newest first with their age. The service mirrors the
+  queue mako's `on-notify` already writes for waybar
+  (`~/.local/state/bar-ticker/queue.jsonl`, override with
+  `COMMS_DECK_NOTIFY_QUEUE`), so do-not-disturb filtering stays exactly
+  as the bar has it and nothing replaces waybar or mako.
 - **The status bar** (bottom): each seat's light and state (busy, idle,
   away, chat not open, not set up), how long it has been that way, and how
   many notes are waiting.
@@ -149,6 +157,8 @@ each agent it finds:
   `~/.vibe/hooks.toml`, and a `[[mcp_servers]]` entry named `comms-deck` in
   `~/.vibe/config.toml`, if `vibe` is installed. Other hooks are kept.
 - **Codex:** the MCP server in `~/.codex/config.toml`.
+- **Devin:** hooks, the MCP server, the deck's tool permission and the OTLP
+  metrics endpoint in `~/.config/devin/`, if `devin` is installed.
 
 It also turns on kitty remote control and starts `comms-deck.service` and
 `push-courier.service`. It's safe to run again. Then **open fresh kitty
@@ -237,6 +247,16 @@ journalctl --user -u comms-deck -f                         # the service's log
 | [`docs/BRANCHING.md`](docs/BRANCHING.md) | How code moves from `test` to `main` to `live`. |
 | [`docs/REDUNDANCY.md`](docs/REDUNDANCY.md) | How the deck keeps going when seats are down, and how to recover the program and the notes from GitHub when the machine is gone. |
 | [`docs/REMOTE.md`](docs/REMOTE.md) | How an agent on another device becomes a remote seat and joins the chat through the git repos. |
+
+**Other repos this needs, or that rebuild it** (all public):
+
+| Repo | What it is |
+| --- | --- |
+| [navigation-control-system](https://github.com/whyyyyyai/navigation-control-system) | Rebuild the desktop and this deck from nothing. Start here after an outage. |
+| [quantum-kittens](https://github.com/whyyyyyai/quantum-kittens) | Easy start on a machine that's up; `LAUNCH.md` and the no-AI login launcher. |
+| [load-balancer](https://github.com/whyyyyyai/load-balancer) | The task board: one holder per owner request. comms-deck loads it if `~/.local/bin/load-balancer` exists (`comms-deck install` links it from `~/load-balancer`). |
+| [chronophage](https://github.com/whyyyyyai/chronophage) | The no-AI watchdog that wakes a stuck seat. |
+| [lumo-seat](https://github.com/whyyyyyai/lumo-seat) | What the Lumo seat reads to use its tools. |
 
 ## History
 

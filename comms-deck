@@ -6,6 +6,7 @@
   comms-deck read [--peek]                               show (and take) your notes
   comms-deck note <text...>                              add to the running commentary
   comms-deck status                                      who is busy, idle or away
+  comms-deck usage [--days N]                            notes, activity and plan limits
   comms-deck watch                                       print notes as they are sent
   comms-deck chat [--hide-private]                       full-screen live view of the notes
   comms-deck serve                                       the background service
@@ -14,6 +15,8 @@
   comms-deck statusline --source <claude|grok|agy>       status line (feeds the usage panel; agy has none)
   comms-deck install [--yes]                             set this machine up
   comms-deck self-test                                   run the tests in a temp folder
+  comms-deck status --json                               every seat as JSON (for watchdogs)
+  comms-deck wake <seat> [--stale]                       one wake attempt; --stale clears a stuck busy
   comms-deck spent <seat> <+166h|06:20|YYYY-MM-DD HH:MM|clear>
                                                          show a seat spent, counting down to its reset
   comms-deck review-check <PR#>                          fail unless another seat reviewed it
@@ -141,6 +144,7 @@ import argparse
 import base64
 import fcntl
 import hashlib
+import http.server
 import json
 import math
 import os
@@ -148,10 +152,12 @@ import re
 import secrets
 import shutil
 import socket
+import sqlite3
 import struct
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -219,6 +225,9 @@ def setting(name, default=None):
 
 
 DATA = Path(setting("HOME") or HOME / ".local/share/comms-deck")
+# The top bar's notification queue: mako's on-notify runs bar-ticker-enqueue,
+# which appends {"text": ...} here and waybar scrolls it. The deck mirrors it.
+NOTIFY_QUEUE = Path(setting("NOTIFY_QUEUE") or HOME / ".local/state/bar-ticker/queue.jsonl")
 CONFIG = Path(setting("CONFIG") or HOME / ".config/comms-deck")
 WEBHOOK_FILE = CONFIG / "discord-webhook"
 
@@ -659,6 +668,15 @@ def send(sender, to, text, quiet=False, private=False):
     record = {"kind": "message", "id": new_id(), "from": sender or "unknown",
               "to": to, "time": now(), "machine": MACHINE,
               "quiet": bool(quiet), "private": bool(private), "text": text}
+    balancer = load_balancer() if sender == "owner" else None
+    if balancer:
+        try:
+            task = balancer.create_task(record, targets)
+        except Exception as error:  # the note must still go out
+            task = None
+            log(f"load-balancer couldn't make a task: {error}")
+        if task:
+            record["task"] = task["id"]
     for seat in targets:
         if seat == "owner":
             notify(f"Note from {record['from']}", text)
@@ -685,6 +703,59 @@ def add_note(sender, text):
     queue_out(record)
     append_log(record)
     return record
+
+
+# -- Load balancer: the task board, in its own repo -----------------------------
+# The owner (2026-11-25): requests to several agents were being picked up by
+# two or three of them at once. The task board that stops this lives in its
+# own repo, https://github.com/whyyyyyai/load-balancer: a note from the owner
+# to two or more agents becomes one task with one holder, chosen by the
+# program, and the holder keeps it only while it can work on it.
+#
+# comms-deck loads it if it's installed (~/.local/bin/load-balancer, or
+# $COMMS_DECK_LOAD_BALANCER) and hands it this module, so it uses the deck's
+# own availability ranking, mailbox and notes. Without it, nothing changes:
+# no tasks, and every note is delivered exactly as before.
+_balancer = None
+
+
+class _DeckView:
+    """This module's globals as attributes, read live.
+
+    The load balancer is handed the deck it runs in. When comms-deck runs as
+    a script that's sys.modules["__main__"], but a loader (a test, another
+    program) may load it without registering it, so this view stands in.
+    """
+
+    def __getattr__(self, name):
+        try:
+            return globals()[name]
+        except KeyError:
+            raise AttributeError(name) from None
+
+    def __setattr__(self, name, value):
+        globals()[name] = value
+
+
+def load_balancer():
+    """The load-balancer module, attached to this deck, or None if it isn't installed."""
+    global _balancer
+    if _balancer is None:
+        path = Path(setting("LOAD_BALANCER") or HOME / ".local/bin/load-balancer")
+        _balancer = False
+        if path.exists():
+            try:
+                import importlib.machinery
+                import importlib.util
+                loader = importlib.machinery.SourceFileLoader("load_balancer", str(path))
+                spec = importlib.util.spec_from_loader("load_balancer", loader)
+                module = importlib.util.module_from_spec(spec)
+                loader.exec_module(module)
+                module.attach(sys.modules.get(__name__) or _DeckView())
+                _balancer = module
+            except Exception as error:  # a broken balancer must never stop the deck
+                log(f"load-balancer at {path} didn't load: {error}")
+    return _balancer or None
 
 
 PRIVATE_NAMES_FILE = CONFIG / "private-names"
@@ -785,7 +856,11 @@ def team_snapshot(seat, records):
         waiting = len(pending(other))
         rows.append(f"{other} {st}{began}, {waiting} waiting")
     text = f"Team at {time.strftime('%H:%M')}: " + "; ".join(rows) + "."
-    shared = [r for r in records if r.get("to") == "all" or "+" in str(r.get("to"))]
+    balancer = load_balancer()
+    board = [t for t in balancer.all_tasks() if t["state"] in balancer.TASK_ACTIVE][-5:] if balancer else []
+    if board:
+        text += " Tasks: " + "; ".join(f"{t['id']} {t.get('holder') or 'open'}" for t in board) + "."
+    shared = [r for r in records if (r.get("to") == "all" or "+" in str(r.get("to"))) and not r.get("task")]
     if shared:
         text += (" This note went to more than one agent. Before starting work on it, check "
                  "who is already on it (team_status, or ask). If it was sent a while ago and "
@@ -802,12 +877,25 @@ def render(records, seat):
         to = "" if r.get("to") == seat else f" (to {str(r.get('to')).replace('+', ', ')})"
         tag = f" [{', '.join(tags)}]" if tags else ""
         lines.append(f"From {r['from']}{to} at {r['time'][11:16]} ({note_age(r)}){tag}:\n{r['text']}")
+        balancer = load_balancer() if r.get("task") else None
+        task = balancer.load_task(r.get("task")) if balancer else None
+        if task and task["state"] in balancer.TASK_ACTIVE:
+            holder = task.get("holder")
+            if holder == seat:
+                lines.append(f"Task {task['id']} is YOURS (picked by the deck). Do it, then "
+                             f"`done_task {task['id']}`; `release_task {task['id']}` if you can't.")
+            elif holder:
+                lines.append(f"Task {task['id']} is {holder}'s. Don't start it yourself; "
+                             f"help only if {holder} asks.")
+            else:
+                lines.append(f"Task {task['id']} is open: nobody was free. `claim_task {task['id']}` "
+                             f"to take it.")
     lines.append(team_snapshot(seat, records))
     senders = sorted({r["from"] for r in records} & set(SEATS))
     reply = (f"\n\nReply with the send_message tool (to: {senders[0]})"
              f" or `comms-deck send {senders[0]} \"...\"`." if senders else "")
-    if seat in APP_SEATS:
-        # An app seat reads this in its own chat and has no comms-deck tools:
+    if seat in APP_SEATS and APP_PROCESS.get(seat, "grok-bot") == "grok-bot":
+        # A Grok Bot seat reads this in its own chat and has no comms-deck tools:
         # its chat reply is picked up and filed, so tell it how that works.
         who = "owner" if "owner" in senders or not senders else senders[0]  # not just the first alphabetically
         return (f"{MARK} {len(records)} note(s) for {seat}:\n\n" + "\n\n".join(lines)
@@ -1090,7 +1178,8 @@ def agy_hook(event):
 # owner, 09:00). Vibe keys a tool's permission as [tools.<server>_<tool>]:
 # checked live, where [tools."mcp_comms_deck.<tool>"] (the name it shows) and
 # [tools.mcp_comms_deck_<tool>] both still asked.
-VIBE_ALLOWED_TOOLS = ("team_status", "read_messages", "send_message", "add_note", "set_status")
+VIBE_ALLOWED_TOOLS = ("team_status", "read_messages", "send_message", "add_note", "set_status",
+                      "tasks", "claim_task", "release_task", "done_task")
 
 
 def grant_vibe_tools(config):
@@ -1392,6 +1481,8 @@ def try_wake(seat):
         return False
     if not any(not r.get("quiet") for _, r in pending(seat)):
         return False
+    if seat_spent(seat):
+        return False  # out of usage: its notes wait in the inbox until the reset, not lost in a dead turn
     if state["auto"] >= AUTO_LIMIT and not owner_waiting(seat):
         pause_notice(seat)
         return False
@@ -2567,11 +2658,17 @@ def do_actions():
 def serve():
     """Run forever: wake agents, drive Grok Bot seats, refresh usage, copy records, mirror to Discord."""
     log(f"comms-deck serving on {MACHINE}; data in {DATA}")
+    threading.Thread(target=otel_serve, daemon=True).start()
     last_sync, discord_wait_until, last_usage = 0.0, 0.0, 0.0
+    notify_pos = 0
     while True:
         if fresh_code():
             log("the program changed on disk; restarting the service on the new code")
             run_fresh()
+        try:
+            notify_pos = refresh_notifications(notify_pos)
+        except Exception as error:  # the bar feed is a nicety; never stop the service for it
+            log(f"couldn't mirror notifications: {error}")
         for seat in AGENTS:
             try:
                 try_wake(seat)
@@ -2592,9 +2689,19 @@ def serve():
             except Exception as error:  # usage is a nicety; never stop the service for it
                 log(f"couldn't read Grok's usage: {error}")
             try:
+                refresh_devin_usage()
+            except Exception as error:
+                log(f"couldn't read Devin's usage: {error}")
+            try:
                 refresh_vibe_usage()
             except Exception as error:  # the same: never stop the service for it
                 log(f"couldn't read Vibe's usage: {error}")
+            balancer = load_balancer()
+            if balancer:
+                try:
+                    balancer.refresh_tasks()  # keep every task with someone who can do it
+                except Exception as error:
+                    log(f"load-balancer pass failed: {error}")
             try:
                 refresh_screen_limits()
             except Exception as error:  # never stop the service for it
@@ -2826,11 +2933,32 @@ def countdown(reset, now=None):
     return f"back in {minutes}m {seconds:02d}s"
 
 
+def metric_time(seconds):
+    """A countdown to the millisecond, metric style: '6d 19:12:07.456',
+    '1:12:05.000', '42:05.500'. The owner asked for ms on the ACTIVITY
+    cooldowns (the deck redraws fast while one is live)."""
+    ms = max(0, int(round(seconds * 1000)))
+    days, ms = divmod(ms, 86400000)
+    hours, ms = divmod(ms, 3600000)
+    minutes, ms = divmod(ms, 60000)
+    secs, ms = divmod(ms, 1000)
+    if days:
+        return f"{days}d {hours:02d}:{minutes:02d}:{secs:02d}.{ms:03d}"
+    if hours:
+        return f"{hours}:{minutes:02d}:{secs:02d}.{ms:03d}"
+    return f"{minutes}:{secs:02d}.{ms:03d}"
+
+
 def idle_until(reset, now=None):
-    """'idle until Tue 05:08 · 6d 21h 53m': when a spent agent is back, and how long that is."""
+    """'idle until Tue 05:08 · 6d 19:12:07.456': when a spent agent is back,
+    to the millisecond while the row counts down."""
     if reset is None or reset == math.inf:
         return "idle until its limit resets"
-    return f"idle until {when(reset)} · {countdown(reset, now)[len('back in '):]}"
+    left = reset - (time.time() if now is None else now)
+    # Metric time to the ms once the row counts down live (< 1 h, when the
+    # screen redraws fast); the coarse countdown beyond that.
+    tail = metric_time(left) if left < 3600 else countdown(reset, now)[len("back in "):]
+    return f"idle until {when(reset)} · {tail}"
 
 
 # The ACTIVITY list is sorted by how available each agent is, most available
@@ -3326,6 +3454,9 @@ def usage_panel(width):
                 used = size * pct / 100
             if isinstance(used, (int, float)) and isinstance(size, (int, float)):
                 lines.append(f"\033[2m           {short_tokens(used)} of {short_tokens(size)} tokens\033[0m")
+        elif isinstance(dig(d, "context_window", "context_tokens"), (int, float)):
+            # A count with no known window size (Devin's db reports tokens only).
+            lines.append(f"  Context  {short_tokens(dig(d, 'context_window', 'context_tokens'))} tokens")
         for label, key in (("5-hour", "five_hour"), ("Weekly", "seven_day")):
             used = dig(d, "rate_limits", key, "used_percentage")
             if isinstance(used, (int, float)):
@@ -3342,6 +3473,14 @@ def usage_panel(width):
         cost = dig(d, "cost", "total_cost_usd")
         if isinstance(cost, (int, float)):
             bits.append(f"${cost:.2f}" + (" est." if dig(d, "rate_limits") is not None else ""))
+        # OTLP counters (Devin): active seconds and session count sit next to
+        # the token figures under data.otel.metrics.
+        active = dig(d, "otel", "metrics", "devin.active_time.total")
+        if isinstance(active, (int, float)):
+            bits.append("active " + (f"{active / 3600:.1f}h" if active >= 3600 else f"{active / 60:.0f}m"))
+        sessions = dig(d, "otel", "metrics", "devin.session.count")
+        if isinstance(sessions, (int, float)) and sessions:
+            bits.append(f"{sessions:.0f} session{'s' if sessions != 1 else ''}")
         if bits:
             lines.append(f"  Session  {' · '.join(bits)}")
         lines.append(f"\033[2m  updated {ago(time.time() - record.get('time', 0))}\033[0m")
@@ -3357,6 +3496,103 @@ def usage_panel(width):
     if plans:
         lines += plans + [""]
     return [fit(" " + line, width) for line in lines]
+
+
+def refresh_notifications(pos=0):
+    """Mirror new bar-ticker queue lines into DATA/notifications.jsonl.
+
+    Mako's on-notify already drops do-not-disturb and dismisses the popup;
+    the queue is exactly the text the top bar scrolls, so the deck shows
+    the same feed without replacing waybar or mako. `pos` is the byte
+    offset already copied; returns the new one. A missing queue (other
+    machines, self-test) is a no-op.
+    """
+    try:
+        size = NOTIFY_QUEUE.stat().st_size
+    except OSError:
+        return pos
+    if size < pos:
+        pos = 0
+    if size == pos:
+        return pos
+    try:
+        with NOTIFY_QUEUE.open("r", encoding="utf-8") as handle:
+            handle.seek(pos)
+            raw = handle.read()
+            pos = handle.tell()
+    except OSError:
+        return pos
+    out = DATA / "notifications.jsonl"
+    now = time.time()
+    wrote = False
+    try:
+        DATA.mkdir(parents=True, exist_ok=True)
+        with out.open("a", encoding="utf-8") as handle:
+            for line in raw.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    item = json.loads(line)
+                except ValueError:
+                    continue
+                text = item.get("text") if isinstance(item, dict) else None
+                if text:
+                    handle.write(json.dumps({"time": now, "text": text}, ensure_ascii=False) + "\n")
+                    wrote = True
+    except OSError:
+        return pos
+    if wrote:
+        trim_notifications()
+    return pos
+
+
+def trim_notifications(keep=500, max_lines=5000):
+    """Keep notifications.jsonl bounded: past max_lines, rewrite the tail."""
+    path = DATA / "notifications.jsonl"
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return
+    if len(lines) <= max_lines:
+        return
+    tmp = path.parent / (path.name + ".tmp")
+    try:
+        tmp.write_text("\n".join(lines[-keep:]) + "\n", encoding="utf-8")
+        tmp.replace(path)
+    except OSError:
+        pass
+
+
+def notify_lines(width, count=6):
+    """The NOTIFICATIONS block for the right column: what the top bar scrolled.
+
+    Newest first, dimmed, with the age on the left. Only the tail of
+    notifications.jsonl is read, so the redraw stays cheap as it grows.
+    """
+    path = DATA / "notifications.jsonl"
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()[-count:]
+    except OSError:
+        return []
+    items = []
+    for line in lines:
+        try:
+            r = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(r, dict) and r.get("text"):
+            items.append(r)
+    if not items:
+        return []
+    limit = max(10, width - 14)
+    out = ["", "\033[1mNOTIFICATIONS\033[0m", ""]
+    for r in reversed(items):
+        text = str(r["text"])
+        if len(text) > limit:
+            text = text[: limit - 1] + "…"
+        out.append(f"\033[2m{ago(time.time() - float(r.get('time') or 0)):>7}\033[0m {text}")
+    return out
 
 
 def activity_panel(width):
@@ -3377,6 +3613,7 @@ def activity_panel(width):
     snap = panel_scans()  # one shared half-second snapshot for every panel
     lines = ["\033[1mACTIVITY\033[0m", ""]
     activity_panel.ticking = False
+    activity_panel.fast = False  # a live ms countdown redraws at 10 fps, not 1-2 s
     rows = []
     for order, (seat, st, since) in enumerate(current_states(snap)):
         a = availability(seat, st, snap=snap)
@@ -3386,8 +3623,10 @@ def activity_panel(width):
             began = idle_until(reset)
             if reset is not None and reset - time.time() < 3600:
                 activity_panel.ticking = True  # seconds are shown only in the last hour
+                activity_panel.fast = True    # ...and ms while it counts down
         elif seat in APP_SEATS and APP_PROCESS.get(seat, "grok-bot") != "grok-bot" and st != "not set up":
             activity_panel.ticking = True  # it polls rather than being woken, so show when it next looks
+            activity_panel.fast = True    # its check countdown is in metric time
             began = poll_countdown(snap["seats"].get(seat) or load_seat(seat))
         else:
             began = when(since) if since else ""  # static: "03:27" today, "Fri 18:00" this week, "Nov 12 18:00" further back
@@ -3405,6 +3644,14 @@ def activity_panel(width):
                       + (f" \033[38;5;{square_shade}m{squares}\033[0m" if squares else "")]
                      + ([f"    \033[2m↳ {summary}\033[0m"] if summary else [])))
     lines += [line for row in sorted(rows) for line in row[-1]]
+    balancer = load_balancer()
+    board = [t for t in balancer.all_tasks() if t["state"] in balancer.TASK_ACTIVE] if balancer else []
+    if board:
+        lines += ["", "\033[1mTASKS\033[0m"]
+        for t in board[-6:]:
+            who = t.get("holder") or "open"
+            lines.append(f"  \033[38;5;{colour(who) if t.get('holder') else 245}m{t['id']:4} {who:7}\033[0m "
+                         f"\033[2m{'(private)' if t.get('private') else t['summary']}\033[0m")
     return [fit(" " + line, width) for line in lines]
 
 
@@ -3465,6 +3712,24 @@ def route(text):
     if not [n for n in dict.fromkeys(names) if n not in excludes]:
         return [], f"-{', -'.join(excludes)} leaves nobody to send to"
     return list(dict.fromkeys(names)) + ["-" + s for s in excludes], None
+
+
+def fit_column(lines, height):
+    """A side column's lines, trimmed to fit `height` rows without losing content.
+
+    The "updated 3s ago" footers go first, then the blank spacer lines. Only
+    if it still doesn't fit is the bottom cut. (The owner, 2026-11-25: after
+    the context split was added, ACTIVITY and its blue squares were pushed
+    off the bottom of the screen.)
+    """
+    if len(lines) <= height:
+        return lines
+    plain = [re.sub(r"\033\[[0-9;:?]*[A-Za-z]", "", line) for line in lines]
+    lines = [line for line, text in zip(lines, plain) if not text.strip().startswith("updated ")]
+    if len(lines) > height:
+        lines = [line for i, line in enumerate(lines)
+                 if i == 0 or re.sub(r"\033\[[0-9;:?]*[A-Za-z]", "", line).strip()]
+    return lines[:height]
 
 
 class FreshCode(Exception):
@@ -3673,9 +3938,11 @@ def chat(history=200, hide_private=False):
                 # frames for up to an hour. The scans sit behind a
                 # half-second snapshot, so the fast clock doesn't hammer
                 # /proc and the inboxes. Quiet screens keep the old pace --
-                # 0.25 s polls, 1-2 s redraws.
+                # 0.25 s polls, 1-2 s redraws. (#66, devin: a live ms
+                # countdown redraws at 10 fps, between the two.)
                 animating = getattr(usage_panel, "running", False)
-                gap = 1 / 120 if animating else (1 if getattr(activity_panel, "ticking", False) else 2)
+                gap = 1 / 120 if animating else (0.1 if getattr(activity_panel, "fast", False)
+                                                 else 1 if getattr(activity_panel, "ticking", False) else 2)
                 if changed or time.time() - last_draw >= gap:
                     # A fixed top bar (the version, 04:26), the notes, then
                     # the chat box as the last line.
@@ -3687,9 +3954,9 @@ def chat(history=200, hide_private=False):
                     else:
                         usage_panel.running = False  # no usage column: don't let a stale True spin the clock
                         usg = []
-                    act = activity_panel(panel_w) if panel_w else []
-                    usg = (usg + [""] * body)[:body]
-                    right = (act + [""] * body)[:body]
+                    act = (activity_panel(panel_w) + notify_lines(panel_w)) if panel_w else []
+                    usg = (fit_column(usg, body) + [""] * body)[:body]
+                    right = (fit_column(act, body) + [""] * body)[:body]
                     screen = ["\033[H", deck_header(cols), "\n"]
                     for i in range(body):
                         row = (fit(usg[i], usage_w) + f" \033[38;5;238m│\033[0m ") if usage_w else ""
@@ -3745,6 +4012,430 @@ def statusline(source):
     if waiting:
         parts.append(f"{waiting} note(s) waiting")
     print(" · ".join(str(p) for p in parts if p))
+
+
+# --- OTLP metrics: Devin CLI's usage export ---------------------------------
+# Devin has no status line and its hooks carry no usage figures, but the CLI
+# can push OTLP metrics (devin.token.usage and friends) to any HTTP endpoint.
+# `comms-deck serve` listens on 127.0.0.1:OTEL_PORT (default 4318, the OTLP
+# HTTP port) for POST /v1/metrics and folds each data point into a running
+# total per seat, written as usage/<seat>.json so the panel shows it like any
+# other meter. Install points Devin's otel.metrics_endpoint here and sets no
+# logs endpoint, so prompts and tool text are never exported.
+
+OTEL_PORT = int(setting("OTEL_PORT") or 4318)
+OTEL_ACCUM_DIR = DATA / "usage" / "otel"   # running totals, kept across restarts
+
+
+def _pb_varint(buf, i):
+    """One protobuf varint from buf at i; returns (value, next index)."""
+    result = shift = 0
+    while True:
+        byte = buf[i]
+        i += 1
+        result |= (byte & 0x7F) << shift
+        if not byte & 0x80:
+            return result, i
+        shift += 7
+        if shift > 70:
+            raise ValueError("protobuf varint too long")
+
+
+def pb_fields(buf):
+    """Every (field number, wire type, value) in one protobuf message.
+
+    value is an int for varints and bytes for the other wire types; callers
+    decode further with pb_fields (submessages) or struct (fixed numbers).
+    """
+    fields, i = [], 0
+    while i < len(buf):
+        key, i = _pb_varint(buf, i)
+        number, wire = key >> 3, key & 7
+        if wire == 0:
+            value, i = _pb_varint(buf, i)
+        elif wire == 1:
+            value = buf[i:i + 8]
+            i += 8
+        elif wire == 2:
+            size, i = _pb_varint(buf, i)
+            value = buf[i:i + size]
+            i += size
+        elif wire == 5:
+            value = buf[i:i + 4]
+            i += 4
+        else:
+            break  # groups and bad wire types: stop rather than misparse
+        fields.append((number, wire, value))
+    return fields
+
+
+def _pb_msgs(fields, number):
+    """The submessages stored under `number`."""
+    return [v for n, w, v in fields if n == number and w == 2]
+
+
+def _pb_text(fields, number):
+    """The first string stored under `number`, or None."""
+    for n, w, v in fields:
+        if n == number and w == 2:
+            return v.decode("utf-8", "replace")
+    return None
+
+
+def _pb_attr_map(kv_msgs):
+    """{key: value} from protobuf KeyValue messages (opentelemetry common/v1)."""
+    attrs = {}
+    for msg in kv_msgs:
+        fields = pb_fields(msg)
+        key = _pb_text(fields, 1)
+        if key is None:
+            continue
+        for n, w, v in fields:
+            if n != 2 or w != 2:  # value: an AnyValue submessage
+                continue
+            for an, aw, av in pb_fields(v):
+                if an == 1 and aw == 2:
+                    attrs[key] = av.decode("utf-8", "replace")
+                elif an == 2 and aw == 0:
+                    attrs[key] = bool(av)
+                elif an == 3 and aw == 0:
+                    attrs[key] = av - (1 << 64) if av >= (1 << 63) else av  # int64 varint
+                elif an == 4 and aw == 1 and len(av) == 8:
+                    attrs[key] = struct.unpack("<d", av)[0]
+                elif an == 7 and aw == 2:
+                    attrs[key] = av.decode("utf-8", "replace")
+            break
+    return attrs
+
+
+def _pb_number_point(msg):
+    """(attributes, value) from a protobuf NumberDataPoint, or (attrs, None)."""
+    fields = pb_fields(msg)
+    attrs = _pb_attr_map(_pb_msgs(fields, 7))
+    value = None
+    for n, w, v in fields:
+        if w == 1 and len(v) == 8:
+            if n == 4:   # as_double: fixed64
+                value = struct.unpack("<d", v)[0]
+            elif n == 6:  # as_int: sfixed64
+                value = struct.unpack("<q", v)[0]
+    return attrs, value
+
+
+def _otel_attr_map_json(attrs):
+    """{key: value} from OTLP/JSON attributes ([{key, value:{stringValue...}}])."""
+    out = {}
+    for a in attrs or []:
+        if not isinstance(a, dict):
+            continue
+        value = a.get("value") or {}
+        for k in ("stringValue", "boolValue", "intValue", "doubleValue", "bytesValue"):
+            if k in value:
+                out[str(a.get("key", ""))] = value[k]
+                break
+    return out
+
+
+def _otel_series_json(payload):
+    """[(name, attrs, value, kind, temporality)] from an OTLP/JSON metrics body."""
+    try:
+        doc = json.loads(payload)
+    except (ValueError, TypeError):
+        return []
+    out = []
+
+    def points(name, data, kind, temp):
+        for p in (data or {}).get("dataPoints") or []:
+            if not isinstance(p, dict):
+                continue
+            value = p.get("asDouble", p.get("asInt"))
+            try:
+                value = float(value)
+            except (TypeError, ValueError):
+                continue
+            out.append((name, _otel_attr_map_json(p.get("attributes")), value, kind, temp))
+
+    for rm in (doc.get("resourceMetrics") or []):
+        for sm in (rm.get("scopeMetrics") or []):
+            for metric in (sm.get("metrics") or []):
+                if not isinstance(metric, dict):
+                    continue
+                name = metric.get("name")
+                if "sum" in metric:
+                    temp = (metric["sum"] or {}).get("aggregationTemporality")
+                    temp = {"AGGREGATION_TEMPORALITY_DELTA": 1,
+                            "AGGREGATION_TEMPORALITY_CUMULATIVE": 2}.get(temp, temp)
+                    points(name, metric["sum"], "sum", temp)
+                if "gauge" in metric:
+                    points(name, metric["gauge"], "gauge", None)
+    return out
+
+
+def _otel_series_pb(payload):
+    """[(name, attrs, value, kind, temporality)] from an OTLP/protobuf body."""
+    out = []
+    for rm in _pb_msgs(pb_fields(payload), 1):        # resource_metrics
+        for sm in _pb_msgs(pb_fields(rm), 2):         # scope_metrics
+            for metric in _pb_msgs(pb_fields(sm), 2):  # metrics
+                mfields = pb_fields(metric)
+                name = _pb_text(mfields, 1)
+                for kind, fnum in (("sum", 7), ("gauge", 5)):
+                    for data in _pb_msgs(mfields, fnum):
+                        dfields = pb_fields(data)
+                        temp = next((v for n, w, v in dfields if n == 2 and w == 0), None) \
+                            if kind == "sum" else None
+                        for point in _pb_msgs(dfields, 1):  # data_points
+                            attrs, value = _pb_number_point(point)
+                            if value is not None:
+                                out.append((name, attrs, value, kind, temp))
+    return out
+
+
+def otel_series(payload, content_type):
+    """The data points in one OTLP metrics export, JSON or protobuf."""
+    if "json" in (content_type or ""):
+        return _otel_series_json(payload)
+    return _otel_series_pb(payload)
+
+
+def otel_series_key(name, attrs):
+    """One series' identity: metric name plus its sorted attributes."""
+    return name + "|" + ",".join(f"{k}={attrs[k]}" for k in sorted(attrs))
+
+
+def record_otel_metrics(seat, payload, content_type):
+    """Fold one OTLP metrics export into the seat's usage totals.
+
+    Devin's counters are delta sums, so each export adds to a running total
+    kept in usage/otel/<seat>.json (which survives a service restart). A
+    cumulative sum adds only the growth since the last export. Returns the
+    number of data points taken.
+    """
+    seat = re.sub(r"[^a-z0-9_-]", "", (seat or "devin").lower()) or "devin"
+    series = otel_series(payload, content_type)
+    if not series:
+        return 0
+    acc_path = OTEL_ACCUM_DIR / f"{seat}.json"
+    acc = read_json(acc_path, {}) or {}
+    totals = acc.get("totals") or {}
+    last = acc.get("last") or {}      # cumulative series: value at last export
+    points = 0
+    for name, attrs, value, kind, temp in series:
+        key = otel_series_key(name, attrs)
+        if kind == "gauge":
+            totals[key] = value       # a gauge's latest value is its reading
+        elif temp == 2:               # cumulative: add only the growth
+            totals[key] = totals.get(key, 0) + max(0.0, value - last.get(key, 0))
+            last[key] = value
+        else:                         # delta (and unspecified): add the export
+            totals[key] = totals.get(key, 0) + value
+        points += 1
+    write_json(acc_path, {"time": time.time(), "totals": totals, "last": last})
+    # Merge into any existing record: refresh_devin_usage may already have
+    # filled model/context_window from the sessions database, and the otel
+    # section is this writer's own.
+    path = DATA / "usage" / f"{seat}.json"
+    prev = read_json(path, {}) or {}
+    data = dict(prev.get("data") or {})
+    fresh = otel_panel_data(totals)
+    data["otel"] = fresh.get("otel", {})
+    if fresh.get("model"):
+        data["model"] = fresh["model"]
+    context = dict(data.get("context_window") or {})
+    context.update(fresh.get("context_window") or {})
+    if context:
+        data["context_window"] = context
+    write_json(path, {"time": time.time(), "source": prev.get("source") or "devin-otel",
+                      "data": data})
+    return points
+
+
+def otel_panel_data(totals):
+    """The usage/<seat>.json 'data' for the chat panel, from OTLP totals.
+
+    devin.token.usage is keyed by model and type (input, output, cacheRead,
+    cacheCreation); the panel's Session line shows input and output, the most
+    used model names the row, and the full breakdown stays under 'otel' for
+    later readers. Other counters (sessions, lines, commits, PRs, active
+    time) are summed per metric name under 'otel'.metrics'.
+    """
+    tokens, model_totals, metrics = {}, {}, {}
+    for key, total in totals.items():
+        name, _, attr_text = key.partition("|")
+        attrs = dict(p.split("=", 1) for p in attr_text.split(",") if "=" in p)
+        if name == "devin.token.usage":
+            tokens[attrs.get("type", "?")] = tokens.get(attrs.get("type", "?"), 0) + total
+            model = attrs.get("model", "?")
+            model_totals[model] = model_totals.get(model, 0) + total
+        else:
+            metrics[name] = metrics.get(name, 0) + total
+    data = {}
+    if model_totals:
+        data["model"] = {"display_name": max(model_totals, key=model_totals.get)}
+    if tokens:
+        data["context_window"] = {"session_input_tokens": tokens.get("input", 0),
+                                  "session_output_tokens": tokens.get("output", 0)}
+    data["otel"] = {"tokens": tokens, "metrics": metrics}
+    return data
+
+
+class _OtelHandler(http.server.BaseHTTPRequestHandler):
+    """POST /v1/metrics from Devin's OTLP export; /v1/logs and /v1/traces are
+    accepted and dropped (the deck reads metrics only)."""
+
+    def _answer(self, code, body=b"{}"):
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        if body:
+            self.wfile.write(body)
+
+    def do_POST(self):
+        path = self.path.split("?", 1)[0]
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            length = 0
+        body = self.rfile.read(min(length, 64 * 1024 * 1024)) if length else b""
+        if path == "/v1/metrics":
+            seat = self.headers.get("X-Comms-Deck-Seat") or "devin"
+            try:
+                record_otel_metrics(seat, body, self.headers.get("Content-Type") or "")
+            except Exception as error:  # a bad export must never bother the agent
+                log(f"OTEL metrics from {seat} not recorded: {error}")
+            self._answer(200)
+        elif path in ("/v1/logs", "/v1/traces"):
+            self._answer(200)
+        else:
+            self._answer(404)
+
+    def do_GET(self):
+        self._answer(200 if self.path.split("?", 1)[0] == "/" else 404,
+                     b'{"status":"ok"}' if self.path == "/" else b"")
+
+    def log_message(self, *args):
+        pass  # the service log already says the listener is up
+
+
+def otel_serve():
+    """Listen for Devin's OTLP metrics until the service stops."""
+    try:
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", OTEL_PORT), _OtelHandler)
+        server.daemon_threads = True
+    except OSError as error:
+        log(f"OTEL listener on 127.0.0.1:{OTEL_PORT} not started: {error}")
+        return
+    log(f"OTEL metrics listener on 127.0.0.1:{OTEL_PORT}")
+    server.serve_forever()
+
+
+# --- Devin's sessions database ----------------------------------------------
+# Devin CLI keeps every session in ~/.local/share/devin/cli/sessions.db. Each
+# assistant message records per-request metrics (tokens, timings, model)
+# under chat_message.metadata.metrics — the token figures this CLI build's
+# OTEL export does not emit. refresh_devin_usage reads the latest session
+# and writes usage/devin.json in the panel's shape, the same way
+# refresh_grok_usage reads Grok's session files.
+
+DEVIN_DB = Path(setting("DEVIN_DB") or Path.home() / ".local/share/devin/cli/sessions.db")
+
+
+def devin_model_name(slug):
+    """'swe-2-flash-medium' -> 'SWE-2 Flash Medium'; anything else title-cased."""
+    if not slug:
+        return None
+    parts = str(slug).split("-")
+    if parts[0].lower() == "swe" and len(parts) > 1:
+        return "SWE-" + parts[1] + "".join(" " + p.title() for p in parts[2:])
+    return str(slug).replace("-", " ").title()
+
+
+def devin_usage_from_db():
+    """Devin's usage from its local sessions database, as panel data.
+
+    Totals cover the most recently active session: the Session line gets
+    input/output tokens, context gets the newest context_input_tokens (an
+    absolute count — this build does not report the window size), and the
+    model comes from the latest generation_model. Returns None when the db
+    is missing, locked or has no assistant metrics yet.
+    """
+    if not DEVIN_DB.exists():
+        return None
+    try:
+        con = sqlite3.connect(f"file:{DEVIN_DB}?mode=ro", uri=True, timeout=2)
+    except sqlite3.Error:
+        return None
+    try:
+        sid = con.execute("SELECT id FROM sessions ORDER BY last_activity_at DESC LIMIT 1"
+                          ).fetchone()
+        if not sid:
+            return None
+        rows = con.execute(
+            "SELECT json_extract(chat_message,'$.metadata.metrics'),"
+            " json_extract(chat_message,'$.metadata.generation_model'),"
+            " json_extract(chat_message,'$.metadata.metrics.context_input_tokens')"
+            " FROM message_nodes WHERE session_id=?"
+            " AND json_extract(chat_message,'$.role')='assistant' ORDER BY row_id",
+            (sid[0],))
+        sin = sout = cache_r = cache_c = reqs = 0
+        model = context = None
+        for metrics, gen_model, ctx in rows:
+            if not metrics:
+                continue
+            try:
+                mm = json.loads(metrics)
+            except ValueError:
+                continue
+            reqs += 1
+            sin += mm.get("input_tokens") or 0
+            sout += mm.get("output_tokens") or 0
+            cache_r += mm.get("cache_read_tokens") or 0
+            cache_c += mm.get("cache_creation_tokens") or 0
+            if ctx:
+                context = ctx
+            if gen_model:
+                model = gen_model
+    except sqlite3.Error:
+        return None
+    finally:
+        con.close()
+    if not reqs:
+        return None
+    context_window = {"session_input_tokens": sin, "session_output_tokens": sout}
+    if context:
+        context_window["context_tokens"] = context
+    size = setting("DEVIN_CONTEXT")  # window size in tokens, when known
+    if context and size:
+        try:
+            size = float(size)
+            context_window["context_window_size"] = size
+            context_window["used_percentage"] = round(100.0 * context / size, 1)
+        except ValueError:
+            pass
+    data = {"context_window": context_window,
+            "devin": {"requests": reqs, "cache_read_tokens": cache_r,
+                      "cache_creation_tokens": cache_c}}
+    name = devin_model_name(model)
+    if name:
+        data["model"] = {"display_name": name}
+    return data
+
+
+def refresh_devin_usage():
+    """Write usage/devin.json from the sessions database, keeping the otel
+    section an OTLP export may already have written."""
+    found = devin_usage_from_db()
+    if not found:
+        return
+    path = DATA / "usage" / "devin.json"
+    prev = read_json(path, {}) or {}
+    data = dict(prev.get("data") or {})
+    data.update(found)
+    if "otel" in (prev.get("data") or {}):
+        data["otel"] = prev["data"]["otel"]
+    write_json(path, {"time": time.time(), "source": prev.get("source") or "devin-db",
+                      "data": data})
 
 
 def grok_usage_from_session():
@@ -3918,17 +4609,37 @@ def vibe_model_info(model):
         return model, None
 
 
+def vibe_reported_context(session):
+    """The context size Vibe's own status line shows ("ctx 17.4k/202k"), or None.
+
+    It is last_reported_context_tokens in the newest generation's
+    checkpoint.json. That file also holds the conversation, so only this one
+    number is taken out of it, by pattern, and nothing else is kept.
+    """
+    generations = sorted((session / "generations").glob("*/checkpoint.json"))
+    if not generations:
+        return None
+    try:
+        text = generations[-1].read_text(errors="replace")
+    except OSError:
+        return None
+    m = re.search(r'"last_reported_context_tokens"\s*:\s*(\d+)', text)
+    return int(m.group(1)) if m else None
+
+
 def vibe_usage_from_session():
     """Vibe's context use, from the files Vibe writes for its live session.
 
     The owner OK'd reading these (2026-11-25). Vibe keeps one folder per
-    session under ~/.vibe/logs/session/unified/. The live one is the folder
-    whose context-breakdown.json changed last: it holds the tokens now in
-    context (system, tools, skills, conversation), and meta.json names the
-    model. The window size comes from Vibe's model catalog. Vibe's free
-    models report no plan limit, so there's no 5-hour or weekly bar.
-    Returns (time, data) in the status-line shape, or None if Vibe isn't
-    running.
+    session under ~/.vibe/logs/session/unified/; the live one changed last.
+    The tokens are the figure Vibe's own status line shows
+    (vibe_reported_context). context-breakdown.json is only a fallback: it
+    can count far more than is really in context (it read 578k of a 262k
+    window on 2026-11-25, when Vibe's screen said 17.4k of 202k). The
+    window is the one Vibe's UI uses (ui_startup_config.json), else the
+    model catalog's. meta.json names the model. Vibe's free models report
+    no plan limit, so there's no 5-hour or weekly bar. Returns (time, data)
+    in the status-line shape, or None if Vibe isn't running.
     """
     if not any(proc_name(int(d.name)) == AGENTS["vibe"] for d in Path("/proc").iterdir() if d.name.isdigit()):
         return None
@@ -3941,9 +4652,17 @@ def vibe_usage_from_session():
         meta = json.loads((newest.parent / "meta.json").read_text())
     except (OSError, ValueError):
         return None
-    tokens = sum(v for v in breakdown.values() if isinstance(v, (int, float)))
+    reported = vibe_reported_context(newest.parent)
+    tokens = reported if reported is not None else sum(
+        v for v in breakdown.values() if isinstance(v, (int, float)))
     model = dig(meta, "config", "active_model") or dig(meta, "config", "model_name") or ""
     label, window = vibe_model_info(model) if model else ("", None)
+    try:  # the window Vibe's own status line divides by ("17.4k/202k")
+        ui = json.loads((HOME / ".vibe/ui_startup_config.json").read_text())
+        if ui.get("contextWindow") and str(ui.get("activeModelDisplayName") or "").startswith(label or "\0"):
+            window = ui["contextWindow"]
+    except (OSError, ValueError):
+        pass
     data = {"model": {"id": model, "display_name": label}, "context_window": {"context_tokens": tokens}}
     if isinstance(window, (int, float)) and window > 0:
         data["context_window"]["context_window_size"] = window
@@ -3992,6 +4711,71 @@ def context_percent(data):
     return None
 
 
+STALE_BUSY = 600  # a busy seat whose file hasn't changed this long, with notes waiting, is stale
+
+
+def status_json(now=None):
+    """Every seat, for programs (Chronophage): state, why it may be stuck, and ages.
+
+    Plain facts only; the watchdog decides what to do with them.
+    """
+    now = time.time() if now is None else now
+    seats = {}
+    for seat in tuple(AGENTS) + APP_SEATS:
+        s = load_seat(seat)
+        st = app_seat_state(seat) if seat in APP_SEATS else s["state"]
+        a = availability(seat, st, now)
+        notes = pending(seat)
+        oldest = min((path.stat().st_mtime for path, _ in notes), default=None)
+        seats[seat] = {
+            "kind": "app" if seat in APP_SEATS else "agent",
+            "state": st, "shown": a["word"], "rank": list(a["rank"]),
+            "waiting": len(notes),
+            "waiting_normal": sum(1 for _, r in notes if not r.get("quiet")),
+            "oldest_waiting_s": round(now - oldest) if oldest else 0,
+            "since_s": round(now - float(s.get("since") or now)),
+            "file_age_s": round(now - float(s.get("updated") or now)),
+            "can_wake": bool(s.get("kitty_socket") and s.get("kitty_window")) if seat in AGENTS else None,
+            "paused": int(s.get("auto") or 0) >= AUTO_LIMIT,
+            "held_by_draft": bool(s.get("held_by_draft")) or st == "draft in box",
+            "retry_at": float(s.get("app_retry_at") or 0) or None,
+            "spent_until": spent_reset(a["usage"], spent_mark(seat, now), now),
+            "hidden": seat in HIDDEN_SEATS,
+        }
+    return {"time": now, "machine": MACHINE, "seats": seats}
+
+
+def wake_seat(seat, stale=False):
+    """One wake attempt for `seat`, for a watchdog. Returns (done, reason).
+
+    With `stale`, a seat that has said busy for STALE_BUSY seconds without
+    its file changing, while notes wait, is treated as idle first: its Stop
+    hook never ran, so nothing else would ever deliver to it. The wake pastes
+    the notes and presses Enter; if the agent was in fact still working, that
+    lands in its turn, which is why the bar is 10 minutes with no change.
+    """
+    if seat not in AGENTS:
+        return False, "only terminal agents can be woken this way"
+    s = load_seat(seat)
+    if not pending(seat):
+        return False, "nothing waiting"
+    if seat_spent(seat):
+        return False, "out of usage until its reset"  # before any write: a spent seat's state is left as it is
+    if stale and s["state"] == "busy" and time.time() - float(s.get("updated") or 0) >= STALE_BUSY:
+        update_seat(seat, state="idle")
+        log(f"{seat}: busy with no change for {STALE_BUSY // 60} min while notes wait; treating as idle")
+    if try_wake(seat):
+        return True, "woken"
+    s = load_seat(seat)
+    reason = ("out of usage until its reset" if seat_spent(seat) else
+              "paused by the loop guard" if int(s.get("auto") or 0) >= AUTO_LIMIT else
+              "a draft is in its prompt" if s.get("held_by_draft") else
+              f"state is {s['state']}" if s["state"] != "idle" else
+              "no kitty window to type into" if not (s.get("kitty_socket") and s.get("kitty_window")) else
+              "its window is focused or unreadable")
+    return False, reason
+
+
 def status_text():
     """A short table of every agent seat."""
     rows = []
@@ -4004,6 +4788,116 @@ def status_text():
         rows.append(f"{seat:8} {app_seat_state(seat):14} {len(pending(seat))} waiting")
     hook_state = "Discord mirror: on" if WEBHOOK_FILE.exists() else "Discord mirror: off"
     return "\n".join(rows + [hook_state])
+
+
+def usage_report(days=7, now=None):
+    """A text report of this deck's usage, from its own logs.
+
+    `comms-deck usage [--days N]`: notes sent and received (log.jsonl), time
+    each seat spent in each state (activity.jsonl, this machine only), and
+    the plan-limit meters and spent marks (usage/, limits/). Plain text, no
+    agent needed: everything is already on disk; this only reads it back.
+    """
+    now = time.time() if now is None else now
+    since_epoch = now - days * 86400
+    since_text = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(since_epoch))
+    out = [f"comms-deck usage, last {days} day(s) (since {since_text[:16]})", ""]
+
+    # Notes, from log.jsonl.
+    msgs = []
+    try:
+        for line in (DATA / "log.jsonl").open():
+            try:
+                r = json.loads(line)
+            except ValueError:
+                continue
+            if r.get("kind") == "message" and str(r.get("time", "")) >= since_text:
+                msgs.append(r)
+    except OSError:
+        pass
+    if not msgs:
+        out.append("notes: none in the log for this period")
+    else:
+        per_day, by_from, to_seat, quiet, private = {}, {}, {}, 0, 0
+        for r in msgs:
+            day = str(r.get("time", ""))[:10]
+            per_day[day] = per_day.get(day, 0) + 1
+            by_from[r.get("from", "unknown")] = by_from.get(r.get("from", "unknown"), 0) + 1
+            for seat in str(r.get("to") or "").split("+"):
+                to_seat["(all) " if seat == "all" else seat] = to_seat.get("(all) " if seat == "all" else seat, 0) + 1
+            quiet += 1 if r.get("quiet") else 0
+            private += 1 if r.get("private") else 0
+        out.append(f"notes: {len(msgs)} sent ({quiet} quiet, {private} private)")
+        out.append("  by day:   " + "  ".join(f"{d}: {n}" for d, n in sorted(per_day.items())))
+        fmt = lambda counts: ", ".join(f"{k.strip()} {v}" for k, v in
+                                       sorted(counts.items(), key=lambda kv: -kv[1]) if v)
+        out.append("  sent by:  " + fmt(by_from))
+        out.append("  sent to:  " + fmt(to_seat))
+    out.append("")
+
+    # Time in state, from activity.jsonl (written by serve on this machine).
+    spans, last = {}, {}
+    by_program = {proc: seat for seat, proc in AGENTS.items() if proc != seat}
+    try:
+        for line in (DATA / "activity.jsonl").open():
+            try:
+                r = json.loads(line)
+            except ValueError:
+                continue
+            seat, state, t = r.get("seat"), r.get("state"), r.get("time")
+            seat = by_program.get(seat, seat)  # older records name a seat by its program (agy is gravity)
+            if not seat or state is None or not isinstance(t, (int, float)):
+                continue
+            if seat in last:
+                prev_state, prev_t = last[seat]
+                if prev_state != state:
+                    span = max(prev_t, since_epoch)
+                    if span < t:
+                        d = spans.setdefault(seat, {}).setdefault(prev_state, 0)
+                        spans[seat][prev_state] = d + (t - span)
+            last[seat] = (state, t)
+    except OSError:
+        pass
+    if not spans and not last:
+        out.append("activity: nothing recorded yet")
+    else:
+        out.append("activity (time in each state, hours):")
+        for seat in sorted(set(spans) | (set(last) if last else set())):
+            buckets = dict(spans.get(seat, {}))
+            current = last.get(seat)
+            if current and current[1] > since_epoch:
+                buckets[current[0]] = buckets.get(current[0], 0) + max(0.0, now - max(current[1], since_epoch))
+            bits = []
+            for state, seconds in sorted(buckets.items(), key=lambda kv: -kv[1]):
+                if seconds > 60:
+                    mark = " *" if current and current[0] == state else ""
+                    bits.append(f"{state} {seconds / 3600:.1f}h{mark}")
+            if bits:
+                out.append(f"  {seat:8} " + ", ".join(bits))
+            else:
+                out.append(f"  {seat:8} (less than a minute in each state)")
+    out.append("")
+
+    # Plan-limit meters and spent marks.
+    out.append("plan limits:")
+    rows = []
+    for seat in tuple(AGENTS) + APP_SEATS:
+        d = (read_json(DATA / "usage" / f"{seat}.json", {}) or {}).get("data") or {}
+        bits = []
+        for label, key in (("5-hour", "five_hour"), ("weekly", "seven_day")):
+            used = dig(d, "rate_limits", key, "used_percentage")
+            if isinstance(used, bool) or not isinstance(used, (int, float)):
+                continue
+            reset = dig(d, "rate_limits", key, "resets_at")
+            when_text = f", resets {when(reset, now)}" if isinstance(reset, (int, float)) else ""
+            bits.append(f"{label} {used:.0f}% used{when_text}")
+        marked = spent_mark(seat, now)
+        if marked is not None:
+            bits.append(f"spent until {when(marked, now)} ({countdown(marked, now)})")
+        if bits:
+            rows.append(f"  {seat:8} " + "; ".join(bits))
+    out.extend(rows if rows else ["  no meters reported and no spent marks"])
+    return "\n".join(out)
 
 
 # -----------------------------------------------------------------------------
@@ -4040,6 +4934,20 @@ MCP_TOOLS = [
     {"name": "team_status",
      "description": "Which agents are busy, idle or away, and how many notes wait for each.",
      "inputSchema": {"type": "object", "properties": {}}},
+    {"name": "tasks",
+     "description": "The task board: requests from the owner to several agents, each with one "
+                    "holder chosen by the deck. Don't start a task someone else holds.",
+     "inputSchema": {"type": "object", "properties": {
+         "all": {"type": "boolean", "description": "Include finished tasks."}}}},
+    {"name": "claim_task",
+     "description": "Take an open task (refused if another seat holds it).",
+     "inputSchema": {"type": "object", "required": ["id"], "properties": {"id": {"type": "string"}}}},
+    {"name": "release_task",
+     "description": "Give up a task you hold; the deck hands it to the next most available seat.",
+     "inputSchema": {"type": "object", "required": ["id"], "properties": {"id": {"type": "string"}}}},
+    {"name": "done_task",
+     "description": "Mark a task you hold as finished.",
+     "inputSchema": {"type": "object", "required": ["id"], "properties": {"id": {"type": "string"}}}},
 ]
 
 
@@ -4074,7 +4982,7 @@ def poll_left(state, now=None):
     polled = float(state.get("polled_at") or 0)
     if not polled:
         return None
-    return int(polled + float(state.get("poll_gap") or POLL_DEFAULT) - now)
+    return polled + float(state.get("poll_gap") or POLL_DEFAULT) - now
 
 
 def poll_is_late(seat, now=None):
@@ -4086,15 +4994,40 @@ def poll_is_late(seat, now=None):
 
 
 def poll_countdown(state, now=None):
-    """'next check in 0:42', or 'check late 1:05' once the expected time has passed."""
+    """'next check in 0:42.123', or 'check late 1:05.021' once the expected
+    time has passed — metric time to the millisecond, like the spent rows."""
     left = poll_left(state, now)
     if left is None:
         return "hasn't checked yet"
-    clock = lambda n: f"{n // 3600}:{n % 3600 // 60:02d}:{n % 60:02d}" if n >= 3600 else f"{n // 60}:{n % 60:02d}"
-    return f"next check in {clock(left)}" if left >= 0 else f"check late {clock(-left)}"
+    return f"next check in {metric_time(left)}" if left >= 0 else f"check late {metric_time(-left)}"
+
+
+def mcp_only(seat):
+    """True for an app seat that reaches the deck only through MCP (Lumo): nothing can wake it."""
+    return seat in APP_SEATS and APP_PROCESS.get(seat, "grok-bot") != "grok-bot"
 
 
 def mcp_call(seat, name, args):
+    """Run one MCP tool. Returns (text, is_error).
+
+    A seat that can't be woken (mcp_only) gets its waiting notes with the
+    answer to any tool, not only read_messages: the same as a hook handing
+    Claude its notes at the end of a turn. Otherwise a seat that is busy
+    sending and setting status, but not reading, never sees its notes.
+    """
+    text, error = mcp_tool(seat, name, args)
+    if not error and name != "read_messages" and mcp_only(seat):
+        notes = take(seat)
+        if notes:
+            try:
+                note_mcp_call(seat, "read_messages")
+            except OSError:
+                pass
+            text += "\n\n---\nNotes that were waiting for you:\n\n" + render(notes, seat)
+    return text, error
+
+
+def mcp_tool(seat, name, args):
     """Run one MCP tool. Returns (text, is_error)."""
     try:
         note_mcp_call(seat, name)
@@ -4115,6 +5048,13 @@ def mcp_call(seat, name, args):
         return "Status set.", False
     if name == "team_status":
         return status_text(), False
+    if name in ("tasks", "claim_task", "release_task", "done_task"):
+        balancer = load_balancer()
+        if not balancer:
+            return "The load balancer isn't installed on this machine, so there are no tasks.", True
+        if name == "tasks":
+            return balancer.tasks_text(active_only=not args.get("all")), False
+        return balancer.task_action(seat, name.split("_")[0], str(args.get("id", "")).strip()), False
     return f"Unknown tool {name}", True
 
 
@@ -4235,6 +5175,12 @@ def devin_config(config, cmd):
     allow = config.setdefault("permissions", {}).setdefault("allow", [])
     if DEVIN_ALLOW not in allow:
         allow.append(DEVIN_ALLOW)
+    # Usage metrics: point Devin's OTLP metrics export at the deck's listener.
+    # Only the metrics signal is set, so prompts and tool text stay home.
+    # setdefault: an endpoint the owner chose is never replaced.
+    otel = config.setdefault("otel", {})
+    otel.setdefault("metrics_endpoint", f"http://127.0.0.1:{OTEL_PORT}/v1/metrics")
+    otel.setdefault("metrics_headers", {}).setdefault("X-Comms-Deck-Seat", "devin")
     return config
 
 
@@ -4291,6 +5237,13 @@ def install(yes):
                 old.symlink_to(new)
     step("move ~/.local/share/launchpad and ~/.config/launchpad to the comms-deck names", migrate)
 
+    def link_balancer():
+        repo = HOME / "load-balancer" / "load-balancer"
+        if repo.exists():
+            bin_dir.mkdir(parents=True, exist_ok=True)
+            link("load-balancer", repo)
+    step(f"link {bin_dir}/load-balancer to ~/load-balancer, if that repo is cloned (the task board)",
+         link_balancer)
     step(f"link {bin_dir}/comms-deck (and the old name, launchpad) and push-courier to this repo",
          lambda: (bin_dir.mkdir(parents=True, exist_ok=True), link("comms-deck", here / "comms-deck"),
                   link("launchpad", here / "comms-deck"), link("push-courier", here / "push-courier")))
@@ -4481,7 +5434,12 @@ def self_test():
     """Check the mailbox, hooks, loop guard and MCP server. Exit 1 on failure."""
     tmp = tempfile.mkdtemp(prefix="comms-deck-test-")
     os.environ["COMMS_DECK_NO_NOTIFY"] = "1"  # test notes to the owner must not pop up on the desktop
+    for name in ("KITTY_LISTEN_ON", "KITTY_WINDOW_ID"):
+        os.environ.pop(name, None)  # a test seat must never record, and so type into, a real kitty window
+    # The deck's checks test the deck alone: the load balancer (the task board)
+    # has its own `load-balancer self-test`, so it's switched off here.
     env = dict(os.environ, COMMS_DECK_HOME=f"{tmp}/data", COMMS_DECK_CONFIG=f"{tmp}/config",
+               COMMS_DECK_LOAD_BALANCER="/nonexistent-in-self-test",
                COMMS_DECK_AUTO_LIMIT="2")
     me = str(Path(__file__).resolve())
     failures = []
@@ -4531,6 +5489,40 @@ def self_test():
     run(["--from", "owner", "send", "grok", "from the owner"], "owner")
     r = run(["hook", "--source", "grok", "--event", "Stop"], "grok", "{}", {"GROK_HOOK_EVENT": "stop"})
     check("an owner note gets through a paused loop guard", "from the owner" in r.stdout, r.stdout)
+    now = time.time()
+    uhome = Path(tmp) / "usage-home"
+    (uhome / "usage").mkdir(parents=True)
+    (uhome / "limits").mkdir(parents=True)
+    (uhome / "log.jsonl").write_text("".join(json.dumps(r) + "\n" for r in [
+        {"kind": "message", "from": "claude", "to": "grok", "time": "2026-11-24 10:00:00", "text": "u1"},
+        {"kind": "message", "from": "grok", "to": "claude+vibe", "time": "2026-11-24 23:00:00", "text": "u2", "quiet": True},
+        {"kind": "message", "from": "grok", "to": "claude", "time": "2026-11-01 08:00:00", "text": "too old"},
+        {"kind": "commentary", "from": "claude", "time": "2026-11-24 11:00:00", "text": "not a note"},
+    ]))
+    (uhome / "activity.jsonl").write_text("".join(json.dumps(r) + "\n" for r in [
+        {"seat": "claude", "state": "busy", "time": 1795560000.0},
+        {"seat": "claude", "state": "idle", "time": 1795563600.0},
+    ]))
+    (uhome / "usage" / "claude.json").write_text(json.dumps(
+        {"data": {"rate_limits": {"five_hour": {"used_percentage": 42, "resets_at": now + 3600}}}}))
+    (uhome / "limits" / "grok.json").write_text(json.dumps({"resets_at": now + 7200, "set_by": "claude", "set_at": now}))
+    r = run(["usage"], "owner", extra={"COMMS_DECK_HOME": str(uhome)})
+    check("usage: notes counted, old rows and commentary excluded",
+          r.returncode == 0 and "notes: 2 sent (1 quiet, 0 private)" in r.stdout
+          and "2026-11-24: 2" in r.stdout
+          and "claude 1" in r.stdout and "vibe 1" in r.stdout
+          and "u1" not in r.stdout and "u2" not in r.stdout,  # note texts never leak into a metrics report
+          r.stdout + r.stderr)
+    check("usage: time in state and plan meters show",
+          "busy 1.0h" in r.stdout and "idle" in r.stdout and "*" in r.stdout
+          and "5-hour 42% used" in r.stdout
+          and "grok" in r.stdout and "spent until" in r.stdout, r.stdout + r.stderr)
+    empty_home = Path(tmp) / "usage-home-empty"
+    empty_home.mkdir()
+    r = run(["usage"], "owner", extra={"COMMS_DECK_HOME": str(empty_home)})
+    check("usage: an empty deck reports and doesn't crash",
+          r.returncode == 0 and "none in the log" in r.stdout and "no meters" in r.stdout,
+          r.stdout + r.stderr)
     r = run(["send", "all -grok", "minus grok"], "owner")
     in_grok = [json.load(open(p)) for p in Path(f"{tmp}/data/inbox/grok").glob("*.json")]
     in_claude = [json.load(open(p)) for p in Path(f"{tmp}/data/inbox/claude").glob("*.json")]
@@ -4805,8 +5797,8 @@ def self_test():
     check("Vibe's composer: the > line under its labelled rule", composer_text(vibe_screen) ==
           "Hello. Check the local directory", repr(composer_text(vibe_screen)))
     granted = grant_vibe_tools('theme = "ansi-dark"\n\n[tools.comms-deck_send_message]\npermission = "ask"\n')
-    check("vibe's five deck tools are allowed, a choice already made is kept, and twice is once",
-          granted.count("[tools.comms-deck_") == 5 and 'send_message]\npermission = "ask"' in granted
+    check("vibe's deck tools are allowed, a choice already made is kept, and twice is once",
+          granted.count("[tools.comms-deck_") == len(VIBE_ALLOWED_TOOLS) and 'send_message]\npermission = "ask"' in granted
           and grant_vibe_tools(granted) == granted, granted)
     check("Vibe's empty composer reads as empty",
           composer_text(vibe_screen.replace("Hello. Check the local directory", "")) == "",
@@ -4963,6 +5955,13 @@ def self_test():
         "assert fresh == [] and cur == 't1@3'",
         "idle = {'open': True, 'replying': False, 'composer': ''}",
         "assert x.app_delivery_allowed({'open':True,'replying':True,'composer':''}, False, {'auto':0}, 'alice') is False",
+        "x.APP_SEATS = tuple(set(x.APP_SEATS) | {'pollseat2'}); x.APP_PROCESS['pollseat2'] = 'some-app'",
+        "x.write_json(x.DATA / 'inbox' / 'pollseat2' / 'n1.json', {'id': 'n1', 'from': 'owner', 'to': 'pollseat2', 'text': 'please check X', 'time': '2026-11-24 07:00:00', 'quiet': False, 'private': False})",
+        "out, err = x.mcp_call('pollseat2', 'set_status', {'text': 'working'})",
+        "assert not err and 'Notes that were waiting for you' in out and 'please check X' in out and not x.pending('pollseat2')",
+        "assert 'send_message tool' in out and 'Reply here in this chat' not in out",
+        "out, err = x.mcp_call('pollseat2', 'set_status', {'text': 'again'}); assert 'Notes that were waiting' not in out",
+        "assert x.load_seat('pollseat2').get('polled_at')",
         "ch, st = x.draft_status({}, 'w', 1000.0); assert ch == {'app_draft': 'w', 'app_draft_since': 1000.0} and not st",
         "ch, st = x.draft_status({'app_draft': 'w', 'app_draft_since': 1000.0}, 'w', 1000.0 + x.DRAFT_STALE - 1); assert not ch and not st",
         "ch, st = x.draft_status({'app_draft': 'w', 'app_draft_since': 1000.0}, 'w', 1000.0 + x.DRAFT_STALE); assert st",
@@ -5028,6 +6027,120 @@ def self_test():
     r = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True, timeout=30)
     check("app seat replies, guards, usage and websocket mask",
           r.returncode == 0 and r.stdout.strip() == "ok", r.stdout + r.stderr)
+    # OTLP metrics -> usage/<seat>.json: the listener, both body formats,
+    # delta and cumulative sums, gauges, and the panel's data shape. A fake
+    # Devin sessions.db stands in for ~/.local/share/devin/cli/sessions.db.
+    Path(f"{tmp}/otel-config").mkdir(parents=True, exist_ok=True)
+    devin_db = f"{tmp}/otel-data/devin-sessions.db"
+    Path(f"{tmp}/otel-data").mkdir(parents=True, exist_ok=True)
+    con = sqlite3.connect(devin_db)
+    con.execute("CREATE TABLE sessions (id TEXT PRIMARY KEY, last_activity_at INTEGER)")
+    con.execute("CREATE TABLE message_nodes (row_id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                " session_id TEXT, chat_message TEXT)")
+    con.execute("INSERT INTO sessions VALUES ('s1', 1)")
+    for inp, out, ctx in ((100, 20, 100000), (200, 40, 123456)):
+        con.execute("INSERT INTO message_nodes (session_id, chat_message) VALUES ('s1', ?)",
+                    (json.dumps({"role": "assistant", "metadata": {
+                        "generation_model": "swe-2-flash-medium",
+                        "metrics": {"input_tokens": inp, "output_tokens": out,
+                                    "cache_read_tokens": 5000, "cache_creation_tokens": None,
+                                    "context_input_tokens": ctx}}}),))
+    con.commit()
+    con.close()
+    code = "\n".join([
+        "import importlib.machinery as m, importlib.util as u, json, struct, threading, time, urllib.request",
+        f"l = m.SourceFileLoader('cd', {me!r}); s = u.spec_from_loader('cd', l)",
+        "x = u.module_from_spec(s); l.exec_module(x)",
+        # a minimal protobuf writer, for a hand-built OTLP/protobuf export
+        "def vi(n):",
+        "    out = b''",
+        "    while True:",
+        "        b = n & 0x7f; n >>= 7",
+        "        out += bytes([b | (0x80 if n else 0)])",
+        "        if not n: return out",
+        "def fld(num, wire, val): return vi(num << 3 | wire) + val",
+        "def ln(num, payload): return fld(num, 2, vi(len(payload)) + payload)",
+        "def txt(num, s): return ln(num, s.encode())",
+        "def kv(k, v): return ln(7, txt(1, k) + ln(2, ln(1, v.encode())))",
+        "def point(attrs, val): return b''.join(kv(a, b) for a, b in attrs) + fld(6, 1, struct.pack('<q', val))",
+        "def pb_metric(name, points, temp=1, gauge=False):",
+        "    data = b''.join(ln(1, p) for p in points)",
+        "    if gauge: return txt(1, name) + ln(5, data)",
+        "    return txt(1, name) + ln(7, data + fld(2, 0, vi(temp)))",
+        "def pb_export(metrics): return ln(1, ln(2, b''.join(ln(2, m) for m in metrics)))",
+        # OTLP/JSON over the real listener, with the seat header
+        "pt = lambda t, v: {'attributes': [{'key': 'model', 'value': {'stringValue': 'SWE-2'}},"
+        " {'key': 'type', 'value': {'stringValue': t}}], 'asInt': str(v)}",
+        "jdoc = {'resourceMetrics': [{'scopeMetrics': [{'metrics': [",
+        " {'name': 'devin.token.usage', 'sum': {'aggregationTemporality': 'AGGREGATION_TEMPORALITY_DELTA',"
+        " 'dataPoints': [pt('input', 100), pt('output', 50), pt('cacheRead', 900)]}},",
+        " {'name': 'devin.session.count', 'sum': {'aggregationTemporality': 1,"
+        " 'dataPoints': [{'asInt': '1'}]}},",
+        " {'name': 'devin.active_time.total', 'sum': {'aggregationTemporality': 'AGGREGATION_TEMPORALITY_DELTA',"
+        " 'dataPoints': [{'attributes': [{'key': 'type', 'value': {'stringValue': 'cli'}}], 'asDouble': 30.0}]}}",
+        "]}]}]}",
+        "threading.Thread(target=x.otel_serve, daemon=True).start()",
+        "time.sleep(0.3)",
+        "for _ in range(2):",
+        "    req = urllib.request.Request('http://127.0.0.1:48123/v1/metrics', data=json.dumps(jdoc).encode(),",
+        "        headers={'Content-Type': 'application/json', 'X-Comms-Deck-Seat': 'devin'})",
+        "    assert urllib.request.urlopen(req, timeout=5).status == 200",
+        "time.sleep(0.2)",
+        "d = json.load(open(x.DATA / 'usage' / 'devin.json'))['data']",
+        "assert d['model']['display_name'] == 'SWE-2'",
+        "assert d['context_window'] == {'session_input_tokens': 200, 'session_output_tokens': 100}",
+        "assert d['otel']['tokens'] == {'input': 200, 'output': 100, 'cacheRead': 1800}",
+        "assert d['otel']['metrics']['devin.session.count'] == 2",
+        "assert d['otel']['metrics']['devin.active_time.total'] == 60",
+        "panel = x.usage_panel(80)",
+        "assert any('DEVIN' in l for l in panel)",
+        "assert any('active 1m' in l and '2 sessions' in l for l in panel)",
+        # the sessions db fills what OTEL cannot: real tokens, context, model
+        "x.refresh_devin_usage()",
+        "d = json.load(open(x.DATA / 'usage' / 'devin.json'))['data']",
+        "assert d['model']['display_name'] == 'SWE-2 Flash Medium'",
+        "assert d['context_window']['session_input_tokens'] == 300",
+        "assert d['context_window']['session_output_tokens'] == 60",
+        "assert d['context_window']['context_tokens'] == 123456",
+        "assert d['devin'] == {'requests': 2, 'cache_read_tokens': 10000, 'cache_creation_tokens': 0}",
+        "assert d['otel']['metrics']['devin.session.count'] == 2",
+        "panel = x.usage_panel(80)",
+        "assert any('Context' in l and 'tokens' in l for l in panel)",
+        # an OTLP export afterwards keeps the db's fields
+        "x.record_otel_metrics('devin', json.dumps(jdoc), 'application/json')",
+        "d = json.load(open(x.DATA / 'usage' / 'devin.json'))['data']",
+        "assert d['context_window']['context_tokens'] == 123456 and d['devin']['requests'] == 2",
+        "assert d['otel']['metrics']['devin.session.count'] == 3",
+        # protobuf, delta sums, a gauge, and cumulative temporality
+        "pb = pb_export([",
+        " pb_metric('devin.token.usage', [",
+        "  point([('model','SWE-2'),('type','input')], 40),",
+        "  point([('model','SWE-2'),('type','output')], 10),",
+        " ]),",
+        " pb_metric('devin.active_time.total', [point([], 30)], gauge=True),",
+        "])",
+        "assert x.record_otel_metrics('devinpb', pb, 'application/x-protobuf') == 3",
+        "d = json.load(open(x.DATA / 'usage' / 'devinpb.json'))['data']",
+        "assert d['context_window'] == {'session_input_tokens': 40, 'session_output_tokens': 10}",
+        "assert d['otel']['metrics']['devin.active_time.total'] == 30",
+        "cum = pb_export([pb_metric('devin.token.usage', [point([('model','SWE-2'),('type','input')], 50)], temp=2)])",
+        "x.record_otel_metrics('devinpb', cum, 'application/x-protobuf')",
+        "cum2 = pb_export([pb_metric('devin.token.usage', [point([('model','SWE-2'),('type','input')], 70)], temp=2)])",
+        "x.record_otel_metrics('devinpb', cum2, 'application/x-protobuf')",
+        "d = json.load(open(x.DATA / 'usage' / 'devinpb.json'))['data']",
+        "assert d['context_window']['session_input_tokens'] == 110",  # 40 + (50-0) + (70-50)
+        "acc = json.load(open(x.OTEL_ACCUM_DIR / 'devinpb.json'))",
+        "assert acc['totals']['devin.token.usage|model=SWE-2,type=input'] == 110",
+        "assert x.record_otel_metrics('devinpb', b'not metrics', 'application/x-protobuf') == 0",
+        "print('ok')",
+    ])
+    r = subprocess.run([sys.executable, "-c", code],
+                       env=dict(env, COMMS_DECK_OTEL_PORT="48123",
+                                COMMS_DECK_HOME=f"{tmp}/otel-data", COMMS_DECK_CONFIG=f"{tmp}/otel-config",
+                                COMMS_DECK_DEVIN_DB=devin_db),
+                       capture_output=True, text=True, timeout=30)
+    check("OTLP metrics listener fills usage/<seat>.json (JSON and protobuf, delta and cumulative)",
+          r.returncode == 0 and r.stdout.strip().splitlines()[-1:] == ["ok"], r.stdout + r.stderr)
     now = 1_700_000_000
     code = "\n".join([
         "import importlib.machinery as m, importlib.util as u, json",
@@ -5057,12 +6170,17 @@ def self_test():
         "assert x.countdown(now + 42*60 + 5, now) == 'back in 42m 05s'",
         "assert x.countdown(float('inf'), now) == 'back: time unknown'",
         "assert x.idle_until(now + 6*86400 + 19*3600 + 12*60 + 7, now).endswith(' · 6d 19h 12m')",
+        "assert x.idle_until(now + 3500.25, now).endswith(' · 58:20.250'), 'sub-hour cooldowns count in metric time'",
+        "assert x.metric_time(6*86400 + 19*3600 + 12*60 + 7.456) == '6d 19:12:07.456'",
+        "assert x.metric_time(3723) == '1:02:03.000' and x.metric_time(42.5) == '0:42.500'",
         "assert x.idle_until(now + 6*86400, now).startswith('idle until ')",
         "assert x.idle_until(float('inf'), now) == 'idle until its limit resets'",
         "assert x.task_summary('reviewing PR #35 for the owner today please', []) == 'reviewing PR #35 for the owner …'",
         "assert x.task_summary('', [('p', {'text': '@claude please fix https://x.y the chat layout', 'private': False})]) == 'please fix the chat layout'",
         "assert x.task_summary('', [('p', {'text': 'token stuff', 'private': True})]) == 'private note'",
         "assert x.task_summary('', []) == ''",
+        "j = x.status_json(); assert set(j['seats']) >= {'claude', 'grok'} and 'shown' in j['seats']['claude']",
+        "assert x.wake_seat('alice')[0] is False",
         "assert x.task_summary('<system-reminder> fixing the chat layout now', []) == 'fixing the chat layout now'",
         "assert x.task_summary('<system-reminder>', [('p', {'text': 'merge the PR', 'private': False})]) == 'merge the PR'",
         "assert x.describe('<system-reminder>\\nhook text\\n</system-reminder>\\nreview PR 36') == 'review PR 36'",
@@ -5098,6 +6216,12 @@ def self_test():
         "(x.DATA / 'inbox' / 'gravity' / 'g1.json').unlink()",
         "x.mark_spent('gravity', 'clear', 'claude')",
         "assert not x.seat_spent('gravity')",
+        "x.mark_spent('codex', '+1h', 'claude'); x.update_seat('codex', state='idle', kitty_socket='unix:/nonexistent', kitty_window='1')",
+        "x.write_json(x.DATA / 'inbox' / 'codex' / 'w1.json', {'from': 'owner', 'text': 'hi', 'time': '2026-11-24 07:00:00'})",
+        "assert x.try_wake('codex') is False and x.wake_seat('codex') == (False, 'out of usage until its reset')",
+        "x.update_seat('codex', state='busy'); x.write_json(x.DATA / 'seats' / 'codex.json', dict(x.load_seat('codex'), updated=1.0))",
+        "assert x.wake_seat('codex', stale=True) == (False, 'out of usage until its reset') and x.load_seat('codex')['state'] == 'busy'",
+        "x.mark_spent('codex', 'clear', 'claude'); (x.DATA / 'inbox' / 'codex' / 'w1.json').unlink()",
         "x.write_json(x.DATA / 'usage' / 'gravity.json', {'time': now, 'data': {'rate_limits': {'five_hour': full(x.time.time() + 600)}}})",
         "x.update_seat('gravity', state='away')",
         "assert x.seat_spent('gravity') and any(s == 'gravity' for s, _, _ in x.current_states())",
@@ -5139,6 +6263,11 @@ def self_test():
         "(vh / '.vibe/model_catalog_cache.json').write_text('{\"k\": [{\"id\": \"m-free\", \"label\": \"M Free\", \"max_context_length\": 40000}]}')",
         "_, vd = x.vibe_usage_from_session()",
         "assert vd['model']['display_name'] == 'M Free' and x.context_percent(vd) == 25.0, vd",
+        "g = sd / 'generations/0000000000000002'; g.mkdir(parents=True); (sd / 'generations/0000000000000001').mkdir()",
+        "(g / 'checkpoint.json').write_text('{\"compaction_count\": 2, \"last_reported_context_tokens\": 4000, \"turn\": {}}')",
+        "(vh / '.vibe/ui_startup_config.json').write_text('{\"activeModelDisplayName\": \"M Free[high]\", \"contextWindow\": 20000}')",
+        "_, vd = x.vibe_usage_from_session()",
+        "assert x.context_percent(vd) == 20.0, vd",  # Vibe's own figure and window win over the breakdown and catalog
         "x.AGENTS['vibe'] = 'no-such-program-xyz'; assert x.vibe_usage_from_session() is None",
         "x.HOME, x.AGENTS['vibe'] = real_home, real_vibe",
         # The context-split pie reads usage/<seat>.json only: counts, never text.
@@ -5204,10 +6333,37 @@ def self_test():
         "assert 'PLAN USAGE' in pl_t and 'codex' in pl_t and '40%' in pl_t, pl_t  # the 5-hour figure shows",
         "assert pl_t.index('codex') < pl_t.index('gravity') if 'gravity' in pl_t else True, pl_t  # sorted highest first",
         "x.DATA = real_data",
+        # The top bar's notification queue mirrors into the deck's feed.
+        "nd = x.Path(x.tempfile.mkdtemp()); real_nd, real_nq = x.DATA, x.NOTIFY_QUEUE",
+        "x.DATA = nd; x.NOTIFY_QUEUE = nd / 'queue.jsonl'",
+        "assert x.notify_lines(40) == [], 'no queue, no feed'",
+        "nq = x.NOTIFY_QUEUE",
+        "nq.write_text('{\"text\": \"first note\"}\\nnot json\\n{\"text\": \"second — body\"}\\n')",
+        "p = x.refresh_notifications(0); assert p == nq.stat().st_size",
+        "nt = (x.DATA / 'notifications.jsonl').read_text()",
+        "assert nt.count(chr(10)) == 2 and 'first note' in nt and 'second — body' in nt and 'not json' not in nt, nt",
+        "assert x.refresh_notifications(p) == p, 'nothing new, nothing copied'",
+        "with nq.open('a') as h: h.write('{\"text\": \"third\"}\\n')",
+        "x.refresh_notifications(p)",
+        "nl = x.notify_lines(40); nt_t = ' '.join(x.ANSI.sub('', l) for l in nl)",
+        "assert 'NOTIFICATIONS' in nt_t and 'third' in nt_t and 'first note' in nt_t, nt_t",
+        "assert nt_t.index('third') < nt_t.index('first note'), 'newest first'",
+        "x.trim_notifications(keep=2, max_lines=2)",
+        "tl = (x.DATA / 'notifications.jsonl').read_text().splitlines()",
+        "assert len(tl) == 2 and 'first note' not in ''.join(tl) and 'third' in ''.join(tl), tl",
+        "x.DATA, x.NOTIFY_QUEUE = real_nd, real_nq",
+        "col = ['USAGE', '', 'A', '  updated 1s ago', '', 'B', '  updated 2s ago', '', 'C']",
+        "assert x.fit_column(col, 20) == col",  # fits: untouched
+        "assert x.fit_column(col, 7) == ['USAGE', '', 'A', '', 'B', '', 'C']",  # footers go first
+        "assert x.fit_column(col, 4) == ['USAGE', 'A', 'B', 'C']",  # then the spacers
+        "assert x.fit_column(col, 2) == ['USAGE', 'A']",  # only then the bottom
+        "x._balancer = False; text, failed = x.mcp_call('claude', 'tasks', {})",
+        "assert failed and 'isn' in text and 'installed' in text, text",  # no load balancer: said plainly
+        "x._balancer = False",
         "assert x.poll_countdown({}, now) == \"hasn't checked yet\"",
-        "assert x.poll_countdown({'polled_at': now - 18}, now) == 'next check in 0:42'",
-        "assert x.poll_countdown({'polled_at': now - 125, 'poll_gap': 60}, now) == 'check late 1:05'",
-        "assert x.poll_countdown({'polled_at': now - 5, 'poll_gap': 1800}, now) == 'next check in 29:55'",
+        "assert x.poll_countdown({'polled_at': now - 18}, now) == 'next check in 0:42.000'",
+        "assert x.poll_countdown({'polled_at': now - 125, 'poll_gap': 60}, now) == 'check late 1:05.000'",
+        "assert x.poll_countdown({'polled_at': now - 5, 'poll_gap': 1800}, now) == 'next check in 29:55.000'",
         "x.APP_SEATS = x.APP_SEATS + ('pollseat',); x.APP_PROCESS['pollseat'] = 'some-app'",
         "x.note_mcp_call('pollseat', 'read_messages', now)",
         "x.note_mcp_call('pollseat', 'read_messages', now + 1)",
@@ -5216,7 +6372,7 @@ def self_test():
         "assert x.load_seat('pollseat')['poll_gap'] == 299",
         "x.note_mcp_call('pollseat', 'read_messages', now + 300 + 90000)",
         "assert x.load_seat('pollseat')['poll_gap'] == 86400",
-        "assert x.poll_countdown({'polled_at': now, 'poll_gap': 86400}, now) == 'next check in 24:00:00'",
+        "assert x.poll_countdown({'polled_at': now, 'poll_gap': 86400}, now) == 'next check in 1d 00:00:00.000'",
         "x.update_seat('pollseat', state='idle', polled_at=now - 125, poll_gap=60)",
         "x.write_json(x.DATA / 'inbox' / 'pollseat' / 'n1.json', {'from': 'owner', 'text': 'check in', 'quiet': False})",
         "late = x.availability('pollseat', 'idle', now)",
@@ -5248,6 +6404,11 @@ def self_test():
     r = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True, timeout=30)
     check("a full plan limit is spent until its reset, and waiting notes are counted from the inbox",
           r.returncode == 0 and r.stdout.strip() == "ok", r.stdout + r.stderr)
+    layout = Path(__file__).resolve().parent / "desktop" / "scratchpad-layout"
+    r = subprocess.run([sys.executable, str(layout), "--self-test"], env=env,
+                       capture_output=True, text=True, timeout=30)
+    check("scratchpad cells tile flush, including Vibe and the shared bottom right",
+          r.returncode == 0 and "layout tiles ok" in r.stdout, r.stdout + r.stderr)
 
     # --- remote seats (docs/REMOTE.md): join from another device through the git repos ---
     upstream, rlog = Path(tmp) / "remote-upstream", Path(tmp) / "remote-log"
@@ -5496,7 +6657,10 @@ def main():
     p.add_argument("--peek", action="store_true", help="show without taking")
     p = sub.add_parser("note")
     p.add_argument("text", nargs="+")
-    sub.add_parser("status")
+    p = sub.add_parser("status")
+    p.add_argument("--json", action="store_true", help="every seat as JSON, for programs")
+    p = sub.add_parser("usage", help="notes, activity and plan limits for the deck, from its logs")
+    p.add_argument("--days", type=int, default=7)
     sub.add_parser("watch")
     p = sub.add_parser("chat")
     p.add_argument("--hide-private", action="store_true")
@@ -5512,6 +6676,9 @@ def main():
     p = sub.add_parser("install")
     p.add_argument("--yes", action="store_true")
     sub.add_parser("self-test")
+    p = sub.add_parser("wake", help="one wake attempt for a seat (for watchdogs)")
+    p.add_argument("seat")
+    p.add_argument("--stale", action="store_true", help="treat a long-unchanged busy seat as idle")
     p = sub.add_parser("spent", help="mark a seat spent until its limit resets (for agents with no meter)")
     p.add_argument("seat")
     p.add_argument("until", nargs="+", help="+166h, +90m, +2d, 06:20, 'YYYY-MM-DD HH:MM', or clear")
@@ -5547,7 +6714,9 @@ def main():
             add_note(me(), " ".join(args.text))
             print("added to the commentary")
         elif args.cmd == "status":
-            print(status_text())
+            print(json.dumps(status_json(), indent=1) if args.json else status_text())
+        elif args.cmd == "usage":
+            print(usage_report(max(1, args.days)))
         elif args.cmd == "watch":
             watch()
         elif args.cmd == "chat":
@@ -5579,6 +6748,10 @@ def main():
             print(kitten((args.seat or "").lower(), args.kitten_all))
         elif args.cmd == "self-test":
             sys.exit(self_test())
+        elif args.cmd == "wake":
+            done, reason = wake_seat(args.seat.lower(), args.stale)
+            print(json.dumps({"seat": args.seat.lower(), "woken": done, "reason": reason}))
+            sys.exit(0 if done else 3)
         elif args.cmd == "spent":
             print(mark_spent(args.seat.lower(), " ".join(args.until), me()))
         elif args.cmd == "review-check":

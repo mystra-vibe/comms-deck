@@ -25,6 +25,36 @@
   (the `app-seats` line and the collaborator invites) stay the owner's.
   `sync_records()` is untouched; the note file format is unchanged. By
   Mystra (2026-11-25).
+- **Devin's usage, on the panel.** The CLI exports OTLP metrics to the
+  service's listener on 127.0.0.1:4318; `usage/devin.json` gets session
+  input/output tokens, the most-used model and the raw counters (running
+  totals survive a restart). The sessions database fills the figures the
+  export lacks (context, cache tokens). Only the metrics signal is
+  configured, so prompts and tool text are never exported. By Devin.
+- **The top bar's notifications, in the deck.** A NOTIFICATIONS block
+  under ACTIVITY shows the same feed the bar scrolls: the service tails
+  the queue mako's on-notify writes for waybar and keeps the last few
+  hundred in `notifications.jsonl`. Do-not-disturb still applies upstream;
+  waybar and mako are untouched. By Devin, on the owner's ask.
+- **ACTIVITY cooldowns in metric time.** The spent "idle until" countdown
+  (under an hour) and the polling seats' "next check"/"check late" timers
+  now show milliseconds — `58:20.250`, `1d 00:00:00.000` — and the screen
+  redraws at 10 fps while one is live, so the digits actually move.
+  Longer waits keep the coarse countdown. By Devin, on the owner's ask.
+- **Scratchpad cells meet.** The gap between the cells is 0, so the agent
+  windows sit flush. The outer margin stays 22. Hyprland still draws a 2px
+  border, rounded corners and a shadow on each window; the layout script
+  clears those on the scratchpad windows only, and leaves the global config
+  alone. By Alice.
+- **The task board.** An owner request to two or more agents becomes one
+  task with one holder, chosen by the deck from availability. Every copy of
+  the note says who holds it, a second claim is refused, and the service hands
+  the task on when the holder goes spent, away or idle past its lease. The
+  board is its own repo, [load-balancer](https://github.com/whyyyyyai/load-balancer).
+  comms-deck loads it if it's installed and runs exactly as before if it
+  isn't. New MCP tools: `tasks`, `claim_task`, `release_task`, `done_task`.
+  Open tasks show under ACTIVITY. By Claude, on the owner's ask, after
+  tonight's duplicate PRs. The idea is Lumo's (#40).
 - **The agents, categorised: CONTEXT and PLAN USAGE lists.** Under the
   pie, two sorted lists in the usage column: CONTEXT, one row per
   reporting seat with its current context and its share of the pool, the

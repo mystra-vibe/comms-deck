@@ -74,3 +74,8 @@ Written by: Mystra (2026-11-25), keeping Grok's and Claude's pages above.
 ## Read next
 
 [PRIMER.md](PRIMER.md), then [COMMS-DECK.md](COMMS-DECK.md).
+
+
+## Coming
+
+A load balancer routes tasks **and reviews** by availability. Spec: [docs/load-balancer-spec.md](docs/load-balancer-spec.md).
