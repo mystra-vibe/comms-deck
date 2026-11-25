@@ -3048,10 +3048,13 @@ def context_split():
     write to a usage file still recomputes at once.
     """
     usage_dir = DATA / "usage"
-    sig = (str(usage_dir), tuple(sorted((p.name, p.stat().st_size, p.stat().st_mtime_ns)
-                                        for p in usage_dir.glob("*.json")))) \
-        if usage_dir.is_dir() else (str(usage_dir), ())
-    if sig == _split_cache["sig"]:
+    try:
+        sig = (str(usage_dir), tuple(sorted((p.name, p.stat().st_size, p.stat().st_mtime_ns)
+                                            for p in usage_dir.glob("*.json")))) \
+            if usage_dir.is_dir() else (str(usage_dir), ())
+    except OSError:
+        sig = None  # a file vanished between glob and stat: recompute next frame
+    if sig is not None and sig == _split_cache["sig"]:
         return _split_cache["value"]
     out = []
     for seat in tuple(AGENTS) + APP_SEATS:
@@ -3065,7 +3068,7 @@ def context_split():
             used = size * pct / 100
         out.append([seat, float(used)])
     _split_cache.update(sig=sig, value=out)
-    return out
+    return out  # the cached list is shared by every caller: treat it as read-only
 
 
 def context_pie(split, width, step=None, busy=None):
