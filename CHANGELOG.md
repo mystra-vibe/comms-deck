@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- **The context split moves right.** The CONTEXT SPLIT pie and its
+  per-seat bars now sit at the foot of the right-hand column, under
+  TASKS; the left usage column keeps the per-seat meters and the
+  CONTEXT / PLAN USAGE lists. The pie and bars were too tall for the
+  left. By Devin, on the owner's ask.
 - **The citation rule, enforced.** `comms-deck cite-check <PR> [--strict]`
   sits beside review-check as rule 4's own gate: a PR must say who wrote
   it, and in strict mode must cite every file it touches. docs/CITATION.md
