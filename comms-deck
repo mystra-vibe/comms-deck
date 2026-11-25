@@ -6357,6 +6357,7 @@ def self_test():
         "gap = x.cite_gap('Written by: grok\\nREADME.md\\n', 99)",
         "assert gap and 'never cites' in gap and 'docs/README.md' in gap, gap",
         "assert x.cite_gap('Written by: grok\\nPR touches comms-deck, docs/README.md.\\n', 99) is None, 'a sentence-ending period still cites'",
+        "assert x.cite_gap('Written by: grok\\nPR touches `comms-deck` and **docs/README.md**\\n', 99) is None, 'markdown-wrapped paths cite'",
         "gap = x.cite_gap('Written by: grok\\ndocs/README.md.backup is a different file\\n', 99)",
         "assert gap and 'docs/README.md' in gap, gap",
         "gap = x.cite_gap('Reviewed by: claude\\n')",
@@ -6457,11 +6458,16 @@ def cite_gap(text, number=None):
     if not writers:
         return "no Written by line naming a seat"
     if number:
+        # Markdown-emphasis and inline-code marks wouldn't stop a reader
+        # from seeing the path, so strip them before matching (claude's
+        # review of the first cut): `docs/CITATION.md` or **README.md**
+        # cite the file just as plainly as bare text.
+        plain = re.sub(r"`{1,3}([^`]*)`{1,3}", r"\1", text).replace("**", "")
         # Whole-path match: docs/README.md is not cited by README.md. A
         # sentence-ending period after the path still counts; a period that
         # starts another path segment (docs/README.md.backup) does not.
         cited = lambda path: re.search(r"(?<![\w./-])" + re.escape(path)
-                                       + r"(?=$|[\s,;:)]|\.(?![\w]))", text) is not None
+                                       + r"(?=$|[\s,;:)]|\.(?![\w]))", plain) is not None
         missing = [path for path in pr_files(number) if not cited(path)]
         if missing:
             return "files the PR touches that its text never cites: " + ", ".join(missing[:6])
