@@ -579,8 +579,11 @@ def send(sender, to, text, quiet=False, private=False):
     if "all" in excludes:
         raise ValueError("- excludes seats, not 'all'")
     if "all" in names:
-        to = "all" if not excludes else "all-" + "-".join(excludes)
         targets = [s for s in tuple(AGENTS) + APP_SEATS if s != sender and s not in excludes]
+        # the real recipients, not "all-grok": every reader of `to` (the
+        # snapshot's "went to more than one agent", Discord, the chat view)
+        # knows "+"-joined names, and "all" only when nobody was dropped.
+        to = "all" if not excludes else "+".join(targets)
     else:
         targets = [n for n in names if n not in excludes]
         to = "+".join(targets)
@@ -2912,20 +2915,28 @@ def current_states():
 
 
 MENTION = re.compile(r"(?<![\w@])@([A-Za-z][\w-]*)")
+EXCLUDE = re.compile(r"(?<![\w-])-([A-Za-z][\w-]*)")
 
 
 def route(text):
     """Who the owner's chat-box line goes to: (seats, error or None).
 
     @seat names a seat (several are fine); @all, or no @ at all, is everyone.
+    A "-seat" token drops that seat instead (the inverse of an @command):
+    "-grok hello" goes to everyone but Grok. Only real seat names count, and
+    only at the start of a word, so "re-run" and "-rf" are left as text.
     """
     names = [m.lower() for m in MENTION.findall(text)]
+    excludes = list(dict.fromkeys(m.group(1).lower() for m in EXCLUDE.finditer(text)
+                                  if m.group(1).lower() in SEATS))
     if not names or "all" in names:
-        return ["all"], None
+        return ["all"] + ["-" + s for s in excludes], None
     unknown = [n for n in names if n not in SEATS or n == "owner"]
     if unknown:
         return [], f"no seat called @{unknown[0]}; try " + " ".join(f"@{s}" for s in SEATS if s != "owner" and s not in HIDDEN_SEATS) + " @all"
-    return list(dict.fromkeys(names)), None
+    if not [n for n in dict.fromkeys(names) if n not in excludes]:
+        return [], f"-{', -'.join(excludes)} leaves nobody to send to"
+    return list(dict.fromkeys(names)) + ["-" + s for s in excludes], None
 
 
 def chat(history=200, hide_private=False):
@@ -3671,9 +3682,11 @@ def self_test():
     r = run(["send", "all -grok", "minus grok"], "owner")
     in_grok = [json.load(open(p)) for p in Path(f"{tmp}/data/inbox/grok").glob("*.json")]
     in_claude = [json.load(open(p)) for p in Path(f"{tmp}/data/inbox/claude").glob("*.json")]
+    now_to = [g["to"] for g in in_claude if g["text"] == "minus grok"]
     check("a -seat token is dropped from the recipients",
           r.returncode == 0 and not any("minus grok" in g["text"] for g in in_grok)
-          and any("minus grok" in g["text"] and g["to"] == "all-grok" for g in in_claude),
+          and now_to and "+" in now_to[0] and "grok" not in now_to[0].split("+")
+          and "claude" in now_to[0],  # the record reads the real recipients, "+-joined
           r.stdout + r.stderr)
     for p in Path(f"{tmp}/data/inbox/claude").glob("*.json"):
         if "minus grok" in json.load(open(p))["text"]:
@@ -3699,10 +3712,15 @@ def self_test():
             f"l = m.SourceFileLoader('lp', {me!r}); s = u.spec_from_loader('lp', l)\n"
             "x = u.module_from_spec(s); l.exec_module(x)\n"
             "print(x.route('@grok hi')[0], x.route('hi @Claude and @grok')[0], x.route('@all go')[0],"
-            " bool(x.route('@bob hi')[1]), x.route('no mention')[0] == ['all'], x.MENTION.findall('mail a@grok.com') == [])")
+            " bool(x.route('@bob hi')[1]), x.route('no mention')[0] == ['all'], x.MENTION.findall('mail a@grok.com') == [],"
+            " x.route('-grok hello')[0], x.route('hi @Claude and @grok -claude')[0],"
+            " x.route('@all -grok go')[0], bool(x.route('re-run it -rf')[0] == ['all']),"
+            " x.route('@grok -grok hi')[1])")
     r = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True, timeout=30)
-    check("chat box routing (@seat, several, @all, unknown, no @ = all, not emails)",
-          r.stdout.strip() == "['grok'] ['claude', 'grok'] ['all'] True True True", r.stdout + r.stderr)
+    check("chat box routing (@seat, several, @all, unknown, no @ = all, not emails, -seat drops)",
+          r.stdout.strip() == "['grok'] ['claude', 'grok'] ['all'] True True True "
+          "['all', '-grok'] ['claude', 'grok', '-claude'] ['all', '-grok'] True "
+          "-grok leaves nobody to send to", r.stdout + r.stderr)
     run(["send", "claude", "for claude"], "grok")
     r = run(["hook", "--source", "claude", "--event", "UserPromptSubmit"], "claude", '{"prompt": "hi"}')
     check("Claude gets notes with the owner's prompt", "for claude" in r.stdout, r.stdout + r.stderr)
