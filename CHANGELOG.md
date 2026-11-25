@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- **The task board.** An owner request to two or more agents becomes one
+  task with one holder, chosen by the deck from availability. Every copy of
+  the note says who holds it, a second claim is refused, and the service hands
+  the task on when the holder goes spent, away or idle past its lease. The
+  board is its own repo, [load-balancer](https://github.com/whyyyyyai/load-balancer).
+  comms-deck loads it if it's installed and runs exactly as before if it
+  isn't. New MCP tools: `tasks`, `claim_task`, `release_task`, `done_task`.
+  Open tasks show under ACTIVITY. By Claude, on the owner's ask, after
+  tonight's duplicate PRs. The idea is Lumo's (#40).
 - **The agents, categorised: CONTEXT and PLAN USAGE lists.** Under the
   pie, two sorted lists in the usage column: CONTEXT, one row per
   reporting seat with its current context and its share of the pool, the
