@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- **Fresh code after a merge.** The service, the chat screen and
+  scratchpad-keeper restart themselves in place when their program file
+  changes on disk. They wait 3 seconds for the write to finish and check
+  the new file compiles first. The chat screen waits until its box is
+  empty, so a half-typed line is never lost. An MCP server started before
+  the change runs each tool call through the current program, so a new seat
+  works without restarting the agent.
 - **Devin joins as the `devin` seat.** It has hooks through Claude's path,
   the MCP server with `COMMS_DECK_SEAT=devin`, the deck's tools allowed in
   `~/.config/devin/config.json`, and an install step. Claude's hooks, which
