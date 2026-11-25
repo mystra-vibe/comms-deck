@@ -76,7 +76,9 @@ the owner.
   limit, so it isn't in the dollar total. Grok's figures are read from
   its own session files, so they don't depend on Grok's status line.
   Gravity's row is the model name from its hooks. agy does not report
-  token or quota figures there, so that row has no bar.
+  token or quota figures there, so that row has no bar. Devin has no
+  status line either; its row comes from the OTLP metrics the CLI exports
+  to the service (session tokens and model, no cost or plan limit).
 - **ACTIVITY** (right): each change of a seat's state, newest first.
 - **The status bar** (bottom): each seat's light and state (busy, idle,
   away, chat not open, not set up), how long it has been that way, and how
@@ -144,6 +146,8 @@ each agent it finds:
   `~/.vibe/hooks.toml`, and a `[[mcp_servers]]` entry named `comms-deck` in
   `~/.vibe/config.toml`, if `vibe` is installed. Other hooks are kept.
 - **Codex:** the MCP server in `~/.codex/config.toml`.
+- **Devin:** hooks, the MCP server, the deck's tool permission and the OTLP
+  metrics endpoint in `~/.config/devin/`, if `devin` is installed.
 
 It also turns on kitty remote control and starts `comms-deck.service` and
 `push-courier.service`. It's safe to run again. Then **open fresh kitty
