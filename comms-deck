@@ -169,7 +169,8 @@ WEBHOOK_FILE = CONFIG / "discord-webhook"
 # Agent seats: the process name each one runs as. Extra seats can be added
 # with COMMS_DECK_SEATS="name:process,name2:process2".
 AGENTS = {"claude": "claude", "grok": "grok", "codex": "codex", "gravity": "agy",  # gravity: the Antigravity CLI, whose program is agy
-          "vibe": "vibe-rs"}  # vibe: Mistral Vibe, whose program is vibe-rs (the `vibe` launcher execs it)
+          "vibe": "vibe-rs",  # vibe: Mistral Vibe, whose program is vibe-rs (the `vibe` launcher execs it)
+          "devin": "devin"}  # devin: Cognition's Devin CLI
 for _pair in filter(None, setting("SEATS", "").split(",")):
     _name, _, _proc = _pair.partition(":")
     AGENTS[_name.strip()] = (_proc or _name).strip()
@@ -812,13 +813,24 @@ def paused_for_background(data):
     return bool(data.get("backgroundTasks") or data.get("sessionCrons"))
 
 
+# Devin's hooks use Claude Code's event names and replies (additionalContext
+# on SessionStart and UserPromptSubmit, {"decision": "block"} on Stop), so it
+# takes Claude's path through hook(). It has no idle_prompt notification.
+CLAUDE_LIKE = ("claude", "devin")
+
+
 def hook(source, event):
     """Handle one hook event (JSON on stdin). Prints the reply, if any."""
     if source == "agy":
         return agy_hook(event)
     if source == "vibe":
         return vibe_hook(event)
-    running_in = "grok" if os.environ.get("GROK_HOOK_EVENT") else "claude"
+    # Grok and Devin both also read ~/.claude/settings.json, so Claude's hooks
+    # fire inside them too. Each agent marks its own hook runs: Grok sets
+    # GROK_HOOK_EVENT, Devin sets DEVIN_PROJECT_DIR. Only the hook installed
+    # for the agent we're running in acts.
+    running_in = ("grok" if os.environ.get("GROK_HOOK_EVENT")
+                  else "devin" if os.environ.get("DEVIN_PROJECT_DIR") else "claude")
     if source != running_in:
         return  # e.g. Grok reading Claude's settings file: not our hook here
     try:
@@ -843,7 +855,7 @@ def hook(source, event):
         remember_window(seat, pid)
         update_seat(seat, state="idle", auto=0, prompt_id=None)
         count = len(pending(seat))
-        if count and source == "claude":
+        if count and source in CLAUDE_LIKE:
             reply({"hookSpecificOutput": {"hookEventName": "SessionStart",
                    "additionalContext": f"{MARK} {count} note(s) are waiting for you "
                                         f"({seat}). Read them with read_messages."}})
@@ -868,7 +880,7 @@ def hook(source, event):
         if prompt_id:
             changes["prompt_id"] = prompt_id
         update_seat(seat, **changes)
-        if source == "claude" and owner_typed:
+        if source in CLAUDE_LIKE and owner_typed:
             notes = take(seat, limit_chars=HANDOVER_MAX)
             if notes:
                 reply({"hookSpecificOutput": {"hookEventName": "UserPromptSubmit",
@@ -893,10 +905,11 @@ def hook(source, event):
                 return
         elif any(not r.get("quiet") for _, r in pending(seat)):
             pause_notice(seat)
-        if source == "claude":
+        if source in CLAUDE_LIKE:
             # On Claude an allowed Stop is the end of the turn (comms-deck's
             # is the only Stop hook), so idle now rather than waiting the
-            # minute for idle_prompt. Grok settles idle on idle_prompt only.
+            # minute for idle_prompt. Devin has no idle_prompt, so its Stop
+            # is the only idle signal. Grok settles idle on idle_prompt only.
             update_seat(seat, state="idle")
     elif event == "StopCancelled":
         # Idle waits for idle_prompt. An older cancel must not touch the seat:
@@ -2444,7 +2457,8 @@ def watch():
 # workspace. Notes scroll in the top part of the terminal; the bottom line is
 # a status bar that stays put (an ANSI scroll region), showing each seat.
 
-SEAT_COLOURS = {"claude": 208, "grok": 45, "codex": 78, "vibe": 203, "owner": 220, "push-courier": 245}
+SEAT_COLOURS = {"claude": 208, "grok": 45, "codex": 78, "vibe": 203, "devin": 141, "owner": 220,
+                "push-courier": 245}
 # One symbol per state, so busy and idle differ at a glance (not by colour alone).
 STATE_MARKS = {"busy": "●", "idle": "○", "away": "·"}
 STATE_COLOURS = {"busy": 208, "idle": 78, "away": 240, "connected": 78, "not connected": 214,
@@ -3417,6 +3431,34 @@ def claude_hooks(cmd):
         "Notification": [entry("Notification", "idle_prompt")]}
 
 
+DEVIN_HOOK_EVENTS = ("SessionStart", "UserPromptSubmit", "Stop", "SessionEnd")
+DEVIN_ALLOW = "mcp__comms-deck__*"  # the deck's MCP tools run without a prompt, as for Vibe
+
+
+def devin_config(config, cmd):
+    """`config` (~/.config/devin/config.json, as a dict) with the deck's hooks
+    and its tool permission added. Other hooks and permissions are kept, and
+    an earlier comms-deck entry is replaced, so running it twice is once."""
+    config = json.loads(json.dumps(config or {}))  # a copy
+    hooks = config.setdefault("hooks", {})
+    for event in DEVIN_HOOK_EVENTS:
+        kept = [e for e in hooks.get(event, []) if "comms-deck hook" not in json.dumps(e)]
+        hooks[event] = kept + [{"hooks": [{"type": "command", "timeout": 10,
+                                           "command": f"{cmd} hook --source devin --event {event}"}]}]
+    allow = config.setdefault("permissions", {}).setdefault("allow", [])
+    if DEVIN_ALLOW not in allow:
+        allow.append(DEVIN_ALLOW)
+    return config
+
+
+def devin_mcp_config(config, cmd):
+    """`config` (~/.config/devin/mcp_config.json) with the comms-deck server set."""
+    config = json.loads(json.dumps(config or {}))
+    config.setdefault("mcpServers", {})["comms-deck"] = {
+        "command": cmd, "args": ["mcp"], "env": {"COMMS_DECK_SEAT": "devin"}}
+    return config
+
+
 def grok_hooks(cmd):
     """The hooks file for ~/.grok/hooks/comms-deck.json.
 
@@ -3579,6 +3621,29 @@ def install(yes):
             config_path.write_text(granted)
             config_path.chmod(0o600)
     step("add hooks, the MCP server and its tool permissions for Mistral Vibe, if installed (~/.vibe)", mistral_vibe)
+    def devin_files():
+        if not shutil.which("devin") and not (bin_dir / "devin").exists():
+            return
+        folder = HOME / ".config/devin"
+        folder.mkdir(parents=True, exist_ok=True)
+        for name, build in (("config.json", devin_config), ("mcp_config.json", devin_mcp_config)):
+            path = folder / name
+            current = {}
+            if path.exists():
+                try:
+                    current = json.loads(path.read_text() or "{}")
+                except ValueError:
+                    # Devin allows comments in its JSON; don't overwrite a
+                    # file we can't read back. Say so, and leave it.
+                    print(f"     skipped {path}: it isn't plain JSON (comments?); add the comms-deck "
+                          f"entries by hand")
+                    continue
+                shutil.copy(path, path.with_suffix(".json.comms-deck-backup"))
+            updated = build(current, cmd)
+            if updated != current:
+                path.write_text(json.dumps(updated, indent=2) + "\n")
+    step("add hooks, the MCP server and its tool permission for Devin, if installed (~/.config/devin)",
+         devin_files)
     step("register the MCP server with Codex, if installed (~/.codex/config.toml)",
          lambda: mcp_toml(HOME / ".codex/config.toml", "[mcp_servers.comms-deck]"))
 
@@ -3905,6 +3970,43 @@ def self_test():
           (read_json(Path(tmp) / "data/seats/vibe.json", {}) or {}).get("state") == "away")
     r = run(["hook", "--source", "vibe", "--event", "post_agent"], "grok", "{}")
     check("the vibe hook does nothing outside Vibe", not r.stdout.strip(), r.stdout)
+    devin = {"DEVIN_PROJECT_DIR": tmp}
+    seat_file = Path(tmp) / "data/seats/devin.json"
+    run(["send", "devin", "hello devin"], "claude")
+    r = run(["hook", "--source", "devin", "--event", "SessionStart"], "devin", '{"source": "startup"}', devin)
+    ctx = (json.loads(r.stdout or "{}").get("hookSpecificOutput") or {}).get("additionalContext", "")
+    check("devin's SessionStart says how many notes wait", "1 note(s) are waiting" in ctx, r.stdout + r.stderr)
+    r = run(["hook", "--source", "claude", "--event", "Stop"], "devin", "{}", devin)
+    check("Claude's hooks, which Devin also reads, do nothing inside Devin", not r.stdout.strip(), r.stdout)
+    r = run(["hook", "--source", "devin", "--event", "Stop"], "devin", "{}")
+    check("the devin hook does nothing outside Devin", not r.stdout.strip(), r.stdout)
+    r = run(["hook", "--source", "devin", "--event", "Stop"], "devin", '{"stop_hook_active": false}', devin)
+    out = json.loads(r.stdout or "{}")
+    check("devin's Stop hands a waiting note over as block + reason",
+          out.get("decision") == "block" and "hello devin" in out.get("reason", ""), r.stdout + r.stderr)
+    run(["hook", "--source", "devin", "--event", "Stop"], "devin", '{"stop_hook_active": true}', devin)
+    check("devin is idle after a Stop with nothing waiting",
+          (read_json(seat_file, {}) or {}).get("state") == "idle")
+    run(["send", "devin", "owner says hi"], "owner")
+    r = run(["hook", "--source", "devin", "--event", "UserPromptSubmit"], "devin",
+            '{"prompt": "fix the panel", "prompt_id": "p1"}', devin)
+    ctx = (json.loads(r.stdout or "{}").get("hookSpecificOutput") or {}).get("additionalContext", "")
+    check("devin is busy on a typed prompt and gets waiting notes with it",
+          (read_json(seat_file, {}) or {}).get("state") == "busy" and "owner says hi" in ctx, r.stdout + r.stderr)
+    run(["hook", "--source", "devin", "--event", "SessionEnd"], "devin", '{"reason": "exit"}', devin)
+    check("devin is away after SessionEnd", (read_json(seat_file, {}) or {}).get("state") == "away")
+    mine = {"hooks": {"Stop": [{"hooks": [{"type": "command", "command": "my-own-check"}]}]},
+            "permissions": {"allow": ["exec"]}}
+    once = devin_config(mine, "/x/comms-deck")
+    check("devin's config: four deck hooks and the tool permission added, the owner's own kept, twice is once",
+          once == devin_config(once, "/x/comms-deck") and len(once["hooks"]["Stop"]) == 2
+          and once["hooks"]["Stop"][0]["hooks"][0]["command"] == "my-own-check"
+          and set(once["hooks"]) == set(DEVIN_HOOK_EVENTS)
+          and once["permissions"]["allow"] == ["exec", "mcp__comms-deck__*"], json.dumps(once))
+    mcp = devin_mcp_config({"mcpServers": {"other": {"command": "x"}}}, "/x/comms-deck")
+    check("devin's MCP config names the seat and keeps other servers",
+          mcp["mcpServers"]["comms-deck"]["env"] == {"COMMS_DECK_SEAT": "devin"}
+          and "other" in mcp["mcpServers"], json.dumps(mcp))
     vibe_screen = ("Running in this location is not recommended.\n"
                    "\u2500" * 60 + " GLM 5.3 Flash (Mistral Hosted)[high] \u00b7 accept edits \u2500\n"
                    "> Hello. Check the local directory\n" + "\u2500" * 100 + "\n"
@@ -4355,7 +4457,7 @@ def main():
     sub.add_parser("serve")
     sub.add_parser("mcp")
     p = sub.add_parser("hook")
-    p.add_argument("--source", required=True, choices=("claude", "grok", "agy", "vibe"))
+    p.add_argument("--source", required=True, choices=("claude", "grok", "agy", "vibe", "devin"))
     p.add_argument("--event", default="")
     p = sub.add_parser("statusline")
     p.add_argument("--source", required=True, choices=("claude", "grok", "agy"))
