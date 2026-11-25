@@ -2519,12 +2519,29 @@ def fit(text, width):
     return ANSI.sub("", text)[:max(0, width - 1)] + "…"
 
 
-def bar(pct, width):
-    """A coloured bar for a 0-100 percentage."""
+def bar(pct, width, step=None):
+    """A coloured bar for a 0-100 percentage, pulsing like the context rows.
+
+    Same holographic recipe (the owner, 02:15): the threshold hue never
+    changes (green/amber/red by how full), each cell breathes
+    dim/normal/bold, and one white glint sweeps left to right on the
+    redraw clock. `step` freezes the phase (tests).
+    """
     pct = max(0.0, min(100.0, float(pct)))
     full = round(width * pct / 100)
     shade = 78 if pct < 60 else 214 if pct < 85 else 196
-    return f"\033[38;5;{shade}m{'█' * full}\033[38;5;238m{'░' * (width - full)}\033[0m"
+    step = pulse_step() if step is None else step
+    glint = (step * 2) % (width + 4) - 2
+    esc = "\033["
+    cells = []
+    for pos in range(width):
+        if pos >= full:
+            cells.append(f"{esc}0;38;5;238m░{esc}0m")
+        elif pos == glint:
+            cells.append(f"{esc}1;38;5;255m█{esc}0m")
+        else:
+            cells.append(f"{esc}{pulse_style(shade, (pos + step) % 8)}m█{esc}0m")
+    return "".join(cells)
 
 
 def short_tokens(n):
@@ -4670,6 +4687,12 @@ def self_test():
         "assert pt0 != pt5, 'the disc breathes too'",
         "assert '38;5;' + str(x.SEAT_COLOURS['grok']) in ''.join(pt0) or '38;5;45' in ''.join(pt0), 'the disc keeps the key as well'",
         "assert x.pulse_style(208, 0) == '2;38;5;208' and x.pulse_style(208, 4) == '1;38;5;208', 'dim, then bold'",
+        "b0 = x.bar(50, 10, step=0); b2 = x.bar(50, 10, step=2)",
+        "assert b0 != b2, 'the usage bars pulse too'",
+        "assert '38;5;78' in b0, 'the threshold hue (green at 50%) survives the pulse'",
+        "assert '38;5;255' in x.bar(50, 10, step=1), 'a glint sweeps the usage bars as well'",
+        "assert '█' not in x.ANSI.sub('', x.bar(0, 8, step=0)), 'an empty bar draws an empty track, no glint'",
+        "assert '38;5;196' in x.bar(95, 10, step=0), 'a full bar reads red, not amber'",
         "x.DATA = real_data",
         "assert x.poll_countdown({}, now) == \"hasn't checked yet\"",
         "assert x.poll_countdown({'polled_at': now - 18}, now) == 'next check in 0:42'",
