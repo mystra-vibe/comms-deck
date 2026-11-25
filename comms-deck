@@ -793,8 +793,8 @@ def render(records, seat):
     senders = sorted({r["from"] for r in records} & set(SEATS))
     reply = (f"\n\nReply with the send_message tool (to: {senders[0]})"
              f" or `comms-deck send {senders[0]} \"...\"`." if senders else "")
-    if seat in APP_SEATS:
-        # An app seat reads this in its own chat and has no comms-deck tools:
+    if seat in APP_SEATS and APP_PROCESS.get(seat, "grok-bot") == "grok-bot":
+        # A Grok Bot seat reads this in its own chat and has no comms-deck tools:
         # its chat reply is picked up and filed, so tell it how that works.
         who = "owner" if "owner" in senders or not senders else senders[0]  # not just the first alphabetically
         return (f"{MARK} {len(records)} note(s) for {seat}:\n\n" + "\n\n".join(lines)
@@ -3983,7 +3983,32 @@ def poll_countdown(state, now=None):
     return f"next check in {clock(left)}" if left >= 0 else f"check late {clock(-left)}"
 
 
+def mcp_only(seat):
+    """True for an app seat that reaches the deck only through MCP (Lumo): nothing can wake it."""
+    return seat in APP_SEATS and APP_PROCESS.get(seat, "grok-bot") != "grok-bot"
+
+
 def mcp_call(seat, name, args):
+    """Run one MCP tool. Returns (text, is_error).
+
+    A seat that can't be woken (mcp_only) gets its waiting notes with the
+    answer to any tool, not only read_messages: the same as a hook handing
+    Claude its notes at the end of a turn. Otherwise a seat that is busy
+    sending and setting status, but not reading, never sees its notes.
+    """
+    text, error = mcp_tool(seat, name, args)
+    if not error and name != "read_messages" and mcp_only(seat):
+        notes = take(seat)
+        if notes:
+            try:
+                note_mcp_call(seat, "read_messages")
+            except OSError:
+                pass
+            text += "\n\n---\nNotes that were waiting for you:\n\n" + render(notes, seat)
+    return text, error
+
+
+def mcp_tool(seat, name, args):
     """Run one MCP tool. Returns (text, is_error)."""
     try:
         note_mcp_call(seat, name)
@@ -4852,6 +4877,13 @@ def self_test():
         "assert fresh == [] and cur == 't1@3'",
         "idle = {'open': True, 'replying': False, 'composer': ''}",
         "assert x.app_delivery_allowed({'open':True,'replying':True,'composer':''}, False, {'auto':0}, 'alice') is False",
+        "x.APP_SEATS = tuple(set(x.APP_SEATS) | {'pollseat2'}); x.APP_PROCESS['pollseat2'] = 'some-app'",
+        "x.write_json(x.DATA / 'inbox' / 'pollseat2' / 'n1.json', {'id': 'n1', 'from': 'owner', 'to': 'pollseat2', 'text': 'please check X', 'time': '2026-11-24 07:00:00', 'quiet': False, 'private': False})",
+        "out, err = x.mcp_call('pollseat2', 'set_status', {'text': 'working'})",
+        "assert not err and 'Notes that were waiting for you' in out and 'please check X' in out and not x.pending('pollseat2')",
+        "assert 'send_message tool' in out and 'Reply here in this chat' not in out",
+        "out, err = x.mcp_call('pollseat2', 'set_status', {'text': 'again'}); assert 'Notes that were waiting' not in out",
+        "assert x.load_seat('pollseat2').get('polled_at')",
         "ch, st = x.draft_status({}, 'w', 1000.0); assert ch == {'app_draft': 'w', 'app_draft_since': 1000.0} and not st",
         "ch, st = x.draft_status({'app_draft': 'w', 'app_draft_since': 1000.0}, 'w', 1000.0 + x.DRAFT_STALE - 1); assert not ch and not st",
         "ch, st = x.draft_status({'app_draft': 'w', 'app_draft_since': 1000.0}, 'w', 1000.0 + x.DRAFT_STALE); assert st",
