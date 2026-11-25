@@ -668,15 +668,37 @@ def send(sender, to, text, quiet=False, private=False):
             log(f"load-balancer couldn't make a task: {error}")
         if task:
             record["task"] = task["id"]
+    deliver(record, targets)
+    return record, warning
+
+
+def deliver(record, targets, enqueue=True):
+    """One delivery path, shared by send() (and, once #75 lands,
+    import_remote()): each target gets the note (an inbox file; the desktop
+    bell for the owner; nothing for a remote seat, whose mailbox is the git
+    copy), then the git queue, then the log, then the @deck actions.
+
+    `enqueue=False` is import_remote's case: the record came FROM the git
+    copy of the flight-log, so queueing it again would commit it back a
+    second time.
+
+    Written by: mystra (2026-11-25); the body is send()'s tail moved rather
+    than changed, with the `if enqueue` around queue_out — at the owner's
+    instruction, from the Wave-1 package on quantum-kittens (PR #7).
+    """
     for seat in targets:
         if seat == "owner":
-            notify(f"Note from {record['from']}", text)
+            notify(f"Note from {record['from']}", record["text"])
+        elif APP_PROCESS.get(seat) == "remote":
+            pass  # a remote seat takes its notes from the git copy; nothing here
+                  # would ever take it out of an inbox, so the screen's squares
+                  # must not count one that won't be read
         else:
             write_json(DATA / "inbox" / seat / f"{record['id']}.json", record)
-    queue_out(record)
+    if enqueue:
+        queue_out(record)
     append_log(record)
     queue_actions(record)
-    return record, warning
 
 
 def add_note(sender, text):
