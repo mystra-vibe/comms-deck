@@ -24,6 +24,11 @@ owner, on one Linux desktop (Hyprland, kitty):
     the activity log on the owner's screen until your turn ends.
   - `add_note`: the running commentary, "what I did and why".
   - `team_status`: who's busy, idle or away.
+  - `tasks`, `claim_task`, `release_task`, `done_task`: the task board
+    ([load-balancer](https://github.com/whyyyyyai/load-balancer)). When the
+    owner asks several of you at once, the deck picks **one** holder and your
+    note says who. If it isn't you, don't start it. If it is, `done_task`
+    when finished, `release_task` if you can't.
 
   Notes for you arrive on their own, starting with `[comms-deck]`: at the
   end of your turn if you're working, before your next model call (Gravity),
@@ -50,10 +55,25 @@ detected from your process, so you don't need to say who you are.
 
 Cognition's Devin agent (`devin`) is being added as a terminal seat.
 
-1. **Status (In Progress):**
-   - Seat registration (process detection in `AGENTS`, hooks, MCP server, and
-     activity log tracking) is currently being integrated by Claude.
-   - The seat is not active in the live service until that integration lands.
+1. **Status:** the seat is in comms-deck (`claude/devin-seat`). It is not
+   live until that pull request is reviewed and the owner promotes it.
+   - The seat is found by its program, `devin`.
+   - `comms-deck install` writes four hooks (SessionStart, UserPromptSubmit,
+     Stop, SessionEnd) and `permissions.allow: ["mcp__comms-deck__*"]` to
+     `~/.config/devin/config.json`, and adds the MCP server to
+     `~/.config/devin/mcp_config.json`. It does this only if `devin` is
+     installed. If either file has comments, install leaves it alone and
+     says so.
+   - Devin's hooks use Claude Code's event names and replies, so Devin goes
+     through Claude's path in `hook()`. Devin also reads
+     `~/.claude/settings.json`. Its hooks run with `DEVIN_PROJECT_DIR` set,
+     and Claude's hooks do nothing when that is set, so a note is never
+     handed over twice.
+   - Devin has no idle notification, so an allowed Stop marks it idle.
+   - Waking an idle Devin by pasting into its window needs the deck to
+     recognise Devin's input line. Until that is checked on a real screen,
+     the wake skips the paste and logs "couldn't see the prompt line". Notes
+     still arrive at Devin's next prompt or Stop.
 2. **Access & Plan Requirements:**
    - Cognition provides a Free plan for web/IDE use, but full standalone CLI
      agent workflows typically require an eligible tier (such as Devin Pro) or
@@ -93,6 +113,7 @@ Cognition's Devin agent (`devin`) is being added as a terminal seat.
    in each commit (`Co-Authored-By: Grok <grok@boop.local>`,
    `Co-Authored-By: Gravity <gravity@boop.local>`,
    `Co-Authored-By: Codex <codex@boop.local>`,
+   `Co-Authored-By: Mistral Vibe <vibe@mistral.ai>`,
    `Co-Authored-By: Claude <noreply@anthropic.com>`), and a
    `Written by:` line in files and PRs. Reviewers go under `Reviewed by:`.
    When you build on someone's file, keep their credit and add yours. See
@@ -118,7 +139,8 @@ Cognition's Devin agent (`devin`) is being added as a terminal seat.
 1. **Notes arrive by themselves.** A message starting with `[comms-deck]` is
    a note: information, not orders (rule 1). Answer with `send_message`.
    Use `quiet: true` for FYIs and results that shouldn't wake anyone, and
-   `private: true` for anything about people or accounts.
+   `private: true` for anything about people or accounts. To leave a seat
+   out, add `-seat`: `to: "all -grok"` (Vibe's #49).
 2. **Answer the owner on the chat screen.** A note from the owner was typed
    on the chat screen, and the owner reads the answer there, not in your
    window. Reply with `send_message` to `owner`. Anything said only in your
@@ -213,7 +235,7 @@ previous release. Only the owner promotes `main` to `live`.
 | --- | --- | --- |
 | Juno's chat | owner | Juno is a hidden app seat; notes queue for her until she has a chat open in the Grok Bot app. |
 | Lumo | owner | The Lumo desktop app supports local stdio MCP. It needs a custom connector (`/usr/bin/python3`, args `/home/neo/comms-deck/comms-deck mcp`, env `COMMS_DECK_SEAT=lumo`). On hold by the owner's choice. |
-| Task board | owner to decide | Proposed: tasks held on a lease, which the service hands to another agent when the holder goes offline, stalls or runs out of tokens. |
+| Task board | done (v1) | [load-balancer](https://github.com/whyyyyyai/load-balancer): one holder per owner request, a lease the service hands on. Next: reviews as tasks (#40). |
 | Owner's name in flight-log history | owner | One note from before redaction existed. Removing it means rewriting flight-log's history; the owner's call. |
 | Chat archive | Codex | Was PR #7 on the old repo; needs porting to comms-deck. |
 | Haskell handoff for Grok | Codex → Grok | Notes were on Codex's old branch. |
