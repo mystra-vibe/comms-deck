@@ -3029,6 +3029,9 @@ def waiting_summary(notes):
     return f"{len(notes)} waiting · {detail}{extra}"
 
 
+_split_cache = {"sig": None, "value": []}
+
+
 def context_split():
     """[(seat, tokens)] for every seat that reports a live context figure.
 
@@ -3038,7 +3041,18 @@ def context_split():
     gravity's agy), is left out rather than counted as zero. Alice and Juno
     share one Grok Bot account, which gives a weekly limit, not a context
     window, so the shared row drops out here too.
+
+    Both chat panels ask for this every frame, so the answer is cached on
+    the usage folder and its files' names, sizes and mtimes: a stat per
+    file is far cheaper than re-reading and re-parsing them all, and any
+    write to a usage file still recomputes at once.
     """
+    usage_dir = DATA / "usage"
+    sig = (str(usage_dir), tuple(sorted((p.name, p.stat().st_size, p.stat().st_mtime_ns)
+                                        for p in usage_dir.glob("*.json")))) \
+        if usage_dir.is_dir() else (str(usage_dir), ())
+    if sig == _split_cache["sig"]:
+        return _split_cache["value"]
     out = []
     for seat in tuple(AGENTS) + APP_SEATS:
         d = (read_json(DATA / "usage" / f"{seat}.json", {}) or {}).get("data", {}) or {}
@@ -3050,6 +3064,7 @@ def context_split():
                 continue
             used = size * pct / 100
         out.append([seat, float(used)])
+    _split_cache.update(sig=sig, value=out)
     return out
 
 
@@ -6220,6 +6235,10 @@ def self_test():
         "assert cr0 != cr3, 'the shimmer moves with the step'",
         "assert '38;5;45' in cr0[0], 'grok\\'s line keeps grok\\'s hue'",
         "assert '38;5;255' in ''.join(cr3), 'a glint sweeps the bar; not a strobe'",
+        # The split's mtime cache: same files, same answer object; a write recomputes.
+        "assert x.context_split() is x.context_split(), 'the split is cached between frames'",
+        "x.write_json(pc / 'usage' / 'grok.json', {'time': 2, 'source': 'test', 'data': {'context_window': {'context_tokens': 1000}}})",
+        "assert dict(x.context_split())['grok'] == 1000.0, 'a usage write recomputes the split'",
         "pt0 = x.context_pie(sp, 40, step=0); pt5 = x.context_pie(sp, 40, step=5)",
         "assert pt0 != pt5, 'the disc breathes too'",
         "assert '38;5;' + str(x.SEAT_COLOURS['grok']) in ''.join(pt0) or '38;5;45' in ''.join(pt0), 'the disc keeps the key as well'",
