@@ -3515,28 +3515,36 @@ def usage_panel(width, sort="provider"):
     telemetry at all renders CONNECTED / TELEMETRY UNAVAILABLE with its
     last update, never a misleading zero; a field nobody reported reads
     "—", and a stale row says so. `sort` orders the rows: "provider"
-    (default), "consumption" (family B totals, and allocation's
-    percentages) or "spend" (family C). Bars shimmer only while that
-    seat's agent is busy (04:02); idle bars are still. Sets
-    usage_panel.running for the redraw clock: true while any bar has
-    something to animate, so the screen can tick fast then.
+    (default) orders every block by provider then seat; "consumption" and
+    "spend" order their own block only (allocation's percentages and the
+    financial figures, respectively). Allocation rows carry a compact bar,
+    shaded by severity, which shimmers only while a seat on the account
+    is busy (04:02); idle bars are still. Sets usage_panel.running for
+    the redraw clock: true while any bar has something to animate, so the
+    screen can tick fast then.
     """
     inner = width - 2
-    bar_w = max(6, inner - 16)
+    # A compact bar: name + bar + "40% · 5h · resets 22:19" must share the
+    # row, so the bar stays small and the words survive even at 50 columns.
+    bar_w = max(6, inner - 42)
     esc = "\033["
     recs = telemetry()
     snap = panel_scans()  # one shared half-second snapshot for every panel
     running = busy_seats(snap)
-    app_running = any(seat in running for seat in APP_SEATS)
     usage_panel.running = bool(running) and width > 2
 
     def who(r):
-        # One row per account: the shared bot account names the account,
-        # everyone else names their seats (telemetry_rows already folded,
-        # so `seats` is the full roll-up either way).
-        if r["account"] == "grok-bot":
-            return "GROK BOT ACCOUNT", colour(r["seats"][0])
-        return " · ".join(s.upper() for s in r["seats"]), colour(r["seats"][0])
+        # One row per account: a shared account's row names the account and
+        # its seats, everyone else names their seat. The label comes from the
+        # record; no provider is named in the renderer (the brief's rule 1).
+        if r["account"]:
+            return f"{r['account'].upper()} ACCOUNT · {', '.join(r['seats'])}", colour(r["seats"][0])
+        return r["seats"][0].upper(), colour(r["seats"][0])
+
+    def by_provider(rs):
+        # The provider sort: the registry's label first, then the seat, so
+        # new providers slot in among the known ones (the brief's rule 4).
+        return sorted(rs, key=lambda r: (r["provider"], r["seat"]))
 
     # Family C's head total: the spend the seat reporting it claims for the
     # account, one figure per row.
@@ -3555,17 +3563,18 @@ def usage_panel(width, sort="provider"):
     # on the account works.
     alloc = [r for r in rows if r["allocation"]]
     if alloc:
-        if sort == "consumption":
-            alloc = sorted(alloc, key=lambda r: -max(a["used_pct"] for a in r["allocation"]))
+        alloc = by_provider(alloc) if sort != "consumption" else \
+            sorted(alloc, key=lambda r: -max(a["used_pct"] for a in r["allocation"]))
         out = []
         for r in alloc:
             best = max(r["allocation"], key=lambda a: a["used_pct"])
-            anim = any(s in running for s in r["seats"]) or ("grok-bot" == r["account"] and app_running)
+            anim = any(s in running for s in r["seats"])
             shade = 78 if best["used_pct"] < 60 else 214 if best["used_pct"] < 85 else 196
             reset = (f" · resets {when(best['resets_at'])}"
                      if isinstance(best["resets_at"], (int, float)) else "")
             name, c = who(r)
             out.append(f"{esc}38;5;{c}m■{esc}0m {esc}1;38;5;{c}m{name}{esc}0m "
+                       f"{bar(best['used_pct'], bar_w, animate=anim)} "
                        f"{esc}38;5;{shade}m{best['used_pct']:3.0f}%{esc}0m {esc}2m· {best['window']}{reset}{esc}0m")
         lines += [f"{esc}1mALLOCATION{esc}0m"] + out + [""]
     else:
@@ -3577,7 +3586,7 @@ def usage_panel(width, sort="provider"):
         return (r["tokens"]["input"] or 0) + (r["tokens"]["output"] or 0)
     act = [r for r in rows if any(v is not None for v in r["tokens"].values())]
     out = []
-    for r in (sorted(act, key=lambda r: -consumes(r)) if sort == "consumption" else act):
+    for r in (sorted(act, key=lambda r: -consumes(r)) if sort == "consumption" else by_provider(act)):
         t = r["tokens"]
         bits = ["in " + (short_tokens(t["input"]) if isinstance(t["input"], (int, float)) else "—"),
                 "out " + (short_tokens(t["output"]) if isinstance(t["output"], (int, float)) else "—")]
@@ -3602,7 +3611,7 @@ def usage_panel(width, sort="provider"):
     # tagging the estimate.
     spend = [r for r in rows if isinstance(r["spend"]["session_usd"], (int, float))]
     out = []
-    for r in (sorted(spend, key=lambda r: -r["spend"]["session_usd"]) if sort == "spend" else spend):
+    for r in (sorted(spend, key=lambda r: -r["spend"]["session_usd"]) if sort == "spend" else by_provider(spend)):
         est = " est." if r["spend"]["kind"] == "estimate" else ""
         name, c = who(r)
         out.append(f"{esc}38;5;{c}m■{esc}0m {esc}1;38;5;{c}m{name}{esc}0m "
@@ -3611,18 +3620,17 @@ def usage_panel(width, sort="provider"):
         lines += [f"{esc}1mFINANCIAL{esc}0m"] + out + [""]
 
     # The brief's rule 5: connected but silent is a state -- shown, not
-    # hidden, and never a zero.
-    quiet = [(r["seat"], r["updated"]) for r in recs
-             if not r["available"] and r["account"] is None]
-    for r in telemetry_rows([x for x in recs if x["account"] is not None]):
-        if not r["available"]:
-            quiet.append((", ".join(r["seats"]), r["updated"]))
+    # hidden, and never a zero. The row reads as an inventory: what the
+    # seat is, when it last reported, and whether that report is stale.
+    quiet = [r for r in telemetry_rows(recs) if not r["available"]]
     if quiet:
         lines.append(f"{esc}1mCONNECTED / TELEMETRY UNAVAILABLE{esc}0m")
-        for seat_names, updated in sorted(quiet):
-            fresh = (f"last update {ago(time.time() - updated)}"
-                     if isinstance(updated, (int, float)) and updated else "never reported")
-            lines.append(f"{esc}2m  {seat_names:8} {fresh}{esc}0m")
+        for r in by_provider(quiet):
+            fresh = (f"last update {ago(time.time() - r['updated'])}"
+                     if isinstance(r["updated"], (int, float)) and r["updated"]
+                     else "never reported") + (" · stale" if r["stale"] else "")
+            names = ", ".join(r["seats"]) if r.get("seats") else r["seat"]
+            lines.append(f"{esc}2m  {names:8} {r['provider']} · {fresh}{esc}0m")
         lines.append("")
     return [fit(" " + line, width) for line in lines]
 

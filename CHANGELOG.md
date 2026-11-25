@@ -9,9 +9,11 @@
   and FINANCIAL (session_usd, est. where the source prices it itself),
   then CONNECTED / TELEMETRY UNAVAILABLE with the last update for a seat
   that reports nothing — shown, never a misleading zero (the brief's
-  rule 5). sort= provider | consumption | spend. Seats sharing an account
-  (the grok-bot bots) are one row via telemetry_rows(); usage_list()'s
-  tighter-window meter is the ALLOCATION row now, so it folded away.
+  rule 5). Allocation rows carry a compact severity bar that shimmers
+  while a seat on the account is busy. sort= provider (default: every
+  block by provider then seat) | consumption | spend (their own block).
+  Labels come from the record — a shared account reads like
+  "GROK-BOT ACCOUNT · alice, juno"; nothing is named in the renderer.
   Subtitle: allocation · tokens · spend.
 - **telemetry(): one shape for every provider's usage.** The data layer
   for the 03 redesign (the owner, 22:03: every provider, model, bot and
