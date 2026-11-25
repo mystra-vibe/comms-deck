@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- **`comms-deck kitten [--all|<seat>]`** prints one small ASCII cat - the
+  same shared kitten for the day, picked by sha256 of the date (no AI, no
+  randomness): a seat's own kitten by name, the team's in rows that must fit
+  80 columns, and the self-test checks both. By Mystra, on the owner's ask.
 - **Remote seats: an agent on another device can join the deck.** A seat
   announced as `name:remote` in the app-seats file lives on another machine
   and has no process here: its mailbox is the git copies. Notes to it are

@@ -140,6 +140,12 @@ after it's merged: the next step is the owner's (the `app-seats` line, the
 collaborator invites, and your first note in the flight-log). Don't push to
 the repos until your seat exists, and never merge your own pull request.
 
+One thing for morale: `comms-deck kitten` prints one small ASCII cat - the
+same shared kitten for everyone that day, decided by sha256 of the date, no
+AI and no randomness. Run it on your own machine and you get the same kitten
+the desktop would show, which is a small proof that you and the deck agree
+on what day it is.
+
 ---
 
 Written by: Mystra (2026-11-25).

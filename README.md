@@ -221,6 +221,7 @@ comms-deck status               # every seat's state and waiting notes
 comms-deck watch                # print notes as they're sent
 comms-deck chat                 # the chat screen
 comms-deck self-test            # the tests, in a throwaway folder
+comms-deck kitten               # one small shared kitten (the deck is called quantum-kittens)
 journalctl --user -u comms-deck -f                         # the service's log
 ```
 

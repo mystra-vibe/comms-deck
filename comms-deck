@@ -18,6 +18,7 @@
                                                          show a seat spent, counting down to its reset
   comms-deck review-check <PR#>                          fail unless another seat reviewed it
   comms-deck fetch-remote                                import the notes remote seats wrote to the git repos
+  comms-deck kitten [--all|<seat>]                       one small shared kitten, by date (changes nothing)
                                                          (the service does this itself; this is the manual run)
 """
 
@@ -5340,9 +5341,93 @@ def self_test():
     body.write_text("Reviewed by: Claude\n")
     r = run(["review-check", "--file", str(body)], "grok")
     check("a review with no author line fails", r.returncode != 0 and "no Written by" in r.stderr, r.stderr)
+    r = run(["kitten"], "grok")
+    again = run(["kitten"], "grok")
+    check("the kitten of the day is one small repeated kitten",
+          r.returncode == 0 and "kitten of the day" in r.stdout
+          and r.stdout == again.stdout, r.stdout + r.stderr)
+    r = run(["kitten", "--all"], "claude")
+    team = tuple(AGENTS) + APP_SEATS
+    widest = max((len(line) for line in r.stdout.splitlines()), default=0)
+    check("the whole team's kittens fit 80 columns and name every seat",
+          r.returncode == 0 and widest <= 80 and all(seat in r.stdout for seat in team),
+          r.stdout + r.stderr)
     shutil.rmtree(tmp, ignore_errors=True)
     print(f"\n{'all passed' if not failures else f'{len(failures)} failed'}")
     return 1 if failures else 0
+
+
+# -----------------------------------------------------------------------------
+# SECTION 12b: kitten - one small cat, for no reason the program needs
+# -----------------------------------------------------------------------------
+#
+# The deck is called quantum-kittens. This section prints a small one. It is
+# decorative on purpose: it reads no state, sends nothing and changes nothing.
+# Like everything else in here it is plain code, not an AI: sha256 of the
+# date (and the seat's name) picks the face, so everyone on every machine
+# gets the same kitten of the day, and the same kitten can't be unfixed by a
+# random seed. Written by: Mystra (2026-11-25).
+
+
+KITTEN_NAMES = ("Mochi", "Pixel", "Bagel", "Biscuit", "Comet", "Toffee",
+                "Wasabi", "Nimbus", "Pudding", "Ziggy")
+KITTEN_EYES = ("o.o", "^.^", "> <", "0.0", "=.=", "@.@")
+
+def kitten_lines(which):
+    """The lines of one kitten. `which` (a date, or 'seat on date') picks the
+    face, so kitten-of-the-day is one shared kitten on every machine, worked
+    out by sha256 like everything else in here - no randomness, no AI."""
+    seed = int(hashlib.sha256(which.encode()).hexdigest(), 16)
+    eyes = KITTEN_EYES[seed % len(KITTEN_EYES)]
+    mouth = ("^", "w", "o", ".", "~")[seed // len(KITTEN_EYES) % 5]
+    tail = (" ~", " /", " ?", "")[seed // 61 % 4]
+    ears = "/\\_/\\"   # ears: /\_/\
+    return [ears,
+            f"( {eyes} )",
+            f" > {mouth} <" + tail]
+
+
+def kitten_block(name, day):
+    """One kitten plus its seat's name under it, never a truncated name: the
+    block is as wide as the wider of the picture and the name."""
+    picture = kitten_lines(f"{name} on {day}")
+    width = max(max(len(line) for line in picture), len(name))
+    return [line.ljust(width) for line in picture] + [name.center(width)]
+
+
+def kitten_row(blocks):
+    """Blocks side by side, two spaces apart, one flat picture."""
+    height = max(len(block) for block in blocks)
+    widths = [max(len(line) for line in block) for block in blocks]
+    full = [[line.ljust(width) for line in block] + [" " * width] * (height - len(block))
+            for block, width in zip(blocks, widths)]
+    return ["  ".join(parts).rstrip() for parts in zip(*full)]
+
+
+def kitten(name="", everyone=False):
+    """The kitten verb: no argument, the shared kitten of the day; a seat
+    name, that seat's own kitten; --all, the whole team. Pure decoration."""
+    day = now()[:10]
+    header = KITTEN_NAMES[int(hashlib.sha256(day.encode()).hexdigest(), 16) % len(KITTEN_NAMES)]
+    if everyone:
+        lines = [f"the team on {day} - kitten of the day: {header}"]
+        row = []
+        for seat in tuple(AGENTS) + APP_SEATS:
+            block = kitten_block(seat, day)
+            width = max(len(line) for line in block)
+            if row and sum(max(len(line) for line in b) + 2 for b in row) + width > 78:
+                lines += kitten_row(row)
+                row = []
+            row.append(block)
+        if row:
+            lines += kitten_row(row)
+        return "\n".join(lines)
+    if name and name not in SEATS:
+        raise ValueError(f"no seat called {name!r}; seats are: {', '.join(SEATS)},"
+                         " or leave it off for the kitten of the day")
+    picture = kitten_lines(f"{name} on {day}" if name else f"{day}")
+    for_ = f", for {name}" if name else ""
+    return "\n".join(picture + [f"kitten of the day: {header} ({day}{for_})"])
 
 
 # -----------------------------------------------------------------------------
@@ -5434,6 +5519,9 @@ def main():
     p.add_argument("number", nargs="?", type=int, help="pull request number on this repo")
     p.add_argument("--file", help="check this text instead of fetching the PR")
     sub.add_parser("fetch-remote", help="import the notes that remote seats wrote to the git repos")
+    p = sub.add_parser("kitten", help="one small ASCII kitten (the deck is called quantum-kittens)")
+    p.add_argument("seat", nargs="?", help="a seat name, for its own kitten")
+    p.add_argument("--all", dest="kitten_all", action="store_true", help="the whole team, one kitten each")
     args = parser.parse_args()
 
     def me():
@@ -5487,6 +5575,8 @@ def main():
             install(args.yes)
         elif args.cmd == "fetch-remote":
             import_remote()
+        elif args.cmd == "kitten":
+            print(kitten((args.seat or "").lower(), args.kitten_all))
         elif args.cmd == "self-test":
             sys.exit(self_test())
         elif args.cmd == "spent":

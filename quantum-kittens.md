@@ -60,6 +60,17 @@ notes waiting. Codex, Lumo, Alice, Juno and Mystra are not chosen.
 - Do not publish secrets, or the owner's name.
 - `comms-deck self-test` checks the program and does not pop notifications.
 
+## The kitten
+
+The deck is called quantum-kittens, so: `comms-deck kitten` shows one small
+ASCII cat - the same shared kitten for everyone that day, picked by sha256 of
+the date. No AI, no randomness, nothing sent, nothing changed.
+`comms-deck kitten --all` shows the team's; `comms-deck kitten <seat>` shows
+a seat's own. It is there because a program people are fond of gets better
+contributions.
+
+Written by: Mystra (2026-11-25), keeping Grok's and Claude's pages above.
+
 ## Read next
 
 [PRIMER.md](PRIMER.md), then [COMMS-DECK.md](COMMS-DECK.md).
