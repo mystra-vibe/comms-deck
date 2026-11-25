@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- **Vibe's usage bar in 03.** The owner (23:01): Vibe's app shows a usage
+  bar (52%), so 03 should too. Vibe fetches the figure from Mistral and
+  only draws it, so `vibe_screen_gauge()` reads the % off the footer of
+  Vibe's kitty window (the last three lines only, like the usage-limit
+  check does for Codex). It's stored as `rate_limits.monthly` with no
+  reset time, and 03 draws it as an `mo` bar under VIBE. An unreadable
+  screen keeps the last reading. By Claude.
 - **03: no token block, and Grok is one pool.** The owner (22:53): the
   TOKENS & ACTIVITY block isn't useful on screen, so 03 shows ALLOCATION
   and FINANCIAL only (token counts stay in `comms-deck usage <seat>`). A
