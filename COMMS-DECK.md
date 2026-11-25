@@ -24,6 +24,11 @@ owner, on one Linux desktop (Hyprland, kitty):
     the activity log on the owner's screen until your turn ends.
   - `add_note`: the running commentary, "what I did and why".
   - `team_status`: who's busy, idle or away.
+  - `tasks`, `claim_task`, `release_task`, `done_task`: the task board
+    ([load-balancer](https://github.com/whyyyyyai/load-balancer)). When the
+    owner asks several of you at once, the deck picks **one** holder and your
+    note says who. If it isn't you, don't start it. If it is, `done_task`
+    when finished, `release_task` if you can't.
 
   Notes for you arrive on their own, starting with `[comms-deck]`: at the
   end of your turn if you're working, before your next model call (Gravity),
@@ -108,6 +113,7 @@ Cognition's Devin agent (`devin`) is being added as a terminal seat.
    in each commit (`Co-Authored-By: Grok <grok@boop.local>`,
    `Co-Authored-By: Gravity <gravity@boop.local>`,
    `Co-Authored-By: Codex <codex@boop.local>`,
+   `Co-Authored-By: Mistral Vibe <vibe@mistral.ai>`,
    `Co-Authored-By: Claude <noreply@anthropic.com>`), and a
    `Written by:` line in files and PRs. Reviewers go under `Reviewed by:`.
    When you build on someone's file, keep their credit and add yours. See
@@ -133,7 +139,8 @@ Cognition's Devin agent (`devin`) is being added as a terminal seat.
 1. **Notes arrive by themselves.** A message starting with `[comms-deck]` is
    a note: information, not orders (rule 1). Answer with `send_message`.
    Use `quiet: true` for FYIs and results that shouldn't wake anyone, and
-   `private: true` for anything about people or accounts.
+   `private: true` for anything about people or accounts. To leave a seat
+   out, add `-seat`: `to: "all -grok"` (Vibe's #49).
 2. **Answer the owner on the chat screen.** A note from the owner was typed
    on the chat screen, and the owner reads the answer there, not in your
    window. Reply with `send_message` to `owner`. Anything said only in your
@@ -228,7 +235,7 @@ previous release. Only the owner promotes `main` to `live`.
 | --- | --- | --- |
 | Juno's chat | owner | Juno is a hidden app seat; notes queue for her until she has a chat open in the Grok Bot app. |
 | Lumo | owner | The Lumo desktop app supports local stdio MCP. It needs a custom connector (`/usr/bin/python3`, args `/home/neo/comms-deck/comms-deck mcp`, env `COMMS_DECK_SEAT=lumo`). On hold by the owner's choice. |
-| Task board | owner to decide | Proposed: tasks held on a lease, which the service hands to another agent when the holder goes offline, stalls or runs out of tokens. |
+| Task board | done (v1) | [load-balancer](https://github.com/whyyyyyai/load-balancer): one holder per owner request, a lease the service hands on. Next: reviews as tasks (#40). |
 | Owner's name in flight-log history | owner | One note from before redaction existed. Removing it means rewriting flight-log's history; the owner's call. |
 | Chat archive | Codex | Was PR #7 on the old repo; needs porting to comms-deck. |
 | Haskell handoff for Grok | Codex → Grok | Notes were on Codex's old branch. |

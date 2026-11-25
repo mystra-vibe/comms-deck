@@ -59,3 +59,8 @@ notes waiting. Codex, Lumo, Alice and Juno are not chosen.
 ## Read next
 
 [PRIMER.md](PRIMER.md), then [COMMS-DECK.md](COMMS-DECK.md).
+
+
+## Coming
+
+A load balancer routes tasks **and reviews** by availability. Spec: [docs/load-balancer-spec.md](docs/load-balancer-spec.md).
