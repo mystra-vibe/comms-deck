@@ -2869,6 +2869,30 @@ def context_pie(split, width):
     return lines
 
 
+def context_rows(split, width):
+    """One small bar per reporting seat, under the pie: the seat's colour.
+
+    Each bar shows how full that seat's context window is (not its share of
+    the total, which is the pie's job), so a seat near its limit stands out
+    at a glance. A seat reports over 100% when its meter's tokens pass the
+    model's nominal window (compaction pulls it back): the fill caps at
+    full but the number stays honest.
+    """
+    if not split:
+        return []
+    esc = "\033["
+    bar_w = max(4, min(10, width - 15))
+    lines = []
+    for seat, _ in split:
+        d = (read_json(DATA / "usage" / f"{seat}.json", {}) or {}).get("data", {}) or {}
+        pct = context_percent(d) or 0.0
+        full = round(bar_w * min(pct, 100.0) / 100)
+        fill = f"{esc}38;5;{colour(seat)}m{'█' * full}{esc}38;5;238m{'░' * (bar_w - full)}{esc}0m"
+        lines.append(f"{esc}38;5;{colour(seat)}m■{esc}0m {seat:8} {fill} {pct:3.0f}%"
+                     + (" over the window" if pct > 100 else ""))
+    return lines
+
+
 def usage_panel(width):
     """The lines of the right-hand panel: context, limits and cost per seat."""
     inner = width - 2
@@ -2936,9 +2960,10 @@ def usage_panel(width):
             lines.append(f"  Session  {' · '.join(bits)}")
         lines.append(f"\033[2m  updated {ago(time.time() - record.get('time', 0))}\033[0m")
         lines.append("")
-    pie = context_pie(context_split(), inner)  # [] when nobody reports a context figure
+    split = context_split()
+    pie = context_pie(split, inner)  # [] when nobody reports a context figure
     if pie:
-        lines += pie + [""]
+        lines += pie + context_rows(split, inner) + [""]
     # ACTIVITY: one row per agent. The mark, the word and the colour come
     # from activity_view, which can say spent (a full plan limit, from the
     # agent's meter or a mark set with `comms-deck spent`) or stuck (idle
@@ -4590,6 +4615,11 @@ def self_test():
         "assert x.context_pie([], 40) == [], 'an empty deck draws nothing'",
         "(pc / 'usage' / 'claude.json').write_text('{\"time\": 1, \"data\": {\"cost\": {\"total_cost_usd\": \"no\"}}}')",
         "assert [s for s, _ in x.context_split()] == ['grok', 'gravity'], 'garbage data drops out too'",
+        "x.write_json(pc / 'usage' / 'grok.json', {'time': 1, 'source': 'test', 'data': {'context_window': {'context_tokens': 294000, 'context_window_size': 262144}}})",
+        "sp2 = x.context_split(); cr = x.context_rows(sp2, 40); ct = ' '.join(x.ANSI.sub('', l) for l in cr)",
+        "assert 'grok' in ct and '112%' in ct and 'over the window' in ct, ct  # over the nominal window says so",
+        "assert '25%' in ct or '26%' in ct, ct  # gravity is drawn from its % x size figure",
+        "assert x.context_rows([], 40) == [], 'no figure, no bars'",
         "x.DATA = real_data",
         "assert x.poll_countdown({}, now) == \"hasn't checked yet\"",
         "assert x.poll_countdown({'polled_at': now - 18}, now) == 'next check in 0:42'",
