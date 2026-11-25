@@ -3756,7 +3756,7 @@ def self_test():
     for p in Path(f"{tmp}/data/inbox/claude").glob("*.json"):
         if "minus grok" in json.load(open(p))["text"]:
             p.unlink()  # tidy: else later inbox counts include it
-    for seat in ("codex", "gravity", "vibe"):
+    for seat in AGENTS:
         for p in (Path(tmp) / "data" / "inbox" / seat).glob("*.json"):
             if "minus grok" in json.load(open(p))["text"]:
                 p.unlink()
