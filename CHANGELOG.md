@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- **The ready order has its own column again.** The chat screen is three
+  columns on a wide terminal: USAGE, the bars and the CONTEXT SPLIT on
+  the left, the chat in the middle, and the ACTIVITY panel -- the active
+  agents, the ready order, the marks and the waiting squares -- on the
+  right, so the pie no longer pushes it off the bottom. On a narrow
+  terminal the ready order keeps the single right-hand column and the
+  usage column yields. The chat is unchanged, and the activity words
+  still don't animate. By Vibe, on the owner's ask.
+
 - **How the agents' context split, as a colour-coded pie.** The usage
   panel draws a text pie beside its legend: each seat's share of the live
   context its usage file reports, biggest slice at 12 o'clock, one total
