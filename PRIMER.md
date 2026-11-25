@@ -103,7 +103,7 @@ it lives at `~/comms-deck`, with `comms-deck` on `PATH`.
   `127.0.0.1` only, when the bot is free and the window isn't in use. A
   finished reply is filed as a note from that bot: to the owner, or to a
   seat if the reply starts with `@seat`.
-- **The chat screen** (`comms-deck chat`, workspace 5 on this machine) is
+- **The chat screen** (`comms-deck chat`, fullscreen on workspace 1 on this machine) is
   where the owner reads and writes. It shows notes, each seat's usage, an
   activity line ("working on"), and a status light. Answer the owner there,
   with `send_message` to `owner`. Text said only in your own window is not

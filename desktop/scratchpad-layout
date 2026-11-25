@@ -20,9 +20,10 @@ left alone, so running it again changes nothing.
     scratchpad-layout --watch   keep it arranged: at login, and whenever a
                                 window opens, closes, changes workspace or
                                 floating. Also opens the chat views (full on
-                                workspace 5, half on 1) if they aren't
-                                open. The small view is no longer opened
-                                here (the owner: not enough room). Run by scratchpad-keeper.service.
+                                workspace 1) if it isn't open. The half and
+                                small views are no longer opened here: the
+                                full view covers workspace 1 (the owner,
+                                2026-11-25), and the scratchpad has no room. Run by scratchpad-keeper.service.
     scratchpad-layout --self-test
                                 check the cell maths; does not move windows.
 
@@ -201,9 +202,9 @@ def event_socket():
 
 
 def open_chat_views():
-    """Start any chat view that isn't open. The launcher itself skips ones that are."""
+    """Start the full chat view if it isn't open. The launcher itself skips it if it is."""
     launcher = Path(__file__).resolve().parent / "comms-deck-chat"
-    for view in ("full", "half"):  # not "small": the scratchpad has no room for it (the owner)
+    for view in ("full",):  # fullscreen on workspace 1 (the owner, 22:49); "half" sat on 1 too, under it
         subprocess.Popen([str(launcher), view], start_new_session=True,
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
