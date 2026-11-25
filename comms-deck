@@ -141,6 +141,7 @@ import argparse
 import base64
 import fcntl
 import hashlib
+import http.server
 import json
 import math
 import os
@@ -148,10 +149,12 @@ import re
 import secrets
 import shutil
 import socket
+import sqlite3
 import struct
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -2548,6 +2551,7 @@ def do_actions():
 def serve():
     """Run forever: wake agents, drive Grok Bot seats, refresh usage, copy records, mirror to Discord."""
     log(f"comms-deck serving on {MACHINE}; data in {DATA}")
+    threading.Thread(target=otel_serve, daemon=True).start()
     last_sync, discord_wait_until, last_usage = 0.0, 0.0, 0.0
     notify_pos = 0
     while True:
@@ -2577,6 +2581,10 @@ def serve():
                 refresh_grok_usage()
             except Exception as error:  # usage is a nicety; never stop the service for it
                 log(f"couldn't read Grok's usage: {error}")
+            try:
+                refresh_devin_usage()
+            except Exception as error:
+                log(f"couldn't read Devin's usage: {error}")
             try:
                 refresh_vibe_usage()
             except Exception as error:  # the same: never stop the service for it
@@ -3335,6 +3343,9 @@ def usage_panel(width):
                 used = size * pct / 100
             if isinstance(used, (int, float)) and isinstance(size, (int, float)):
                 lines.append(f"\033[2m           {short_tokens(used)} of {short_tokens(size)} tokens\033[0m")
+        elif isinstance(dig(d, "context_window", "context_tokens"), (int, float)):
+            # A count with no known window size (Devin's db reports tokens only).
+            lines.append(f"  Context  {short_tokens(dig(d, 'context_window', 'context_tokens'))} tokens")
         for label, key in (("5-hour", "five_hour"), ("Weekly", "seven_day")):
             used = dig(d, "rate_limits", key, "used_percentage")
             if isinstance(used, (int, float)):
@@ -3351,6 +3362,14 @@ def usage_panel(width):
         cost = dig(d, "cost", "total_cost_usd")
         if isinstance(cost, (int, float)):
             bits.append(f"${cost:.2f}" + (" est." if dig(d, "rate_limits") is not None else ""))
+        # OTLP counters (Devin): active seconds and session count sit next to
+        # the token figures under data.otel.metrics.
+        active = dig(d, "otel", "metrics", "devin.active_time.total")
+        if isinstance(active, (int, float)):
+            bits.append("active " + (f"{active / 3600:.1f}h" if active >= 3600 else f"{active / 60:.0f}m"))
+        sessions = dig(d, "otel", "metrics", "devin.session.count")
+        if isinstance(sessions, (int, float)) and sessions:
+            bits.append(f"{sessions:.0f} session{'s' if sessions != 1 else ''}")
         if bits:
             lines.append(f"  Session  {' · '.join(bits)}")
         lines.append(f"\033[2m  updated {ago(time.time() - record.get('time', 0))}\033[0m")
@@ -3882,6 +3901,430 @@ def statusline(source):
     if waiting:
         parts.append(f"{waiting} note(s) waiting")
     print(" · ".join(str(p) for p in parts if p))
+
+
+# --- OTLP metrics: Devin CLI's usage export ---------------------------------
+# Devin has no status line and its hooks carry no usage figures, but the CLI
+# can push OTLP metrics (devin.token.usage and friends) to any HTTP endpoint.
+# `comms-deck serve` listens on 127.0.0.1:OTEL_PORT (default 4318, the OTLP
+# HTTP port) for POST /v1/metrics and folds each data point into a running
+# total per seat, written as usage/<seat>.json so the panel shows it like any
+# other meter. Install points Devin's otel.metrics_endpoint here and sets no
+# logs endpoint, so prompts and tool text are never exported.
+
+OTEL_PORT = int(setting("OTEL_PORT") or 4318)
+OTEL_ACCUM_DIR = DATA / "usage" / "otel"   # running totals, kept across restarts
+
+
+def _pb_varint(buf, i):
+    """One protobuf varint from buf at i; returns (value, next index)."""
+    result = shift = 0
+    while True:
+        byte = buf[i]
+        i += 1
+        result |= (byte & 0x7F) << shift
+        if not byte & 0x80:
+            return result, i
+        shift += 7
+        if shift > 70:
+            raise ValueError("protobuf varint too long")
+
+
+def pb_fields(buf):
+    """Every (field number, wire type, value) in one protobuf message.
+
+    value is an int for varints and bytes for the other wire types; callers
+    decode further with pb_fields (submessages) or struct (fixed numbers).
+    """
+    fields, i = [], 0
+    while i < len(buf):
+        key, i = _pb_varint(buf, i)
+        number, wire = key >> 3, key & 7
+        if wire == 0:
+            value, i = _pb_varint(buf, i)
+        elif wire == 1:
+            value = buf[i:i + 8]
+            i += 8
+        elif wire == 2:
+            size, i = _pb_varint(buf, i)
+            value = buf[i:i + size]
+            i += size
+        elif wire == 5:
+            value = buf[i:i + 4]
+            i += 4
+        else:
+            break  # groups and bad wire types: stop rather than misparse
+        fields.append((number, wire, value))
+    return fields
+
+
+def _pb_msgs(fields, number):
+    """The submessages stored under `number`."""
+    return [v for n, w, v in fields if n == number and w == 2]
+
+
+def _pb_text(fields, number):
+    """The first string stored under `number`, or None."""
+    for n, w, v in fields:
+        if n == number and w == 2:
+            return v.decode("utf-8", "replace")
+    return None
+
+
+def _pb_attr_map(kv_msgs):
+    """{key: value} from protobuf KeyValue messages (opentelemetry common/v1)."""
+    attrs = {}
+    for msg in kv_msgs:
+        fields = pb_fields(msg)
+        key = _pb_text(fields, 1)
+        if key is None:
+            continue
+        for n, w, v in fields:
+            if n != 2 or w != 2:  # value: an AnyValue submessage
+                continue
+            for an, aw, av in pb_fields(v):
+                if an == 1 and aw == 2:
+                    attrs[key] = av.decode("utf-8", "replace")
+                elif an == 2 and aw == 0:
+                    attrs[key] = bool(av)
+                elif an == 3 and aw == 0:
+                    attrs[key] = av - (1 << 64) if av >= (1 << 63) else av  # int64 varint
+                elif an == 4 and aw == 1 and len(av) == 8:
+                    attrs[key] = struct.unpack("<d", av)[0]
+                elif an == 7 and aw == 2:
+                    attrs[key] = av.decode("utf-8", "replace")
+            break
+    return attrs
+
+
+def _pb_number_point(msg):
+    """(attributes, value) from a protobuf NumberDataPoint, or (attrs, None)."""
+    fields = pb_fields(msg)
+    attrs = _pb_attr_map(_pb_msgs(fields, 7))
+    value = None
+    for n, w, v in fields:
+        if w == 1 and len(v) == 8:
+            if n == 4:   # as_double: fixed64
+                value = struct.unpack("<d", v)[0]
+            elif n == 6:  # as_int: sfixed64
+                value = struct.unpack("<q", v)[0]
+    return attrs, value
+
+
+def _otel_attr_map_json(attrs):
+    """{key: value} from OTLP/JSON attributes ([{key, value:{stringValue...}}])."""
+    out = {}
+    for a in attrs or []:
+        if not isinstance(a, dict):
+            continue
+        value = a.get("value") or {}
+        for k in ("stringValue", "boolValue", "intValue", "doubleValue", "bytesValue"):
+            if k in value:
+                out[str(a.get("key", ""))] = value[k]
+                break
+    return out
+
+
+def _otel_series_json(payload):
+    """[(name, attrs, value, kind, temporality)] from an OTLP/JSON metrics body."""
+    try:
+        doc = json.loads(payload)
+    except (ValueError, TypeError):
+        return []
+    out = []
+
+    def points(name, data, kind, temp):
+        for p in (data or {}).get("dataPoints") or []:
+            if not isinstance(p, dict):
+                continue
+            value = p.get("asDouble", p.get("asInt"))
+            try:
+                value = float(value)
+            except (TypeError, ValueError):
+                continue
+            out.append((name, _otel_attr_map_json(p.get("attributes")), value, kind, temp))
+
+    for rm in (doc.get("resourceMetrics") or []):
+        for sm in (rm.get("scopeMetrics") or []):
+            for metric in (sm.get("metrics") or []):
+                if not isinstance(metric, dict):
+                    continue
+                name = metric.get("name")
+                if "sum" in metric:
+                    temp = (metric["sum"] or {}).get("aggregationTemporality")
+                    temp = {"AGGREGATION_TEMPORALITY_DELTA": 1,
+                            "AGGREGATION_TEMPORALITY_CUMULATIVE": 2}.get(temp, temp)
+                    points(name, metric["sum"], "sum", temp)
+                if "gauge" in metric:
+                    points(name, metric["gauge"], "gauge", None)
+    return out
+
+
+def _otel_series_pb(payload):
+    """[(name, attrs, value, kind, temporality)] from an OTLP/protobuf body."""
+    out = []
+    for rm in _pb_msgs(pb_fields(payload), 1):        # resource_metrics
+        for sm in _pb_msgs(pb_fields(rm), 2):         # scope_metrics
+            for metric in _pb_msgs(pb_fields(sm), 2):  # metrics
+                mfields = pb_fields(metric)
+                name = _pb_text(mfields, 1)
+                for kind, fnum in (("sum", 7), ("gauge", 5)):
+                    for data in _pb_msgs(mfields, fnum):
+                        dfields = pb_fields(data)
+                        temp = next((v for n, w, v in dfields if n == 2 and w == 0), None) \
+                            if kind == "sum" else None
+                        for point in _pb_msgs(dfields, 1):  # data_points
+                            attrs, value = _pb_number_point(point)
+                            if value is not None:
+                                out.append((name, attrs, value, kind, temp))
+    return out
+
+
+def otel_series(payload, content_type):
+    """The data points in one OTLP metrics export, JSON or protobuf."""
+    if "json" in (content_type or ""):
+        return _otel_series_json(payload)
+    return _otel_series_pb(payload)
+
+
+def otel_series_key(name, attrs):
+    """One series' identity: metric name plus its sorted attributes."""
+    return name + "|" + ",".join(f"{k}={attrs[k]}" for k in sorted(attrs))
+
+
+def record_otel_metrics(seat, payload, content_type):
+    """Fold one OTLP metrics export into the seat's usage totals.
+
+    Devin's counters are delta sums, so each export adds to a running total
+    kept in usage/otel/<seat>.json (which survives a service restart). A
+    cumulative sum adds only the growth since the last export. Returns the
+    number of data points taken.
+    """
+    seat = re.sub(r"[^a-z0-9_-]", "", (seat or "devin").lower()) or "devin"
+    series = otel_series(payload, content_type)
+    if not series:
+        return 0
+    acc_path = OTEL_ACCUM_DIR / f"{seat}.json"
+    acc = read_json(acc_path, {}) or {}
+    totals = acc.get("totals") or {}
+    last = acc.get("last") or {}      # cumulative series: value at last export
+    points = 0
+    for name, attrs, value, kind, temp in series:
+        key = otel_series_key(name, attrs)
+        if kind == "gauge":
+            totals[key] = value       # a gauge's latest value is its reading
+        elif temp == 2:               # cumulative: add only the growth
+            totals[key] = totals.get(key, 0) + max(0.0, value - last.get(key, 0))
+            last[key] = value
+        else:                         # delta (and unspecified): add the export
+            totals[key] = totals.get(key, 0) + value
+        points += 1
+    write_json(acc_path, {"time": time.time(), "totals": totals, "last": last})
+    # Merge into any existing record: refresh_devin_usage may already have
+    # filled model/context_window from the sessions database, and the otel
+    # section is this writer's own.
+    path = DATA / "usage" / f"{seat}.json"
+    prev = read_json(path, {}) or {}
+    data = dict(prev.get("data") or {})
+    fresh = otel_panel_data(totals)
+    data["otel"] = fresh.get("otel", {})
+    if fresh.get("model"):
+        data["model"] = fresh["model"]
+    context = dict(data.get("context_window") or {})
+    context.update(fresh.get("context_window") or {})
+    if context:
+        data["context_window"] = context
+    write_json(path, {"time": time.time(), "source": prev.get("source") or "devin-otel",
+                      "data": data})
+    return points
+
+
+def otel_panel_data(totals):
+    """The usage/<seat>.json 'data' for the chat panel, from OTLP totals.
+
+    devin.token.usage is keyed by model and type (input, output, cacheRead,
+    cacheCreation); the panel's Session line shows input and output, the most
+    used model names the row, and the full breakdown stays under 'otel' for
+    later readers. Other counters (sessions, lines, commits, PRs, active
+    time) are summed per metric name under 'otel'.metrics'.
+    """
+    tokens, model_totals, metrics = {}, {}, {}
+    for key, total in totals.items():
+        name, _, attr_text = key.partition("|")
+        attrs = dict(p.split("=", 1) for p in attr_text.split(",") if "=" in p)
+        if name == "devin.token.usage":
+            tokens[attrs.get("type", "?")] = tokens.get(attrs.get("type", "?"), 0) + total
+            model = attrs.get("model", "?")
+            model_totals[model] = model_totals.get(model, 0) + total
+        else:
+            metrics[name] = metrics.get(name, 0) + total
+    data = {}
+    if model_totals:
+        data["model"] = {"display_name": max(model_totals, key=model_totals.get)}
+    if tokens:
+        data["context_window"] = {"session_input_tokens": tokens.get("input", 0),
+                                  "session_output_tokens": tokens.get("output", 0)}
+    data["otel"] = {"tokens": tokens, "metrics": metrics}
+    return data
+
+
+class _OtelHandler(http.server.BaseHTTPRequestHandler):
+    """POST /v1/metrics from Devin's OTLP export; /v1/logs and /v1/traces are
+    accepted and dropped (the deck reads metrics only)."""
+
+    def _answer(self, code, body=b"{}"):
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        if body:
+            self.wfile.write(body)
+
+    def do_POST(self):
+        path = self.path.split("?", 1)[0]
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            length = 0
+        body = self.rfile.read(min(length, 64 * 1024 * 1024)) if length else b""
+        if path == "/v1/metrics":
+            seat = self.headers.get("X-Comms-Deck-Seat") or "devin"
+            try:
+                record_otel_metrics(seat, body, self.headers.get("Content-Type") or "")
+            except Exception as error:  # a bad export must never bother the agent
+                log(f"OTEL metrics from {seat} not recorded: {error}")
+            self._answer(200)
+        elif path in ("/v1/logs", "/v1/traces"):
+            self._answer(200)
+        else:
+            self._answer(404)
+
+    def do_GET(self):
+        self._answer(200 if self.path.split("?", 1)[0] == "/" else 404,
+                     b'{"status":"ok"}' if self.path == "/" else b"")
+
+    def log_message(self, *args):
+        pass  # the service log already says the listener is up
+
+
+def otel_serve():
+    """Listen for Devin's OTLP metrics until the service stops."""
+    try:
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", OTEL_PORT), _OtelHandler)
+        server.daemon_threads = True
+    except OSError as error:
+        log(f"OTEL listener on 127.0.0.1:{OTEL_PORT} not started: {error}")
+        return
+    log(f"OTEL metrics listener on 127.0.0.1:{OTEL_PORT}")
+    server.serve_forever()
+
+
+# --- Devin's sessions database ----------------------------------------------
+# Devin CLI keeps every session in ~/.local/share/devin/cli/sessions.db. Each
+# assistant message records per-request metrics (tokens, timings, model)
+# under chat_message.metadata.metrics — the token figures this CLI build's
+# OTEL export does not emit. refresh_devin_usage reads the latest session
+# and writes usage/devin.json in the panel's shape, the same way
+# refresh_grok_usage reads Grok's session files.
+
+DEVIN_DB = Path(setting("DEVIN_DB") or Path.home() / ".local/share/devin/cli/sessions.db")
+
+
+def devin_model_name(slug):
+    """'swe-2-flash-medium' -> 'SWE-2 Flash Medium'; anything else title-cased."""
+    if not slug:
+        return None
+    parts = str(slug).split("-")
+    if parts[0].lower() == "swe" and len(parts) > 1:
+        return "SWE-" + parts[1] + "".join(" " + p.title() for p in parts[2:])
+    return str(slug).replace("-", " ").title()
+
+
+def devin_usage_from_db():
+    """Devin's usage from its local sessions database, as panel data.
+
+    Totals cover the most recently active session: the Session line gets
+    input/output tokens, context gets the newest context_input_tokens (an
+    absolute count — this build does not report the window size), and the
+    model comes from the latest generation_model. Returns None when the db
+    is missing, locked or has no assistant metrics yet.
+    """
+    if not DEVIN_DB.exists():
+        return None
+    try:
+        con = sqlite3.connect(f"file:{DEVIN_DB}?mode=ro", uri=True, timeout=2)
+    except sqlite3.Error:
+        return None
+    try:
+        sid = con.execute("SELECT id FROM sessions ORDER BY last_activity_at DESC LIMIT 1"
+                          ).fetchone()
+        if not sid:
+            return None
+        rows = con.execute(
+            "SELECT json_extract(chat_message,'$.metadata.metrics'),"
+            " json_extract(chat_message,'$.metadata.generation_model'),"
+            " json_extract(chat_message,'$.metadata.metrics.context_input_tokens')"
+            " FROM message_nodes WHERE session_id=?"
+            " AND json_extract(chat_message,'$.role')='assistant' ORDER BY row_id",
+            (sid[0],))
+        sin = sout = cache_r = cache_c = reqs = 0
+        model = context = None
+        for metrics, gen_model, ctx in rows:
+            if not metrics:
+                continue
+            try:
+                mm = json.loads(metrics)
+            except ValueError:
+                continue
+            reqs += 1
+            sin += mm.get("input_tokens") or 0
+            sout += mm.get("output_tokens") or 0
+            cache_r += mm.get("cache_read_tokens") or 0
+            cache_c += mm.get("cache_creation_tokens") or 0
+            if ctx:
+                context = ctx
+            if gen_model:
+                model = gen_model
+    except sqlite3.Error:
+        return None
+    finally:
+        con.close()
+    if not reqs:
+        return None
+    context_window = {"session_input_tokens": sin, "session_output_tokens": sout}
+    if context:
+        context_window["context_tokens"] = context
+    size = setting("DEVIN_CONTEXT")  # window size in tokens, when known
+    if context and size:
+        try:
+            size = float(size)
+            context_window["context_window_size"] = size
+            context_window["used_percentage"] = round(100.0 * context / size, 1)
+        except ValueError:
+            pass
+    data = {"context_window": context_window,
+            "devin": {"requests": reqs, "cache_read_tokens": cache_r,
+                      "cache_creation_tokens": cache_c}}
+    name = devin_model_name(model)
+    if name:
+        data["model"] = {"display_name": name}
+    return data
+
+
+def refresh_devin_usage():
+    """Write usage/devin.json from the sessions database, keeping the otel
+    section an OTLP export may already have written."""
+    found = devin_usage_from_db()
+    if not found:
+        return
+    path = DATA / "usage" / "devin.json"
+    prev = read_json(path, {}) or {}
+    data = dict(prev.get("data") or {})
+    data.update(found)
+    if "otel" in (prev.get("data") or {}):
+        data["otel"] = prev["data"]["otel"]
+    write_json(path, {"time": time.time(), "source": prev.get("source") or "devin-db",
+                      "data": data})
 
 
 def grok_usage_from_session():
@@ -4621,6 +5064,12 @@ def devin_config(config, cmd):
     allow = config.setdefault("permissions", {}).setdefault("allow", [])
     if DEVIN_ALLOW not in allow:
         allow.append(DEVIN_ALLOW)
+    # Usage metrics: point Devin's OTLP metrics export at the deck's listener.
+    # Only the metrics signal is set, so prompts and tool text stay home.
+    # setdefault: an endpoint the owner chose is never replaced.
+    otel = config.setdefault("otel", {})
+    otel.setdefault("metrics_endpoint", f"http://127.0.0.1:{OTEL_PORT}/v1/metrics")
+    otel.setdefault("metrics_headers", {}).setdefault("X-Comms-Deck-Seat", "devin")
     return config
 
 
@@ -5467,6 +5916,120 @@ def self_test():
     r = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True, timeout=30)
     check("app seat replies, guards, usage and websocket mask",
           r.returncode == 0 and r.stdout.strip() == "ok", r.stdout + r.stderr)
+    # OTLP metrics -> usage/<seat>.json: the listener, both body formats,
+    # delta and cumulative sums, gauges, and the panel's data shape. A fake
+    # Devin sessions.db stands in for ~/.local/share/devin/cli/sessions.db.
+    Path(f"{tmp}/otel-config").mkdir(parents=True, exist_ok=True)
+    devin_db = f"{tmp}/otel-data/devin-sessions.db"
+    Path(f"{tmp}/otel-data").mkdir(parents=True, exist_ok=True)
+    con = sqlite3.connect(devin_db)
+    con.execute("CREATE TABLE sessions (id TEXT PRIMARY KEY, last_activity_at INTEGER)")
+    con.execute("CREATE TABLE message_nodes (row_id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                " session_id TEXT, chat_message TEXT)")
+    con.execute("INSERT INTO sessions VALUES ('s1', 1)")
+    for inp, out, ctx in ((100, 20, 100000), (200, 40, 123456)):
+        con.execute("INSERT INTO message_nodes (session_id, chat_message) VALUES ('s1', ?)",
+                    (json.dumps({"role": "assistant", "metadata": {
+                        "generation_model": "swe-2-flash-medium",
+                        "metrics": {"input_tokens": inp, "output_tokens": out,
+                                    "cache_read_tokens": 5000, "cache_creation_tokens": None,
+                                    "context_input_tokens": ctx}}}),))
+    con.commit()
+    con.close()
+    code = "\n".join([
+        "import importlib.machinery as m, importlib.util as u, json, struct, threading, time, urllib.request",
+        f"l = m.SourceFileLoader('cd', {me!r}); s = u.spec_from_loader('cd', l)",
+        "x = u.module_from_spec(s); l.exec_module(x)",
+        # a minimal protobuf writer, for a hand-built OTLP/protobuf export
+        "def vi(n):",
+        "    out = b''",
+        "    while True:",
+        "        b = n & 0x7f; n >>= 7",
+        "        out += bytes([b | (0x80 if n else 0)])",
+        "        if not n: return out",
+        "def fld(num, wire, val): return vi(num << 3 | wire) + val",
+        "def ln(num, payload): return fld(num, 2, vi(len(payload)) + payload)",
+        "def txt(num, s): return ln(num, s.encode())",
+        "def kv(k, v): return ln(7, txt(1, k) + ln(2, ln(1, v.encode())))",
+        "def point(attrs, val): return b''.join(kv(a, b) for a, b in attrs) + fld(6, 1, struct.pack('<q', val))",
+        "def pb_metric(name, points, temp=1, gauge=False):",
+        "    data = b''.join(ln(1, p) for p in points)",
+        "    if gauge: return txt(1, name) + ln(5, data)",
+        "    return txt(1, name) + ln(7, data + fld(2, 0, vi(temp)))",
+        "def pb_export(metrics): return ln(1, ln(2, b''.join(ln(2, m) for m in metrics)))",
+        # OTLP/JSON over the real listener, with the seat header
+        "pt = lambda t, v: {'attributes': [{'key': 'model', 'value': {'stringValue': 'SWE-2'}},"
+        " {'key': 'type', 'value': {'stringValue': t}}], 'asInt': str(v)}",
+        "jdoc = {'resourceMetrics': [{'scopeMetrics': [{'metrics': [",
+        " {'name': 'devin.token.usage', 'sum': {'aggregationTemporality': 'AGGREGATION_TEMPORALITY_DELTA',"
+        " 'dataPoints': [pt('input', 100), pt('output', 50), pt('cacheRead', 900)]}},",
+        " {'name': 'devin.session.count', 'sum': {'aggregationTemporality': 1,"
+        " 'dataPoints': [{'asInt': '1'}]}},",
+        " {'name': 'devin.active_time.total', 'sum': {'aggregationTemporality': 'AGGREGATION_TEMPORALITY_DELTA',"
+        " 'dataPoints': [{'attributes': [{'key': 'type', 'value': {'stringValue': 'cli'}}], 'asDouble': 30.0}]}}",
+        "]}]}]}",
+        "threading.Thread(target=x.otel_serve, daemon=True).start()",
+        "time.sleep(0.3)",
+        "for _ in range(2):",
+        "    req = urllib.request.Request('http://127.0.0.1:48123/v1/metrics', data=json.dumps(jdoc).encode(),",
+        "        headers={'Content-Type': 'application/json', 'X-Comms-Deck-Seat': 'devin'})",
+        "    assert urllib.request.urlopen(req, timeout=5).status == 200",
+        "time.sleep(0.2)",
+        "d = json.load(open(x.DATA / 'usage' / 'devin.json'))['data']",
+        "assert d['model']['display_name'] == 'SWE-2'",
+        "assert d['context_window'] == {'session_input_tokens': 200, 'session_output_tokens': 100}",
+        "assert d['otel']['tokens'] == {'input': 200, 'output': 100, 'cacheRead': 1800}",
+        "assert d['otel']['metrics']['devin.session.count'] == 2",
+        "assert d['otel']['metrics']['devin.active_time.total'] == 60",
+        "panel = x.usage_panel(80)",
+        "assert any('DEVIN' in l for l in panel)",
+        "assert any('active 1m' in l and '2 sessions' in l for l in panel)",
+        # the sessions db fills what OTEL cannot: real tokens, context, model
+        "x.refresh_devin_usage()",
+        "d = json.load(open(x.DATA / 'usage' / 'devin.json'))['data']",
+        "assert d['model']['display_name'] == 'SWE-2 Flash Medium'",
+        "assert d['context_window']['session_input_tokens'] == 300",
+        "assert d['context_window']['session_output_tokens'] == 60",
+        "assert d['context_window']['context_tokens'] == 123456",
+        "assert d['devin'] == {'requests': 2, 'cache_read_tokens': 10000, 'cache_creation_tokens': 0}",
+        "assert d['otel']['metrics']['devin.session.count'] == 2",
+        "panel = x.usage_panel(80)",
+        "assert any('Context' in l and 'tokens' in l for l in panel)",
+        # an OTLP export afterwards keeps the db's fields
+        "x.record_otel_metrics('devin', json.dumps(jdoc), 'application/json')",
+        "d = json.load(open(x.DATA / 'usage' / 'devin.json'))['data']",
+        "assert d['context_window']['context_tokens'] == 123456 and d['devin']['requests'] == 2",
+        "assert d['otel']['metrics']['devin.session.count'] == 3",
+        # protobuf, delta sums, a gauge, and cumulative temporality
+        "pb = pb_export([",
+        " pb_metric('devin.token.usage', [",
+        "  point([('model','SWE-2'),('type','input')], 40),",
+        "  point([('model','SWE-2'),('type','output')], 10),",
+        " ]),",
+        " pb_metric('devin.active_time.total', [point([], 30)], gauge=True),",
+        "])",
+        "assert x.record_otel_metrics('devinpb', pb, 'application/x-protobuf') == 3",
+        "d = json.load(open(x.DATA / 'usage' / 'devinpb.json'))['data']",
+        "assert d['context_window'] == {'session_input_tokens': 40, 'session_output_tokens': 10}",
+        "assert d['otel']['metrics']['devin.active_time.total'] == 30",
+        "cum = pb_export([pb_metric('devin.token.usage', [point([('model','SWE-2'),('type','input')], 50)], temp=2)])",
+        "x.record_otel_metrics('devinpb', cum, 'application/x-protobuf')",
+        "cum2 = pb_export([pb_metric('devin.token.usage', [point([('model','SWE-2'),('type','input')], 70)], temp=2)])",
+        "x.record_otel_metrics('devinpb', cum2, 'application/x-protobuf')",
+        "d = json.load(open(x.DATA / 'usage' / 'devinpb.json'))['data']",
+        "assert d['context_window']['session_input_tokens'] == 110",  # 40 + (50-0) + (70-50)
+        "acc = json.load(open(x.OTEL_ACCUM_DIR / 'devinpb.json'))",
+        "assert acc['totals']['devin.token.usage|model=SWE-2,type=input'] == 110",
+        "assert x.record_otel_metrics('devinpb', b'not metrics', 'application/x-protobuf') == 0",
+        "print('ok')",
+    ])
+    r = subprocess.run([sys.executable, "-c", code],
+                       env=dict(env, COMMS_DECK_OTEL_PORT="48123",
+                                COMMS_DECK_HOME=f"{tmp}/otel-data", COMMS_DECK_CONFIG=f"{tmp}/otel-config",
+                                COMMS_DECK_DEVIN_DB=devin_db),
+                       capture_output=True, text=True, timeout=30)
+    check("OTLP metrics listener fills usage/<seat>.json (JSON and protobuf, delta and cumulative)",
+          r.returncode == 0 and r.stdout.strip().splitlines()[-1:] == ["ok"], r.stdout + r.stderr)
     now = 1_700_000_000
     code = "\n".join([
         "import importlib.machinery as m, importlib.util as u, json",

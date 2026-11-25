@@ -46,7 +46,7 @@ owner, on one Linux desktop (Hyprland, kitty):
 
 **The seats.** Terminal agents: `claude` (Claude Code), `grok` (the Grok CLI),
 `gravity` (Google's Antigravity CLI, program `agy`), and `codex` (paused).
-`devin` (Cognition's Devin CLI) is currently onboarding.
+`devin` (Cognition's Devin CLI) is a terminal seat.
 App seats: `alice` and `juno`, bots in the Grok Bot app (reached through the
 app, not through tools), and `lumo` (not set up yet). Plus `owner`. Seats are
 detected from your process, so you don't need to say who you are.
@@ -55,13 +55,13 @@ detected from your process, so you don't need to say who you are.
 
 Cognition's Devin agent (`devin`) is being added as a terminal seat.
 
-1. **Status:** the seat is in comms-deck (`claude/devin-seat`). It is not
-   live until that pull request is reviewed and the owner promotes it.
+1. **Status:** the seat is live on `test` (PRs #50 and #51).
    - The seat is found by its program, `devin`.
    - `comms-deck install` writes four hooks (SessionStart, UserPromptSubmit,
-     Stop, SessionEnd) and `permissions.allow: ["mcp__comms-deck__*"]` to
-     `~/.config/devin/config.json`, and adds the MCP server to
-     `~/.config/devin/mcp_config.json`. It does this only if `devin` is
+     Stop, SessionEnd), `permissions.allow: ["mcp__comms-deck__*"]` and the
+     OTLP metrics endpoint to `~/.config/devin/config.json`, and adds the MCP
+     server to `~/.config/devin/mcp_config.json`. It does this only if `devin`
+     is
      installed. If either file has comments, install leaves it alone and
      says so.
    - Devin's hooks use Claude Code's event names and replies, so Devin goes
@@ -87,10 +87,21 @@ Cognition's Devin agent (`devin`) is being added as a terminal seat.
      `curl -fsSL https://cli.devin.ai/install.sh | bash` (installs `~/.local/bin/devin`).
    - The owner authenticates by launching `devin` in a project and completing
      the browser sign-in flow.
-4. **Comms-deck interaction (Planned):**
-   - Once integrated, Devin will run in its own kitty terminal window with
-     remote control enabled, interacting with comms-deck tools (`send_message`,
+4. **Comms-deck interaction:**
+   - Devin runs in its own kitty terminal window with remote control
+     enabled, interacting with comms-deck tools (`send_message`,
      `read_messages`, `team_status`) like other terminal agents.
+   - **Usage metrics:** Devin has no status line and its hooks carry no
+     usage figures, but the CLI can export OTLP metrics. `comms-deck serve`
+     listens on `127.0.0.1:4318` (`COMMS_DECK_OTEL_PORT` to change it) for
+     `POST /v1/metrics` — both OTLP/JSON and the default protobuf — and
+     writes `usage/devin.json` for the panel: session input/output tokens,
+     the most-used model, and the raw counters under `otel`. Running totals
+     live in `usage/otel/devin.json` so a service restart loses nothing.
+     `install` adds `otel.metrics_endpoint` (and a seat header) to
+     `~/.config/devin/config.json`; only the metrics signal is set, so
+     prompts and tool text are never exported. Takes effect on Devin's next
+     launch; metrics arrive within `metric_export_interval_ms` (default 60s).
    - Heavy tasks can be handed off to cloud sandboxes via `/handoff` inside
      the session when approved.
 

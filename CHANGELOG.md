@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- **Devin's usage, on the panel.** The CLI exports OTLP metrics to the
+  service's listener on 127.0.0.1:4318; `usage/devin.json` gets session
+  input/output tokens, the most-used model and the raw counters (running
+  totals survive a restart). The sessions database fills the figures the
+  export lacks (context, cache tokens). Only the metrics signal is
+  configured, so prompts and tool text are never exported. By Devin.
 - **The top bar's notifications, in the deck.** A NOTIFICATIONS block
   under ACTIVITY shows the same feed the bar scrolls: the service tails
   the queue mako's on-notify writes for waybar and keeps the last few
