@@ -3150,10 +3150,15 @@ def context_rows(split, width, step=None, busy=None):
     fstep = float(step) if step is not None else time.time() / PULSE_EVERY
     bar_w = max(4, min(10, width - 15))
     lines = []
-    for seat, _ in split:
+    for seat, used in split:
         d = (read_json(DATA / "usage" / f"{seat}.json", {}) or {}).get("data", {}) or {}
-        pct = context_percent(d) or 0.0
+        pct = context_percent(d)
         c = colour(seat)
+        if not isinstance(pct, (int, float)):
+            # No window size reported (Devin's CLI gives tokens only): a bar
+            # would claim 0%, so show the tokens it does report instead.
+            lines.append(f"{esc}38;5;{c}m■{esc}0m {seat:8} {esc}2m{short_tokens(used)} tokens, window unknown{esc}0m")
+            continue
         full = round(bar_w * min(pct, 100.0) / 100)
         anim = busy is None or seat in busy
         glint = (fstep * 2) % (bar_w + 4) - 2  # the white speck travels with time
@@ -3186,9 +3191,9 @@ def context_list(split):
     """
     if not split:
         return []
-    esc = "\\033["
+    esc = "\033["
     total = sum(used for _, used in split)
-    lines = [f"\\033[1mCONTEXT\\033[0m \\033[2mpool {short_tokens(total)} tokens\\033[0m"]
+    lines = [f"{esc}1mCONTEXT{esc}0m {esc}2mpool {short_tokens(total)} tokens{esc}0m"]
     for seat, used in sorted(split, key=lambda s: -s[1]):
         lines.append(f"{esc}38;5;{colour(seat)}m■{esc}0m {seat:8} "
                      f"{esc}2m{short_tokens(used):>6}{esc}0m {100 * used / total:4.1f}%")
@@ -3230,8 +3235,8 @@ def usage_list():
         rows.append((best[0], seat, tag_seat, best[1]))
     if not rows:
         return []
-    esc = "\\033["
-    lines = ["\\033[1mPLAN USAGE\\033[0m \\033[2mhighest first\\033[0m"]
+    esc = "\033["
+    lines = [f"{esc}1mPLAN USAGE{esc}0m {esc}2mhighest first{esc}0m"]
     for pct, seat, tag_seat, tag in sorted(rows, key=lambda r: -r[0]):
         shade = 78 if pct < 60 else 214 if pct < 85 else 196
         cle = colour(tag_seat)
@@ -6221,6 +6226,12 @@ def self_test():
         "pl2 = x.usage_list(); pl_t = ' '.join(x.ANSI.sub('', l) for l in pl2)",
         "assert 'PLAN USAGE' in pl_t and 'codex' in pl_t and '40%' in pl_t, pl_t  # the 5-hour figure shows",
         "assert pl_t.index('codex') < pl_t.index('gravity') if 'gravity' in pl_t else True, pl_t  # sorted highest first",
+        "assert chr(92) not in ''.join(cl + pl2), 'the lists send real escapes, not a printed backslash-033'",
+        # A seat that reports tokens but no window (Devin's CLI) gets no 0% bar.
+        "x.write_json(pc / 'usage' / 'devin.json', {'time': 1, 'source': 'test', 'data': {'context_window': {'context_tokens': 122605}}})",
+        "sp3 = x.context_split(); assert 'devin' in [s for s, _ in sp3], sp3",
+        "dr = [x.ANSI.sub('', l) for l in x.context_rows(sp3, 40) if 'devin' in l]",
+        "assert len(dr) == 1 and 'window unknown' in dr[0] and '122.6k' in dr[0] and '%' not in dr[0], dr",
         "x.DATA = real_data",
         # The top bar's notification queue mirrors into the deck's feed.
         "nd = x.Path(x.tempfile.mkdtemp()); real_nd, real_nq = x.DATA, x.NOTIFY_QUEUE",
