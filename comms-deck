@@ -3004,12 +3004,81 @@ def context_rows(split, width, step=None):
     return lines
 
 
+def context_list(split):
+    """The CONTEXT block: one line per seat with a live figure, highest first.
+
+    The owner asked (02:43) for the agents categorised by type: a Context
+    list and a Usage list, each ordered by highest value, with more data
+    around the total context pool and how it is distributed. Each row shows
+    the seat's current context in tokens and its share of the pool; the
+    pool total sits in the header. Colours stay the key's (SEAT_COLOURS),
+    and nothing here animates: only bars and the pie pulse.
+    """
+    if not split:
+        return []
+    esc = "\\033["
+    total = sum(used for _, used in split)
+    lines = [f"\\033[1mCONTEXT\\033[0m \\033[2mpool {short_tokens(total)} tokens\\033[0m"]
+    for seat, used in sorted(split, key=lambda s: -s[1]):
+        lines.append(f"{esc}38;5;{colour(seat)}m■{esc}0m {seat:8} "
+                     f"{esc}2m{short_tokens(used):>6}{esc}0m {100 * used / total:4.1f}%")
+    return lines
+
+
+def usage_list():
+    """The PLAN USAGE block: one line per seat, its plan meter, highest first.
+
+    The other list the owner asked for (02:43). A seat's plan meter is the
+    tighter of the two figures it reports: the 5-hour window when it has
+    one, else the weekly (so the shared Grok Bot account shows its weekly).
+    Where a seat reports both, the higher percentage is shown and tagged
+    with which window it came from, because that is the one about to bite.
+    The percentage takes the bar's threshold hue, and the square stays the
+    seat's colour from the key. One line per seat; the grok-bot account is
+    shown once, as in the panel above it. Nothing animates.
+    """
+    rows, shown_account = [], False
+    for seat in tuple(AGENTS) + APP_SEATS:
+        record = read_json(DATA / "usage" / f"{seat}.json")
+        if not record:
+            continue
+        if record.get("source") == "grok-bot":
+            if shown_account:
+                continue
+            shown_account = True
+            seat, tag_seat = "grok-bot", "grok"
+        else:
+            tag_seat = seat
+        d = record.get("data", {}) or {}
+        best = None
+        for key, tag in (("five_hour", "5h"), ("seven_day", "wk")):
+            pct = dig(d, "rate_limits", key, "used_percentage")
+            if isinstance(pct, (int, float)) and (best is None or pct > best[0]):
+                best = (pct, tag)
+        if best is None:
+            continue
+        rows.append((best[0], seat, tag_seat, best[1]))
+    if not rows:
+        return []
+    esc = "\\033["
+    lines = ["\\033[1mPLAN USAGE\\033[0m \\033[2mhighest first\\033[0m"]
+    for pct, seat, tag_seat, tag in sorted(rows, key=lambda r: -r[0]):
+        shade = 78 if pct < 60 else 214 if pct < 85 else 196
+        cle = colour(tag_seat)
+        lines.append(f"{esc}38;5;{cle}m■{esc}0m {seat:8} {esc}38;5;{shade}m{pct:3.0f}%{esc}0m "
+                     f"{esc}2m· {tag}{esc}0m")
+    return lines
+
+
 def usage_panel(width):
     """The usage column: context, limits and cost per seat, then the split.
 
     Since #61 this is drawn on the LEFT of the chat (the owner's layout):
     the ready order moved to its own activity_panel() on the right, so
-    neither pushes the other off the screen. """
+    neither pushes the other off the screen. Under the pie sit the two
+    categorised lists the owner asked for (02:43): CONTEXT, one row per
+    reporting seat highest first with its share of the pool, and PLAN
+    USAGE, one row per seat with the tighter of its plan meters. """
     inner = width - 2
     bar_w = max(6, inner - 16)
     # A running total of the session costs the agents report themselves
@@ -3079,6 +3148,12 @@ def usage_panel(width):
     pie = context_pie(split, inner)  # [] when nobody reports a context figure
     if pie:
         lines += pie + context_rows(split, inner) + [""]
+    ctx = context_list(split)  # the categorised lists the owner asked for (02:43)
+    if ctx:
+        lines += ctx + [""]
+    plans = usage_list()
+    if plans:
+        lines += plans + [""]
     return [fit(" " + line, width) for line in lines]
 
 
@@ -4818,6 +4893,14 @@ def self_test():
         "ap = x.activity_panel(40); ap_t = ' '.join(x.ANSI.sub('', l) for l in ap)",
         "assert 'ACTIVITY' not in up_t and 'ACTIVITY' in ap_t, 'the panels split cleanly'",
         "assert 'USAGE' in up_t, up_t",  # usage keeps its column; the ready order keeps its ink
+        "cl = x.context_list(sp2); cl_t = ' '.join(x.ANSI.sub('', l) for l in cl)",
+        "assert cl_t.split().index('grok') < cl_t.split().index('gravity'), cl_t  # highest tokens first",
+        "assert 'pool' in cl_t and '90.0%' in cl_t, cl_t  # the pool total and each seat's share",
+        "assert x.context_list([]) == [], 'an empty split draws no CONTEXT block'",
+        "assert all(f'38;5;{x.colour(s)}' in ''.join(cl) for s, _ in sp2), 'the key keeps its hues'",
+        "pl2 = x.usage_list(); pl_t = ' '.join(x.ANSI.sub('', l) for l in pl2)",
+        "assert 'PLAN USAGE' in pl_t and 'codex' in pl_t and '40%' in pl_t, pl_t  # the 5-hour figure shows",
+        "assert pl_t.index('codex') < pl_t.index('gravity') if 'gravity' in pl_t else True, pl_t  # sorted highest first",
         "x.DATA = real_data",
         "assert x.poll_countdown({}, now) == \"hasn't checked yet\"",
         "assert x.poll_countdown({'polled_at': now - 18}, now) == 'next check in 0:42'",
