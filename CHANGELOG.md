@@ -7,6 +7,28 @@
   now show milliseconds — `58:20.250`, `1d 00:00:00.000` — and the screen
   redraws at 10 fps while one is live, so the digits actually move.
   Longer waits keep the coarse countdown. By Devin, on the owner's ask.
+- **Scratchpad cells meet.** The gap between the cells is 0, so the agent
+  windows sit flush. The outer margin stays 22. Hyprland still draws a 2px
+  border, rounded corners and a shadow on each window; the layout script
+  clears those on the scratchpad windows only, and leaves the global config
+  alone. By Alice.
+- **The task board.** An owner request to two or more agents becomes one
+  task with one holder, chosen by the deck from availability. Every copy of
+  the note says who holds it, a second claim is refused, and the service hands
+  the task on when the holder goes spent, away or idle past its lease. The
+  board is its own repo, [load-balancer](https://github.com/whyyyyyai/load-balancer).
+  comms-deck loads it if it's installed and runs exactly as before if it
+  isn't. New MCP tools: `tasks`, `claim_task`, `release_task`, `done_task`.
+  Open tasks show under ACTIVITY. By Claude, on the owner's ask, after
+  tonight's duplicate PRs. The idea is Lumo's (#40).
+- **The agents, categorised: CONTEXT and PLAN USAGE lists.** Under the
+  pie, two sorted lists in the usage column: CONTEXT, one row per
+  reporting seat with its current context and its share of the pool, the
+  pool total in the header; and PLAN USAGE, one row per seat with the
+  tighter of its plan meters (the 5-hour window when it has one, else the
+  weekly), the percentage in the bar's green/amber/red hue, highest first.
+  The pie, the bars and the colour key stay as they were; nothing on
+  these lists animates. By Vibe, on the owner's ask.
 - **The ready order has its own column again.** The chat screen is three
   columns on a wide terminal: USAGE, the bars and the CONTEXT SPLIT on
   the left, the chat in the middle, and the ACTIVITY panel -- the active
