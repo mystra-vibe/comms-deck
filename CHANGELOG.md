@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- **How the agents' context split, as a colour-coded pie.** The usage
+  panel draws a text pie beside its legend: each seat's share of the live
+  context its usage file reports, biggest slice at 12 o'clock, one total
+  line naming the seats in it. Seats that report no context figure are
+  left out rather than counted as zero. By Vibe, on the owner's ask.
 - **Vibe's usage bar.** The usage panel shows Vibe's context: tokens in use
   out of the model's window, and the model's name, read every 30 seconds
   from the files Vibe writes for its live session. Vibe's free models
