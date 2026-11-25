@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- **ACTIVITY cooldowns in metric time.** The spent "idle until" countdown
+  (under an hour) and the polling seats' "next check"/"check late" timers
+  now show milliseconds — `58:20.250`, `1d 00:00:00.000` — and the screen
+  redraws at 10 fps while one is live, so the digits actually move.
+  Longer waits keep the coarse countdown. By Devin, on the owner's ask.
 - **The ready order has its own column again.** The chat screen is three
   columns on a wide terminal: USAGE, the bars and the CONTEXT SPLIT on
   the left, the chat in the middle, and the ACTIVITY panel -- the active
