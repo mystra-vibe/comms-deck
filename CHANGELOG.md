@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- **The top bar's notifications, in the deck.** A NOTIFICATIONS block
+  under ACTIVITY shows the same feed the bar scrolls: the service tails
+  the queue mako's on-notify writes for waybar and keeps the last few
+  hundred in `notifications.jsonl`. Do-not-disturb still applies upstream;
+  waybar and mako are untouched. By Devin, on the owner's ask.
 - **The ready order has its own column again.** The chat screen is three
   columns on a wide terminal: USAGE, the bars and the CONTEXT SPLIT on
   the left, the chat in the middle, and the ACTIVITY panel -- the active
