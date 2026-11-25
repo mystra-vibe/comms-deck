@@ -2433,6 +2433,10 @@ def serve():
             except Exception as error:  # usage is a nicety; never stop the service for it
                 log(f"couldn't read Grok's usage: {error}")
             try:
+                refresh_vibe_usage()
+            except Exception as error:  # the same: never stop the service for it
+                log(f"couldn't read Vibe's usage: {error}")
+            try:
                 refresh_screen_limits()
             except Exception as error:  # never stop the service for it
                 log(f"couldn't read a usage-limit screen: {error}")
@@ -3286,6 +3290,76 @@ def refresh_screen_limits():
                           "reset_unknown": stored is None,
                           "set_by": "screen", "set_at": time.time()})
         log(f"{seat}: its screen says usage limit; spent until {when(reset) if stored else 'unknown (7d)'}")
+
+
+def vibe_model_info(model):
+    """(label, context window) for a Vibe model id, from Vibe's own model catalog."""
+    try:
+        catalog = json.loads((HOME / ".vibe/model_catalog_cache.json").read_text())
+    except (OSError, ValueError):
+        catalog = None
+    found = []
+
+    def walk(node):
+        if isinstance(node, dict):
+            if node.get("id") == model or model in (node.get("aliases") or []):
+                found.append(node)
+            for value in node.values():
+                walk(value)
+        elif isinstance(node, list):
+            for value in node:
+                walk(value)
+    walk(catalog)
+    if found:
+        return found[0].get("label") or model, found[0].get("max_context_length")
+    try:  # the window of the active model, as Vibe's UI last saw it
+        ui = json.loads((HOME / ".vibe/ui_startup_config.json").read_text())
+        return ui.get("activeModelDisplayName") or model, ui.get("contextWindow")
+    except (OSError, ValueError):
+        return model, None
+
+
+def vibe_usage_from_session():
+    """Vibe's context use, from the files Vibe writes for its live session.
+
+    The owner OK'd reading these (2026-11-25). Vibe keeps one folder per
+    session under ~/.vibe/logs/session/unified/. The live one is the folder
+    whose context-breakdown.json changed last: it holds the tokens now in
+    context (system, tools, skills, conversation), and meta.json names the
+    model. The window size comes from Vibe's model catalog. Vibe's free
+    models report no plan limit, so there's no 5-hour or weekly bar.
+    Returns (time, data) in the status-line shape, or None if Vibe isn't
+    running.
+    """
+    if not any(proc_name(int(d.name)) == AGENTS["vibe"] for d in Path("/proc").iterdir() if d.name.isdigit()):
+        return None
+    files = list((HOME / ".vibe/logs/session/unified").glob("*/context-breakdown.json"))
+    if not files:
+        return None
+    newest = max(files, key=lambda f: f.stat().st_mtime)
+    try:
+        breakdown = json.loads(newest.read_text())
+        meta = json.loads((newest.parent / "meta.json").read_text())
+    except (OSError, ValueError):
+        return None
+    tokens = sum(v for v in breakdown.values() if isinstance(v, (int, float)))
+    model = dig(meta, "config", "active_model") or dig(meta, "config", "model_name") or ""
+    label, window = vibe_model_info(model) if model else ("", None)
+    data = {"model": {"id": model, "display_name": label}, "context_window": {"context_tokens": tokens}}
+    if isinstance(window, (int, float)) and window > 0:
+        data["context_window"]["context_window_size"] = window
+    return newest.stat().st_mtime, data
+
+
+def refresh_vibe_usage():
+    """Write usage/vibe.json from Vibe's session files when they're newer."""
+    found = vibe_usage_from_session()
+    if not found:
+        return
+    when, data = found
+    current = read_json(DATA / "usage" / "vibe.json", {}) or {}
+    if when > float(current.get("time") or 0):
+        write_json(DATA / "usage" / "vibe.json", {"time": when, "source": "vibe-session", "data": data})
 
 
 def refresh_grok_usage():
@@ -4419,6 +4493,16 @@ def self_test():
         "assert x.when(dt.datetime(2026, 11, 30, 5, 12).timestamp(), base) == 'Mon 05:12'",
         "assert x.when(dt.datetime(2026, 12, 9, 15, 2).timestamp(), base) == 'Dec 9 15:02'",
         "assert x.when(dt.datetime(2026, 11, 22, 18, 0).timestamp(), base) == 'Sun 18:00'",
+        "vh = x.Path(x.tempfile.mkdtemp()); real_home, real_vibe = x.HOME, x.AGENTS['vibe']",
+        "x.HOME = vh; x.AGENTS['vibe'] = x.proc_name(x.os.getpid())",  # 'Vibe is running' = this process
+        "sd = vh / '.vibe/logs/session/unified/s1'; sd.mkdir(parents=True)",
+        "(sd / 'context-breakdown.json').write_text('{\"system\": 1000, \"tools\": 2000, \"conversation\": 7000}')",
+        "(sd / 'meta.json').write_text('{\"config\": {\"active_model\": \"m-free\"}}')",
+        "(vh / '.vibe/model_catalog_cache.json').write_text('{\"k\": [{\"id\": \"m-free\", \"label\": \"M Free\", \"max_context_length\": 40000}]}')",
+        "_, vd = x.vibe_usage_from_session()",
+        "assert vd['model']['display_name'] == 'M Free' and x.context_percent(vd) == 25.0, vd",
+        "x.AGENTS['vibe'] = 'no-such-program-xyz'; assert x.vibe_usage_from_session() is None",
+        "x.HOME, x.AGENTS['vibe'] = real_home, real_vibe",
         "assert x.poll_countdown({}, now) == \"hasn't checked yet\"",
         "assert x.poll_countdown({'polled_at': now - 18}, now) == 'next check in 0:42'",
         "assert x.poll_countdown({'polled_at': now - 125, 'poll_gap': 60}, now) == 'check late 1:05'",
