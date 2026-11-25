@@ -3360,6 +3360,65 @@ class FreshCode(Exception):
     """Raised inside chat() to leave the screen cleanly before run_fresh()."""
 
 
+def deck_version(max_age=2.0):
+    """The deck's version, derived from the git checkout so it moves with
+    every change (the owner, 04:26): 'v<commits>·<short-hash>', '+' when
+    the deck script itself has uncommitted edits. Nothing is bumped by
+    hand -- every commit and every merge renumbers the screen.
+
+    Cached for `max_age` seconds, so the fast redraw clock (up to 120
+    frames a second, 04:02) doesn't fork git every frame. '' when git
+    can't tell (no repo, no git); the bar then just shows 'v·?'.
+    """
+    c = deck_version._c
+    if time.time() - c["at"] < max_age:
+        return c["v"]
+    v = ""
+    try:
+        def g(*args):
+            return subprocess.run(["git", "-C", str(PROGRAM.parent), *args],
+                                  capture_output=True, text=True, timeout=2)
+        count = g("rev-list", "--count", "HEAD").stdout.strip()
+        short = g("rev-parse", "--short", "HEAD").stdout.strip()
+        if count.isdigit() and short:
+            dirty = g("status", "--porcelain", "--", str(PROGRAM)).stdout.strip()
+            v = f"{count}·{short}{'+' if dirty else ''}"
+    except Exception:
+        v = ""  # a missing git or repo never takes the screen down
+    c.update(at=time.time(), v=v)
+    return v
+
+
+deck_version._c = {"at": 0.0, "v": ""}
+
+
+def deck_header(cols):
+    """The chat screen's top bar (the owner, 04:26): a full-width dim band
+    like the input line it sits over, 'comms-deck · live notes on
+    <machine>' on the left and the version on the right -- v<commits> and
+    the short hash from deck_version(), gold for the number so a change
+    catches the eye, dim for the hash. Too narrow for all of it, the
+    subtitle drops first, then the version."""
+    sub = f" · live notes on {MACHINE}"
+    ver = deck_version()
+    count, _, tail = ver.partition("·") if ver else ("", "", "")
+    tail = f" · {tail}" if tail else ""
+    v_plain = ("v" + count + tail) if count else "v·?"
+    if 1 + len("comms-deck") + len(sub) + 1 + len(v_plain) + 1 > cols:
+        sub = ""  # narrow: the machine's name goes first
+    if 1 + len("comms-deck") + len(sub) + 1 + len(v_plain) + 1 > cols:
+        v_plain = ""  # narrower still: just the name
+    gap = max(0, cols - (1 + len("comms-deck") + len(sub)) - len(v_plain) - 1)
+    out = "\033[48;5;234m\033[1;38;5;255m comms-deck"
+    out += ("\033[22;38;5;244m" + sub) if sub else ""
+    out += " " * gap
+    if v_plain:
+        out += "\033[22;38;5;220m" + v_plain[:1 + len(count)]
+        out += ("\033[2;38;5;244m" + v_plain[1 + len(count):]) if v_plain[1 + len(count):] else ""
+    out += " \033[0m"
+    return out
+
+
 def chat(history=200, hide_private=False):
     """Full-screen live view: notes on the left, usage on the right, status at the bottom."""
     path = DATA / "log.jsonl"
@@ -3472,7 +3531,7 @@ def chat(history=200, hide_private=False):
                 changed = False
                 if layout != (cols, rows):  # first time, or the window was resized
                     layout, changed = (cols, rows), True
-                    shown = [f"\033[1mcomms-deck\033[0m \033[2m· live notes on {MACHINE}\033[0m", ""]
+                    shown = []  # (the name and version live in the fixed top bar now)
                     for r in records[-history:]:
                         if not (hide_private and r.get("private")):
                             shown += chat_lines(r, chat_w)
@@ -3507,7 +3566,9 @@ def chat(history=200, hide_private=False):
                 animating = getattr(usage_panel, "running", False)
                 gap = 1 / 120 if animating else (1 if getattr(activity_panel, "ticking", False) else 2)
                 if changed or time.time() - last_draw >= gap:
-                    body = rows - (1 if tty else 0)  # the chat box is the last line
+                    # A fixed top bar (the version, 04:26), the notes, then
+                    # the chat box as the last line.
+                    body = rows - (2 if tty else 1)  # top bar + (the chat box | just the bar)
                     left = shown[-body:]
                     left = [""] * (body - len(left)) + left
                     if usage_w:
@@ -3518,7 +3579,7 @@ def chat(history=200, hide_private=False):
                     act = activity_panel(panel_w) if panel_w else []
                     usg = (usg + [""] * body)[:body]
                     right = (act + [""] * body)[:body]
-                    screen = ["\033[H"]
+                    screen = ["\033[H", deck_header(cols), "\n"]
                     for i in range(body):
                         row = (fit(usg[i], usage_w) + f" \033[38;5;238m│\033[0m ") if usage_w else ""
                         row += fit(left[i], chat_w)
@@ -5012,6 +5073,13 @@ def self_test():
         "assert x.context_rows(sp2, 40, step=3, busy=None) == x.context_rows(sp2, 40, step=3), 'busy=None keeps the old animate-everything behaviour'",
         "pidle = x.context_pie(sp, 40, step=0, busy=()); assert x.context_pie(sp, 40, step=5, busy=()) == pidle, 'an all-idle disc is still'",
         "assert x.context_pie(sp, 40, step=0, busy=None) != x.context_pie(sp, 40, step=5, busy=None), 'the disc breathes when seats work'",
+        "dv0 = x.deck_version(0); dv1 = x.deck_version(0)",
+        "import re as _re",
+        "assert _re.match(r'^\\d+\\u00b7[0-9a-f]+\\+?$', dv0), 'the version is commits \\u00b7 hash (+dirty), from git: ' + repr(dv0)",
+        "assert dv0 == dv1, 'the cache holds between calls: ' + repr(dv0) + ' vs ' + repr(dv1)",
+        "head = x.deck_header(120); head_t = x.ANSI.sub('', head)",
+        "assert 'comms-deck' in head_t and ('v' + dv0.partition('\\u00b7')[0]) in head_t, 'the top bar carries the name and the version'",
+        "assert len(x.ANSI.sub('', head)) <= 120, 'the bar fits the width'",
         "up = x.usage_panel(40); up_t = ' '.join(x.ANSI.sub('', l) for l in up)",
         "ap = x.activity_panel(40); ap_t = ' '.join(x.ANSI.sub('', l) for l in ap)",
         "assert 'ACTIVITY' not in up_t and 'ACTIVITY' in ap_t, 'the panels split cleanly'",
