@@ -161,6 +161,55 @@ from pathlib import Path
 HOME = Path.home()
 
 
+# -- Fresh code -----------------------------------------------------------
+# The service, the chat screen and each agent's MCP server run for hours.
+# Python reads the program once, so after a merge into the live tree they
+# would keep running the old code (that is how "-grok" missed on 2026-11-25:
+# the chat box predated the merge). Each long-running loop asks fresh_code()
+# and, when the file on disk has changed and has settled, starts itself
+# again in place (os.execv) or, for an MCP server, hands calls to a fresh run.
+PROGRAM = Path(__file__).resolve()
+
+
+def _program_stamp():
+    """(mtime, size) of the program file, or None if it can't be read."""
+    try:
+        st = PROGRAM.stat()
+        return (st.st_mtime_ns, st.st_size)
+    except OSError:
+        return None
+
+
+_STARTED_FROM = _program_stamp()
+_seen_change = {"stamp": None, "at": 0.0}
+
+
+def fresh_code(settle=3.0):
+    """True when the program on disk is newer than this process and safe to run.
+
+    "Safe" means unchanged for `settle` seconds (a git checkout has finished
+    writing) and it compiles. A file that doesn't compile is left alone and
+    asked about again later, so a bad write can't take a running loop down.
+    """
+    now_stamp = _program_stamp()
+    if now_stamp is None or now_stamp == _STARTED_FROM:
+        return False
+    if now_stamp != _seen_change["stamp"]:
+        _seen_change.update(stamp=now_stamp, at=time.time())
+    if time.time() - _seen_change["at"] < settle:
+        return False
+    try:
+        compile(PROGRAM.read_text(), str(PROGRAM), "exec")
+    except (OSError, SyntaxError, ValueError):
+        return False
+    return True
+
+
+def run_fresh():
+    """Replace this process with the program on disk, same arguments. Doesn't return."""
+    os.execv(sys.executable, [sys.executable, str(PROGRAM), *sys.argv[1:]])
+
+
 def setting(name, default=None):
     """$COMMS_DECK_<name>, or the older $LAUNCHPAD_<name>, or `default`."""
     return os.environ.get(f"COMMS_DECK_{name}") or os.environ.get(f"LAUNCHPAD_{name}") or default
@@ -2413,6 +2462,9 @@ def serve():
     log(f"comms-deck serving on {MACHINE}; data in {DATA}")
     last_sync, discord_wait_until, last_usage = 0.0, 0.0, 0.0
     while True:
+        if fresh_code():
+            log("the program changed on disk; restarting the service on the new code")
+            run_fresh()
         for seat in AGENTS:
             try:
                 try_wake(seat)
@@ -3133,6 +3185,10 @@ def route(text):
     return list(dict.fromkeys(names)) + ["-" + s for s in excludes], None
 
 
+class FreshCode(Exception):
+    """Raised inside chat() to leave the screen cleanly before run_fresh()."""
+
+
 def chat(history=200, hide_private=False):
     """Full-screen live view: notes on the left, usage on the right, status at the bottom."""
     path = DATA / "log.jsonl"
@@ -3263,6 +3319,8 @@ def chat(history=200, hide_private=False):
                 shown = shown[-2000:]
                 if handle_keys():
                     changed = True
+                if not typed and not in_paste and not pending_esc and fresh_code():
+                    raise FreshCode  # nothing half typed: reopen on the new code (after the finally)
                 if changed or time.time() - last_draw >= (1 if getattr(activity_panel, "ticking", False) else 2):
                     body = rows - (1 if tty else 0)  # the chat box is the last line
                     left = shown[-body:]
@@ -3699,6 +3757,29 @@ def mcp_call(seat, name, args):
     return f"Unknown tool {name}", True
 
 
+def mcp_call_fresh(seat, name, arguments):
+    """mcp_call() run by the program on disk, in a child process: (text, failed)."""
+    request = json.dumps({"seat": seat, "name": name, "arguments": arguments})
+    r = subprocess.run([sys.executable, str(PROGRAM), "mcp-call"], input=request,
+                       capture_output=True, text=True, timeout=60,
+                       env=dict(os.environ, COMMS_DECK_SEAT=seat))
+    try:
+        reply = json.loads(r.stdout)
+        return reply["text"], bool(reply["failed"])
+    except (ValueError, KeyError):
+        return mcp_call(seat, name, arguments)  # the new code failed: answer with ours
+
+
+def mcp_call_once():
+    """The `mcp-call` command: one tool call from JSON on stdin, answer as JSON."""
+    request = json.loads(sys.stdin.read() or "{}")
+    try:
+        text, failed = mcp_call(request.get("seat"), request.get("name"), request.get("arguments") or {})
+    except ValueError as error:
+        text, failed = str(error), True
+    print(json.dumps({"text": text, "failed": failed}))
+
+
 def mcp():
     """Serve MCP on stdin/stdout until stdin closes."""
     seat, _ = find_agent()
@@ -3735,7 +3816,14 @@ def mcp():
         elif method == "tools/call":
             params = msg.get("params") or {}
             try:
-                text, failed = mcp_call(seat, params.get("name"), params.get("arguments") or {})
+                if fresh_code(settle=0):
+                    # This server started before the program changed (a merge
+                    # into the live tree). Run the call in the program on disk,
+                    # so a new seat or a fixed rule works without restarting
+                    # the agent. The tool list itself stays as it was.
+                    text, failed = mcp_call_fresh(seat, params.get("name"), params.get("arguments") or {})
+                else:
+                    text, failed = mcp_call(seat, params.get("name"), params.get("arguments") or {})
             except ValueError as error:
                 text, failed = str(error), True
             answer(msg_id, {"content": [{"type": "text", "text": text}], "isError": failed})
@@ -4345,6 +4433,10 @@ def self_test():
     check("devin's MCP config names the seat and keeps other servers",
           mcp["mcpServers"]["comms-deck"]["env"] == {"COMMS_DECK_SEAT": "devin"}
           and "other" in mcp["mcpServers"], json.dumps(mcp))
+    r = run(["mcp-call"], "grok", json.dumps({"seat": "grok", "name": "team_status", "arguments": {}}))
+    reply = json.loads(r.stdout or "{}")
+    check("an MCP server on old code hands a call to the program on disk (mcp-call)",
+          "claude" in reply.get("text", "") and reply.get("failed") is False, r.stdout + r.stderr)
     vibe_screen = ("Running in this location is not recommended.\n"
                    "\u2500" * 60 + " GLM 5.3 Flash (Mistral Hosted)[high] \u00b7 accept edits \u2500\n"
                    "> Hello. Check the local directory\n" + "\u2500" * 100 + "\n"
@@ -4673,6 +4765,11 @@ def self_test():
         "assert x.when(dt.datetime(2026, 11, 30, 5, 12).timestamp(), base) == 'Mon 05:12'",
         "assert x.when(dt.datetime(2026, 12, 9, 15, 2).timestamp(), base) == 'Dec 9 15:02'",
         "assert x.when(dt.datetime(2026, 11, 22, 18, 0).timestamp(), base) == 'Sun 18:00'",
+        "assert not x.fresh_code(settle=0)",  # unchanged since start
+        "x._STARTED_FROM = (0, 0); x._seen_change.update(stamp=None, at=0.0)",
+        "assert not x.fresh_code(settle=3)",  # changed, but not settled yet
+        "assert x.fresh_code(settle=0)",  # changed, compiles: restart on it
+        "x._STARTED_FROM = x._program_stamp()",
         "vh = x.Path(x.tempfile.mkdtemp()); real_home, real_vibe = x.HOME, x.AGENTS['vibe']",
         "x.HOME = vh; x.AGENTS['vibe'] = x.proc_name(x.os.getpid())",  # 'Vibe is running' = this process
         "sd = vh / '.vibe/logs/session/unified/s1'; sd.mkdir(parents=True)",
@@ -4857,6 +4954,7 @@ def main():
     p.add_argument("--history", type=int, default=200)
     sub.add_parser("serve")
     sub.add_parser("mcp")
+    sub.add_parser("mcp-call")  # internal: one tool call for an MCP server running old code
     p = sub.add_parser("hook")
     p.add_argument("--source", required=True, choices=("claude", "grok", "agy", "vibe", "devin"))
     p.add_argument("--event", default="")
@@ -4900,11 +4998,16 @@ def main():
         elif args.cmd == "watch":
             watch()
         elif args.cmd == "chat":
-            chat(args.history, args.hide_private)
+            try:
+                chat(args.history, args.hide_private)
+            except FreshCode:
+                run_fresh()  # the screen has been restored; same window, new code
         elif args.cmd == "serve":
             serve()
         elif args.cmd == "mcp":
             mcp()
+        elif args.cmd == "mcp-call":
+            mcp_call_once()
         elif args.cmd == "hook":
             try:
                 hook(args.source, args.event)
