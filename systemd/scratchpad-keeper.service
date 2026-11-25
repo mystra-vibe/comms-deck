@@ -1,5 +1,5 @@
-# scratchpad-keeper: keeps the scratchpad arranged (Grok, Grok Bot, the small
-# chat on top; Claude, Lumo, Gravity below) and the chat views open. It
+# scratchpad-keeper: keeps the scratchpad arranged (Grok, Grok Bot, Vibe
+# on top; Claude, Lumo, Gravity below) and the chat views open. It
 # arranges at login, then again whenever a window opens, closes, changes
 # workspace or floating. No agent is needed.
 #
