@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- **Scratchpad cells meet.** The gap between the cells is 0, so the agent
+  windows sit flush. The outer margin stays 22. Hyprland still draws a 2px
+  border, rounded corners and a shadow on each window; the layout script
+  clears those on the scratchpad windows only, and leaves the global config
+  alone. By Alice.
 - **Vibe's usage bar.** The usage panel shows Vibe's context: tokens in use
   out of the model's window, and the model's name, read every 30 seconds
   from the files Vibe writes for its live session. Vibe's free models
