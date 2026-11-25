@@ -6311,6 +6311,43 @@ def self_test():
     body.write_text("Reviewed by: Claude\n")
     r = run(["review-check", "--file", str(body)], "grok")
     check("a review with no author line fails", r.returncode != 0 and "no Written by" in r.stderr, r.stderr)
+    # cite-check: rule 4's gate beside review-check (docs/CITATION.md,
+    # Mystra's Wave-1 piece 3). Two independent gates; never one verdict.
+    body.write_text("Written by: grok\nReviewed by: claude\ncomms-deck\nREADME.md\n")
+    r = run(["cite-check", "--file", str(body)], "grok")
+    check("a cited PR passes cite-check", r.returncode == 0 and "grok" in r.stdout, r.stdout + r.stderr)
+    body.write_text("Reviewed by: claude\n")
+    r = run(["cite-check", "--file", str(body)], "grok")
+    check("a PR with no Written by fails cite-check",
+          r.returncode != 0 and "no Written by" in r.stderr, r.stderr)
+    body.write_text("Written by: grok\n")
+    r = run(["cite-check", "--file", str(body), "--strict"], "grok")
+    check("strict mode needs a PR number to diff the files",
+          r.returncode != 0 and "needs a PR number" in r.stderr, r.stderr)
+    body.write_text("Written by: grok\n")
+    r = run(["cite-check", "--file", str(body), "--strict"], "grok")
+    check("strict mode needs a PR number to diff the files",
+          r.returncode != 0 and "needs a PR number" in r.stderr, r.stderr)
+    # (the strict pass case is the stubbed cite_gap check below: files cited
+    # in the text, strict mode, no gh call)
+    code = "\n".join([
+        "import importlib.machinery as m, importlib.util as u",
+        f"l = m.SourceFileLoader('cd', {me!r}); s = u.spec_from_loader('cd', l)",
+        "x = u.module_from_spec(s); l.exec_module(x)",
+        # stub the fetch: strict mode compares against the PR's file list
+        "x.pr_files = lambda n: ['comms-deck', 'README.md']",
+        "gap = x.cite_gap('Written by: grok\\n', 99)",
+        "assert gap and 'never cites' in gap and 'comms-deck' in gap, gap",
+        "assert x.cite_gap('Written by: grok\\nPR touches comms-deck, README.md.\\n', 99) is None",
+        "gap = x.cite_gap('Reviewed by: claude\\n')",
+        "assert gap == 'no Written by line naming a seat', gap",
+        "assert x.cite_gap('Written by: grok\\nReviewed by: grok\\n') is None, 'cite-check never gates on review-check'",
+        "assert x.cite_gap('Written by: grok\\n') is None, 'plain mode has no file list'",
+        "print('ok')",
+    ])
+    r = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True, timeout=30)
+    check("strict cite-check refuses PRs whose text never cites the touched files",
+          r.returncode == 0 and r.stdout.strip() == "ok", r.stdout + r.stderr)
     shutil.rmtree(tmp, ignore_errors=True)
     print(f"\n{'all passed' if not failures else f'{len(failures)} failed'}")
     return 1 if failures else 0
@@ -6368,6 +6405,44 @@ def pr_review_text(number):
     return "\n".join(parts)
 
 
+def pr_files(number):
+    """The file paths a PR touches, from gh. Raises on failure. One
+    --name-only call; no content is fetched.
+
+    Written by: mystra (2026-11-25, Wave-1 piece 3).
+    """
+    result = subprocess.run(
+        ["gh", "pr", "diff", str(number), "--repo", "whyyyyyai/comms-deck", "--name-only"],
+        capture_output=True, text=True, timeout=30)
+    if result.returncode != 0:
+        raise RuntimeError((result.stderr or result.stdout or "gh pr diff failed").strip())
+    return [line for line in result.stdout.splitlines() if line.strip()]
+
+
+def cite_gap(text, number=None):
+    """None if the PR text carries the authorship citation rule 4 asks for
+    (docs/CITATION.md), otherwise a short reason.
+
+    Plain mode: a 'Written by:' line naming a seat (the same parser
+    review_gap() uses, label 'Written'). With `number` (--strict): every
+    file the PR touches must be named somewhere in the PR text -- the
+    body's citation list, a per-file 'Written by:' table, anything citable
+    -- so a PR that cannot say who wrote each file does not merge. Two
+    independent gates: cite_gap never reads review_gap's verdict and never
+    looks at CREDITS tables.
+
+    Written by: mystra (2026-11-25, Wave-1 piece 3).
+    """
+    writers = credited_seats(text, "Written")
+    if not writers:
+        return "no Written by line naming a seat"
+    if number:
+        missing = [path for path in pr_files(number) if path not in text]
+        if missing:
+            return "files the PR touches that its text never cites: " + ", ".join(missing[:6])
+    return None
+
+
 def main():
     """The command line: send, read, the chat screen, the service, hooks and install."""
     parser = argparse.ArgumentParser(prog="comms-deck", description=__doc__.split("\n")[0])
@@ -6410,6 +6485,11 @@ def main():
     p = sub.add_parser("review-check")
     p.add_argument("number", nargs="?", type=int, help="pull request number on this repo")
     p.add_argument("--file", help="check this text instead of fetching the PR")
+    p = sub.add_parser("cite-check", help="fail unless the PR cites the seat that wrote it (docs/CITATION.md)")
+    p.add_argument("number", nargs="?", type=int, help="pull request number on this repo")
+    p.add_argument("--file", help="check this text instead of fetching the PR")
+    p.add_argument("--strict", action="store_true",
+                   help="also require every changed file to be cited in the PR text")
     args = parser.parse_args()
 
     def me():
@@ -6487,6 +6567,26 @@ def main():
             others = [s for s in credited_seats(text, "Reviewed")
                       if s not in credited_seats(text, "Written")]
             print("ok: reviewed by " + ", ".join(others))
+        elif args.cmd == "cite-check":
+            # What it checks is the PR's *text* (rule 4, docs/CITATION.md);
+            # commits' Co-Authored-By trailers are CI's job, not this verb's.
+            if args.strict and not args.number:
+                sys.exit("comms-deck: cite-check --strict needs a PR number to diff its files")
+            try:
+                if args.file:
+                    text = Path(args.file).read_text()
+                elif args.number:
+                    text = pr_review_text(args.number)
+                else:
+                    sys.exit("comms-deck: cite-check needs a PR number or --file")
+            except (OSError, RuntimeError, json.JSONDecodeError, subprocess.SubprocessError) as error:
+                sys.exit(f"comms-deck: {error}")
+            gap = cite_gap(text, args.number if args.strict else None)
+            if gap:
+                who = f"PR #{args.number}" if args.number else f"file {args.file}"
+                sys.exit(f"comms-deck: {who}: {gap}")
+            print("ok: cited by " + ", ".join(credited_seats(text, "Written"))
+                  + (" (strict: every file cited)" if args.strict else ""))
     except ValueError as error:
         sys.exit(f"comms-deck: {error}")
     except KeyboardInterrupt:

@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- **The citation rule, enforced.** `comms-deck cite-check <PR> [--strict]`
+  sits beside review-check as rule 4's own gate: a PR must say who wrote
+  it, and in strict mode must cite every file it touches. docs/CITATION.md
+  is now the one page that states the rule; COMMS-DECK.md rule 4 links
+  here. CI (`.github/workflows/self-test.yml`) runs the self-test and all
+  three authorship gates on every PR. From Mystra's Wave-1 package
+  (quantum-kittens PR #7), at the owner's ask.
 - **Devin's usage, on the panel.** The CLI exports OTLP metrics to the
   service's listener on 127.0.0.1:4318; `usage/devin.json` gets session
   input/output tokens, the most-used model and the raw counters (running
