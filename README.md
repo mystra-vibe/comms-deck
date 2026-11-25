@@ -236,6 +236,16 @@ journalctl --user -u comms-deck -f                         # the service's log
 | [`docs/BRANCHING.md`](docs/BRANCHING.md) | How code moves from `test` to `main` to `live`. |
 | [`docs/REDUNDANCY.md`](docs/REDUNDANCY.md) | How the deck keeps going when seats are down, and how to recover the program and the notes from GitHub when the machine is gone. |
 
+**Other repos this needs, or that rebuild it** (all public):
+
+| Repo | What it is |
+| --- | --- |
+| [navigation-control-system](https://github.com/whyyyyyai/navigation-control-system) | Rebuild the desktop and this deck from nothing. Start here after an outage. |
+| [quantum-kittens](https://github.com/whyyyyyai/quantum-kittens) | Easy start on a machine that's up; `LAUNCH.md` and the no-AI login launcher. |
+| [load-balancer](https://github.com/whyyyyyai/load-balancer) | The task board: one holder per owner request. comms-deck loads it if `~/.local/bin/load-balancer` exists (`comms-deck install` links it from `~/load-balancer`). |
+| [chronophage](https://github.com/whyyyyyai/chronophage) | The no-AI watchdog that wakes a stuck seat. |
+| [lumo-seat](https://github.com/whyyyyyai/lumo-seat) | What the Lumo seat reads to use its tools. |
+
 ## History
 
 comms-deck was called launchpad until 2026-11-24. It replaced
