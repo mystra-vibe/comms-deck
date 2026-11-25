@@ -141,6 +141,7 @@ import re
 import secrets
 import shutil
 import socket
+import sqlite3
 import struct
 import subprocess
 import sys
@@ -2414,6 +2415,10 @@ def serve():
             except Exception as error:  # usage is a nicety; never stop the service for it
                 log(f"couldn't read Grok's usage: {error}")
             try:
+                refresh_devin_usage()
+            except Exception as error:
+                log(f"couldn't read Devin's usage: {error}")
+            try:
                 refresh_screen_limits()
             except Exception as error:  # never stop the service for it
                 log(f"couldn't read a usage-limit screen: {error}")
@@ -2824,6 +2829,9 @@ def usage_panel(width):
                 used = size * pct / 100
             if isinstance(used, (int, float)) and isinstance(size, (int, float)):
                 lines.append(f"\033[2m           {short_tokens(used)} of {short_tokens(size)} tokens\033[0m")
+        elif isinstance(dig(d, "context_window", "context_tokens"), (int, float)):
+            # A count with no known window size (Devin's db reports tokens only).
+            lines.append(f"  Context  {short_tokens(dig(d, 'context_window', 'context_tokens'))} tokens")
         for label, key in (("5-hour", "five_hour"), ("Weekly", "seven_day")):
             used = dig(d, "rate_limits", key, "used_percentage")
             if isinstance(used, (int, float)):
@@ -3342,8 +3350,22 @@ def record_otel_metrics(seat, payload, content_type):
             totals[key] = totals.get(key, 0) + value
         points += 1
     write_json(acc_path, {"time": time.time(), "totals": totals, "last": last})
-    write_json(DATA / "usage" / f"{seat}.json",
-               {"time": time.time(), "source": "devin-otel", "data": otel_panel_data(totals)})
+    # Merge into any existing record: refresh_devin_usage may already have
+    # filled model/context_window from the sessions database, and the otel
+    # section is this writer's own.
+    path = DATA / "usage" / f"{seat}.json"
+    prev = read_json(path, {}) or {}
+    data = dict(prev.get("data") or {})
+    fresh = otel_panel_data(totals)
+    data["otel"] = fresh.get("otel", {})
+    if fresh.get("model"):
+        data["model"] = fresh["model"]
+    context = dict(data.get("context_window") or {})
+    context.update(fresh.get("context_window") or {})
+    if context:
+        data["context_window"] = context
+    write_json(path, {"time": time.time(), "source": prev.get("source") or "devin-otel",
+                      "data": data})
     return points
 
 
@@ -3425,6 +3447,114 @@ def otel_serve():
         return
     log(f"OTEL metrics listener on 127.0.0.1:{OTEL_PORT}")
     server.serve_forever()
+
+
+# --- Devin's sessions database ----------------------------------------------
+# Devin CLI keeps every session in ~/.local/share/devin/cli/sessions.db. Each
+# assistant message records per-request metrics (tokens, timings, model)
+# under chat_message.metadata.metrics — the token figures this CLI build's
+# OTEL export does not emit. refresh_devin_usage reads the latest session
+# and writes usage/devin.json in the panel's shape, the same way
+# refresh_grok_usage reads Grok's session files.
+
+DEVIN_DB = Path(setting("DEVIN_DB") or Path.home() / ".local/share/devin/cli/sessions.db")
+
+
+def devin_model_name(slug):
+    """'swe-2-flash-medium' -> 'SWE-2 Flash Medium'; anything else title-cased."""
+    if not slug:
+        return None
+    parts = str(slug).split("-")
+    if parts[0].lower() == "swe" and len(parts) > 1:
+        return "SWE-" + parts[1] + "".join(" " + p.title() for p in parts[2:])
+    return str(slug).replace("-", " ").title()
+
+
+def devin_usage_from_db():
+    """Devin's usage from its local sessions database, as panel data.
+
+    Totals cover the most recently active session: the Session line gets
+    input/output tokens, context gets the newest context_input_tokens (an
+    absolute count — this build does not report the window size), and the
+    model comes from the latest generation_model. Returns None when the db
+    is missing, locked or has no assistant metrics yet.
+    """
+    if not DEVIN_DB.exists():
+        return None
+    try:
+        con = sqlite3.connect(f"file:{DEVIN_DB}?mode=ro", uri=True, timeout=2)
+    except sqlite3.Error:
+        return None
+    try:
+        sid = con.execute("SELECT id FROM sessions ORDER BY last_activity_at DESC LIMIT 1"
+                          ).fetchone()
+        if not sid:
+            return None
+        rows = con.execute(
+            "SELECT json_extract(chat_message,'$.metadata.metrics'),"
+            " json_extract(chat_message,'$.metadata.generation_model'),"
+            " json_extract(chat_message,'$.metadata.metrics.context_input_tokens')"
+            " FROM message_nodes WHERE session_id=?"
+            " AND json_extract(chat_message,'$.role')='assistant' ORDER BY row_id",
+            (sid[0],))
+        sin = sout = cache_r = cache_c = reqs = 0
+        model = context = None
+        for metrics, gen_model, ctx in rows:
+            if not metrics:
+                continue
+            try:
+                mm = json.loads(metrics)
+            except ValueError:
+                continue
+            reqs += 1
+            sin += mm.get("input_tokens") or 0
+            sout += mm.get("output_tokens") or 0
+            cache_r += mm.get("cache_read_tokens") or 0
+            cache_c += mm.get("cache_creation_tokens") or 0
+            if ctx:
+                context = ctx
+            if gen_model:
+                model = gen_model
+    except sqlite3.Error:
+        return None
+    finally:
+        con.close()
+    if not reqs:
+        return None
+    context_window = {"session_input_tokens": sin, "session_output_tokens": sout}
+    if context:
+        context_window["context_tokens"] = context
+    size = setting("DEVIN_CONTEXT")  # window size in tokens, when known
+    if context and size:
+        try:
+            size = float(size)
+            context_window["context_window_size"] = size
+            context_window["used_percentage"] = round(100.0 * context / size, 1)
+        except ValueError:
+            pass
+    data = {"context_window": context_window,
+            "devin": {"requests": reqs, "cache_read_tokens": cache_r,
+                      "cache_creation_tokens": cache_c}}
+    name = devin_model_name(model)
+    if name:
+        data["model"] = {"display_name": name}
+    return data
+
+
+def refresh_devin_usage():
+    """Write usage/devin.json from the sessions database, keeping the otel
+    section an OTLP export may already have written."""
+    found = devin_usage_from_db()
+    if not found:
+        return
+    path = DATA / "usage" / "devin.json"
+    prev = read_json(path, {}) or {}
+    data = dict(prev.get("data") or {})
+    data.update(found)
+    if "otel" in (prev.get("data") or {}):
+        data["otel"] = prev["data"]["otel"]
+    write_json(path, {"time": time.time(), "source": prev.get("source") or "devin-db",
+                      "data": data})
 
 
 def grok_usage_from_session():
@@ -4576,8 +4706,25 @@ def self_test():
     check("app seat replies, guards, usage and websocket mask",
           r.returncode == 0 and r.stdout.strip() == "ok", r.stdout + r.stderr)
     # OTLP metrics -> usage/<seat>.json: the listener, both body formats,
-    # delta and cumulative sums, gauges, and the panel's data shape.
+    # delta and cumulative sums, gauges, and the panel's data shape. A fake
+    # Devin sessions.db stands in for ~/.local/share/devin/cli/sessions.db.
     Path(f"{tmp}/otel-config").mkdir(parents=True, exist_ok=True)
+    devin_db = f"{tmp}/otel-data/devin-sessions.db"
+    Path(f"{tmp}/otel-data").mkdir(parents=True, exist_ok=True)
+    con = sqlite3.connect(devin_db)
+    con.execute("CREATE TABLE sessions (id TEXT PRIMARY KEY, last_activity_at INTEGER)")
+    con.execute("CREATE TABLE message_nodes (row_id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                " session_id TEXT, chat_message TEXT)")
+    con.execute("INSERT INTO sessions VALUES ('s1', 1)")
+    for inp, out, ctx in ((100, 20, 100000), (200, 40, 123456)):
+        con.execute("INSERT INTO message_nodes (session_id, chat_message) VALUES ('s1', ?)",
+                    (json.dumps({"role": "assistant", "metadata": {
+                        "generation_model": "swe-2-flash-medium",
+                        "metrics": {"input_tokens": inp, "output_tokens": out,
+                                    "cache_read_tokens": 5000, "cache_creation_tokens": None,
+                                    "context_input_tokens": ctx}}}),))
+    con.commit()
+    con.close()
     code = "\n".join([
         "import importlib.machinery as m, importlib.util as u, json, struct, threading, time, urllib.request",
         f"l = m.SourceFileLoader('cd', {me!r}); s = u.spec_from_loader('cd', l)",
@@ -4626,6 +4773,22 @@ def self_test():
         "panel = x.usage_panel(80)",
         "assert any('DEVIN' in l for l in panel)",
         "assert any('active 1m' in l and '2 sessions' in l for l in panel)",
+        # the sessions db fills what OTEL cannot: real tokens, context, model
+        "x.refresh_devin_usage()",
+        "d = json.load(open(x.DATA / 'usage' / 'devin.json'))['data']",
+        "assert d['model']['display_name'] == 'SWE-2 Flash Medium'",
+        "assert d['context_window']['session_input_tokens'] == 300",
+        "assert d['context_window']['session_output_tokens'] == 60",
+        "assert d['context_window']['context_tokens'] == 123456",
+        "assert d['devin'] == {'requests': 2, 'cache_read_tokens': 10000, 'cache_creation_tokens': 0}",
+        "assert d['otel']['metrics']['devin.session.count'] == 2",
+        "panel = x.usage_panel(80)",
+        "assert any('Context' in l and 'tokens' in l for l in panel)",
+        # an OTLP export afterwards keeps the db's fields
+        "x.record_otel_metrics('devin', json.dumps(jdoc), 'application/json')",
+        "d = json.load(open(x.DATA / 'usage' / 'devin.json'))['data']",
+        "assert d['context_window']['context_tokens'] == 123456 and d['devin']['requests'] == 2",
+        "assert d['otel']['metrics']['devin.session.count'] == 3",
         # protobuf, delta sums, a gauge, and cumulative temporality
         "pb = pb_export([",
         " pb_metric('devin.token.usage', [",
@@ -4651,7 +4814,8 @@ def self_test():
     ])
     r = subprocess.run([sys.executable, "-c", code],
                        env=dict(env, COMMS_DECK_OTEL_PORT="48123",
-                                COMMS_DECK_HOME=f"{tmp}/otel-data", COMMS_DECK_CONFIG=f"{tmp}/otel-config"),
+                                COMMS_DECK_HOME=f"{tmp}/otel-data", COMMS_DECK_CONFIG=f"{tmp}/otel-config",
+                                COMMS_DECK_DEVIN_DB=devin_db),
                        capture_output=True, text=True, timeout=30)
     check("OTLP metrics listener fills usage/<seat>.json (JSON and protobuf, delta and cumulative)",
           r.returncode == 0 and r.stdout.strip().splitlines()[-1:] == ["ok"], r.stdout + r.stderr)
