@@ -3185,6 +3185,24 @@ def route(text):
     return list(dict.fromkeys(names)) + ["-" + s for s in excludes], None
 
 
+def fit_column(lines, height):
+    """A side column's lines, trimmed to fit `height` rows without losing content.
+
+    The "updated 3s ago" footers go first, then the blank spacer lines. Only
+    if it still doesn't fit is the bottom cut. (The owner, 2026-11-25: after
+    the context split was added, ACTIVITY and its blue squares were pushed
+    off the bottom of the screen.)
+    """
+    if len(lines) <= height:
+        return lines
+    plain = [re.sub(r"\033\[[0-9;:?]*[A-Za-z]", "", line) for line in lines]
+    lines = [line for line, text in zip(lines, plain) if not text.strip().startswith("updated ")]
+    if len(lines) > height:
+        lines = [line for i, line in enumerate(lines)
+                 if i == 0 or re.sub(r"\033\[[0-9;:?]*[A-Za-z]", "", line).strip()]
+    return lines[:height]
+
+
 class FreshCode(Exception):
     """Raised inside chat() to leave the screen cleanly before run_fresh()."""
 
@@ -3327,8 +3345,8 @@ def chat(history=200, hide_private=False):
                     left = [""] * (body - len(left)) + left
                     usg = usage_panel(usage_w) if usage_w else []
                     act = activity_panel(panel_w) if panel_w else []
-                    usg = (usg + [""] * body)[:body]
-                    right = (act + [""] * body)[:body]
+                    usg = (fit_column(usg, body) + [""] * body)[:body]
+                    right = (fit_column(act, body) + [""] * body)[:body]
                     screen = ["\033[H"]
                     for i in range(body):
                         row = (fit(usg[i], usage_w) + f" \033[38;5;238m│\033[0m ") if usage_w else ""
@@ -4819,6 +4837,11 @@ def self_test():
         "assert 'ACTIVITY' not in up_t and 'ACTIVITY' in ap_t, 'the panels split cleanly'",
         "assert 'USAGE' in up_t, up_t",  # usage keeps its column; the ready order keeps its ink
         "x.DATA = real_data",
+        "col = ['USAGE', '', 'A', '  updated 1s ago', '', 'B', '  updated 2s ago', '', 'C']",
+        "assert x.fit_column(col, 20) == col",  # fits: untouched
+        "assert x.fit_column(col, 7) == ['USAGE', '', 'A', '', 'B', '', 'C']",  # footers go first
+        "assert x.fit_column(col, 4) == ['USAGE', 'A', 'B', 'C']",  # then the spacers
+        "assert x.fit_column(col, 2) == ['USAGE', 'A']",  # only then the bottom
         "assert x.poll_countdown({}, now) == \"hasn't checked yet\"",
         "assert x.poll_countdown({'polled_at': now - 18}, now) == 'next check in 0:42'",
         "assert x.poll_countdown({'polled_at': now - 125, 'poll_gap': 60}, now) == 'check late 1:05'",
