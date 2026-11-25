@@ -3347,9 +3347,10 @@ def context_rows(split, width, step=None, busy=None):
 # and must never invent figures. telemetry() is the data layer the 03
 # renderer and `comms-deck usage` read; nothing below names a seat.
 #
-# A label for the company behind a usage file's source. It's only a label:
-# an unknown source falls back to the source name itself, and a seat with
-# no usage file at all still gets a record (connected, telemetry unavailable).
+# A label for the company behind a usage file's source; a feed's own
+# data.provider wins. It's only a label: an unknown source falls back to
+# the source name itself, and a seat with no usage file at all still gets
+# a record (connected, telemetry unavailable).
 PROVIDER_LABELS = {"claude": "Anthropic", "grok": "xAI", "grok-bot": "xAI",
                    "devin-db": "Cognition", "devin-otel": "Cognition",
                    "vibe-session": "Mistral", "gravity-hook": "Google",
@@ -3371,9 +3372,19 @@ def telemetry_record(seat, record):
     record = record or {}
     d = record.get("data") or {}
     source = record.get("source")
-    account = SHARED_ACCOUNTS.get(source)  # seats drawing on one pool share an id
-    model = dig(d, "model", "display_name") or dig(d, "model", "id")
     program = AGENTS.get(seat) or APP_PROCESS.get(seat)  # what the seat runs as: names a provider with no file yet
+    acct = d.get("account") or d.get("account_id")
+    account = (str(acct) if isinstance(acct, (str, int, float)) and not isinstance(acct, bool)
+               and str(acct) else SHARED_ACCOUNTS.get(source))  # seats on one pool share an id
+    model = dig(d, "model", "display_name") or dig(d, "model", "id")
+    declared = d.get("models")
+    models = [str(m).strip() for m in declared
+              if isinstance(m, (str, int, float)) and not isinstance(m, bool) and str(m).strip()] \
+        if isinstance(declared, list) else []
+    if not models and model:
+        models = [model]
+    provider = d.get("provider")
+    provider = provider.strip() if isinstance(provider, str) and provider.strip() else None
     allocation = []
     limits = dig(d, "rate_limits")
     for key, rl in sorted((limits if isinstance(limits, dict) else {}).items()):
@@ -3407,9 +3418,10 @@ def telemetry_record(seat, record):
     updated = _num(record.get("time"))
     has = bool(allocation) or any(v is not None for v in tokens.values()) or cost is not None
     return {
-        "seat": seat, "provider": PROVIDER_LABELS.get(source) or PROVIDER_LABELS.get(program)
-        or source or program or "unknown",
-        "account": account, "models": [model] if model else [],
+        "seat": seat,
+        "provider": provider or PROVIDER_LABELS.get(source) or PROVIDER_LABELS.get(program)
+        or source or (program if program != "remote" else None) or "unknown",
+        "account": account, "models": models,
         "connected": seat in SEATS, "available": has, "source": source,
         "updated": updated, "stale": updated is not None and time.time() - updated > TELEMETRY_STALE,
         "allocation": allocation, "tokens": tokens,
@@ -3432,7 +3444,8 @@ def telemetry():
       allocation: [{window, used_pct, remaining_pct, resets_at}],
       tokens: {input, output, cache_read, requests, sessions, active_s},
       spend: {session_usd, cumulative_usd, kind: estimate|reported|None},
-      raw: the file's data, untouched.
+      raw: the file's data, untouched. A feed may declare provider, account
+      (or account_id) and models in data; the labels above are the fallback.
 
     A figure the provider doesn't report is None, never 0, and no
     percentage is derived from token counts. Context isn't here: that's
@@ -3446,18 +3459,19 @@ def telemetry():
 
 
 def telemetry_rows(records=None):
-    """telemetry() with seats that share an account folded into one row.
+    """telemetry() with seats that share a provider and account folded into one row.
 
     Seats on one pool report different parts of it at different moments
     (the bots the weekly limit, Grok's CLI its session cost), so each part
     of the row comes from the freshest seat that reports it: allocation,
     each token field, and spend. The row's `updated`, `stale`, `models`
     and `available` cover the whole account, and "seats" lists every seat
-    on it. A seat with no account is its own row, seats == [seat].
+    on it. A seat with no account is its own row, seats == [seat]. Account
+    ids are provider-scoped: the same id under two providers is two pools.
     """
     rows, groups = [], {}
     for r in telemetry() if records is None else records:
-        key = r["account"]
+        key = (r["provider"], r["account"]) if r["account"] is not None else None
         if key is None:
             rows.append(dict(r, seats=[r["seat"]]))
         elif key in groups:
@@ -3467,7 +3481,7 @@ def telemetry_rows(records=None):
             rows.append(key)  # placeholder: keeps the first seat's place in the order
     out = []
     for row in rows:
-        if not isinstance(row, str):
+        if not isinstance(row, tuple):
             out.append(row)
             continue
         group = sorted(groups[row], key=lambda r: r["updated"] or 0, reverse=True)  # freshest first
@@ -7246,14 +7260,24 @@ def self_test():
         "x.write_json(pc / 'usage' / 'grok.json', {'time': 9, 'source': 'grok', 'data': {'context_window': {'session_input_tokens': 7, 'session_output_tokens': 3}, 'cost': {'total_cost_usd': 0.5}}})",
         "g = {r['seat']: r for r in x.telemetry()}['grok']",
         "assert g['tokens']['input'] == 7 and g['tokens']['output'] == 3 and g['allocation'] == [] and g['spend']['kind'] == 'reported', g",
-        "acc = [dict(r, account='shared', updated=t, allocation=[{'window': 'wk', 'used_pct': p}]) for r, t, p in ((tm['codex'], 1, 10.0), (tm['claude'], 3, 90.0))]",
+        "acc = [dict(r, account='shared', provider='Shared Co', updated=t, allocation=[{'window': 'wk', 'used_pct': p}]) for r, t, p in ((tm['codex'], 1, 10.0), (tm['claude'], 3, 90.0))]",
         "rows = x.telemetry_rows(acc); assert len(rows) == 1 and rows[0]['seats'] == ['codex', 'claude'], rows",
         "assert rows[0]['allocation'][0]['used_pct'] == 90.0, 'a shared account shows its freshest figures'",
-        "pool = [dict(tm['codex'], seat='grok', account='grok', updated=5, allocation=[], spend={'session_usd': 1.25, 'cumulative_usd': None, 'kind': 'reported'}),"
-        " dict(tm['codex'], seat='alice', account='grok', updated=9, allocation=[{'window': 'wk', 'used_pct': 99.0}])]",
+        "pool = [dict(tm['codex'], seat='grok', account='grok', provider='xAI', updated=5, allocation=[], spend={'session_usd': 1.25, 'cumulative_usd': None, 'kind': 'reported'}),"
+        " dict(tm['codex'], seat='alice', account='grok', provider='xAI', updated=9, allocation=[{'window': 'wk', 'used_pct': 99.0}])]",
         "pr = x.telemetry_rows(pool); assert len(pr) == 1 and pr[0]['seats'] == ['grok', 'alice'], pr",
         "assert pr[0]['allocation'][0]['used_pct'] == 99.0 and pr[0]['spend']['session_usd'] == 1.25, 'one pool: the limit from the bot, the cost from the CLI'",
         "assert x.SHARED_ACCOUNTS['grok'] == x.SHARED_ACCOUNTS['grok-bot'], 'grok and the bots are one pool (the owner, 22:53)'",
+        "scoped = [dict(tm['codex'], account='same', provider='One'), dict(tm['claude'], account='same', provider='Two')]",
+        "assert len(x.telemetry_rows(scoped)) == 2, 'account ids are provider-scoped: same id, different providers, no fold'",
+        # A feed can name its own provider/account/models; a remote app is transport, not a provider.
+        "x.write_json(pc / 'usage' / 'twobot.json', {'time': 6, 'source': 'acme', 'data': {'provider': 'Acme Cloud', 'account': 'acct-1', 'models': ['m-one', 'm-two'], 'cost': {'total_cost_usd': 3.0}}})",
+        "tw = [r for r in x.telemetry() if r['seat'] == 'twobot'][0]",
+        "assert tw['provider'] == 'Acme Cloud' and tw['account'] == 'acct-1' and tw['models'] == ['m-one', 'm-two'], tw",
+        "x.APP_PROCESS['remoteseat'] = 'remote'",
+        "rr = x.telemetry_record('remoteseat', None)",
+        "assert rr['provider'] == 'unknown' and rr['account'] is None, rr",
+        "x.APP_PROCESS.pop('remoteseat')",
         # comms-deck usage <seat>: the full record, honest about gaps
         "dl = x.telemetry_detail(None); assert all(any(l.startswith(r['seat'] + ' ') for l in dl) for r in x.telemetry()), dl",
         "dc = '\\n'.join(x.telemetry_detail('codex'))",
