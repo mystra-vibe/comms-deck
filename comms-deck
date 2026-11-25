@@ -5,6 +5,7 @@
   comms-deck read [--peek]                               show (and take) your notes
   comms-deck note <text...>                              add to the running commentary
   comms-deck status                                      who is busy, idle or away
+  comms-deck usage [--days N]                            notes, activity and plan limits
   comms-deck watch                                       print notes as they are sent
   comms-deck chat [--hide-private]                       full-screen live view of the notes
   comms-deck serve                                       the background service
@@ -3303,6 +3304,114 @@ def status_text():
     return "\n".join(rows + [hook_state])
 
 
+def usage_report(days=7, now=None):
+    """A text report of this deck's usage, from its own logs.
+
+    `comms-deck usage [--days N]`: notes sent and received (log.jsonl), time
+    each seat spent in each state (activity.jsonl, this machine only), and
+    the plan-limit meters and spent marks (usage/, limits/). Plain text, no
+    agent needed: everything is already on disk; this only reads it back.
+    """
+    now = time.time() if now is None else now
+    since_epoch = now - days * 86400
+    since_text = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(since_epoch))
+    out = [f"comms-deck usage, last {days} day(s) (since {since_text[:16]})", ""]
+
+    # Notes, from log.jsonl.
+    msgs = []
+    try:
+        for line in (DATA / "log.jsonl").open():
+            try:
+                r = json.loads(line)
+            except ValueError:
+                continue
+            if r.get("kind") == "message" and str(r.get("time", "")) >= since_text:
+                msgs.append(r)
+    except OSError:
+        pass
+    if not msgs:
+        out.append("notes: none in the log for this period")
+    else:
+        per_day, by_from, to_seat, quiet, private = {}, {}, {}, 0, 0
+        for r in msgs:
+            day = str(r.get("time", ""))[:10]
+            per_day[day] = per_day.get(day, 0) + 1
+            by_from[r.get("from", "unknown")] = by_from.get(r.get("from", "unknown"), 0) + 1
+            for seat in str(r.get("to") or "").split("+"):
+                to_seat["(all) " if seat == "all" else seat] = to_seat.get("(all) " if seat == "all" else seat, 0) + 1
+            quiet += 1 if r.get("quiet") else 0
+            private += 1 if r.get("private") else 0
+        out.append(f"notes: {len(msgs)} sent ({quiet} quiet, {private} private)")
+        out.append("  by day:   " + "  ".join(f"{d}: {n}" for d, n in sorted(per_day.items())))
+        fmt = lambda counts: ", ".join(f"{k.strip()} {v}" for k, v in
+                                       sorted(counts.items(), key=lambda kv: -kv[1]) if v)
+        out.append("  sent by:  " + fmt(by_from))
+        out.append("  sent to:  " + fmt(to_seat))
+    out.append("")
+
+    # Time in state, from activity.jsonl (written by serve on this machine).
+    spans, last = {}, {}
+    try:
+        for line in (DATA / "activity.jsonl").open():
+            try:
+                r = json.loads(line)
+            except ValueError:
+                continue
+            seat, state, t = r.get("seat"), r.get("state"), r.get("time")
+            if not seat or state is None or not isinstance(t, (int, float)):
+                continue
+            if seat in last:
+                prev_state, prev_t = last[seat]
+                if prev_state != state:
+                    span = max(prev_t, since_epoch)
+                    if span < t:
+                        d = spans.setdefault(seat, {}).setdefault(prev_state, 0)
+                        spans[seat][prev_state] = d + (t - span)
+            last[seat] = (state, t)
+    except OSError:
+        pass
+    if not spans and not last:
+        out.append("activity: nothing recorded yet")
+    else:
+        out.append("activity (time in each state, hours):")
+        for seat in sorted(set(spans) | (set(last) if last else set())):
+            buckets = dict(spans.get(seat, {}))
+            current = last.get(seat)
+            if current and current[1] > since_epoch:
+                buckets[current[0]] = buckets.get(current[0], 0) + max(0.0, now - max(current[1], since_epoch))
+            bits = []
+            for state, seconds in sorted(buckets.items(), key=lambda kv: -kv[1]):
+                if seconds > 60:
+                    mark = " *" if current and current[0] == state else ""
+                    bits.append(f"{state} {seconds / 3600:.1f}h{mark}")
+            if bits:
+                out.append(f"  {seat:8} " + ", ".join(bits))
+            else:
+                out.append(f"  {seat:8} (less than a minute in each state)")
+    out.append("")
+
+    # Plan-limit meters and spent marks.
+    out.append("plan limits:")
+    rows = []
+    for seat in tuple(AGENTS) + APP_SEATS:
+        d = (read_json(DATA / "usage" / f"{seat}.json", {}) or {}).get("data") or {}
+        bits = []
+        for label, key in (("5-hour", "five_hour"), ("weekly", "seven_day")):
+            used = dig(d, "rate_limits", key, "used_percentage")
+            if isinstance(used, bool) or not isinstance(used, (int, float)):
+                continue
+            reset = dig(d, "rate_limits", key, "resets_at")
+            when_text = f", resets {when(reset, now)}" if isinstance(reset, (int, float)) else ""
+            bits.append(f"{label} {used:.0f}% used{when_text}")
+        marked = spent_mark(seat, now)
+        if marked is not None:
+            bits.append(f"spent until {when(marked, now)} ({countdown(marked, now)})")
+        if bits:
+            rows.append(f"  {seat:8} " + "; ".join(bits))
+    out.extend(rows if rows else ["  no meters reported and no spent marks"])
+    return "\n".join(out)
+
+
 # -----------------------------------------------------------------------------
 # SECTION 10: MCP server - send, read and status as built-in tools
 # -----------------------------------------------------------------------------
@@ -3797,6 +3906,40 @@ def self_test():
     run(["--from", "owner", "send", "grok", "from the owner"], "owner")
     r = run(["hook", "--source", "grok", "--event", "Stop"], "grok", "{}", {"GROK_HOOK_EVENT": "stop"})
     check("an owner note gets through a paused loop guard", "from the owner" in r.stdout, r.stdout)
+    now = time.time()
+    uhome = Path(tmp) / "usage-home"
+    (uhome / "usage").mkdir(parents=True)
+    (uhome / "limits").mkdir(parents=True)
+    (uhome / "log.jsonl").write_text("".join(json.dumps(r) + "\n" for r in [
+        {"kind": "message", "from": "claude", "to": "grok", "time": "2026-11-24 10:00:00", "text": "u1"},
+        {"kind": "message", "from": "grok", "to": "claude, vibe", "time": "2026-11-24 23:00:00", "text": "u2", "quiet": True},
+        {"kind": "message", "from": "grok", "to": "claude", "time": "2026-11-01 08:00:00", "text": "too old"},
+        {"kind": "commentary", "from": "claude", "time": "2026-11-24 11:00:00", "text": "not a note"},
+    ]))
+    (uhome / "activity.jsonl").write_text("".join(json.dumps(r) + "\n" for r in [
+        {"seat": "claude", "state": "busy", "time": 1795560000.0},
+        {"seat": "claude", "state": "idle", "time": 1795563600.0},
+    ]))
+    (uhome / "usage" / "claude.json").write_text(json.dumps(
+        {"data": {"rate_limits": {"five_hour": {"used_percentage": 42, "resets_at": now + 3600}}}}))
+    (uhome / "limits" / "grok.json").write_text(json.dumps({"resets_at": now + 7200, "set_by": "claude", "set_at": now}))
+    r = run(["usage"], "owner", extra={"COMMS_DECK_HOME": str(uhome)})
+    check("usage: notes counted, old rows and commentary excluded",
+          r.returncode == 0 and "notes: 2 sent (1 quiet, 0 private)" in r.stdout
+          and "2026-11-24: 2" in r.stdout
+          and "claude 1" in r.stdout and "vibe 1" in r.stdout
+          and "u1" not in r.stdout and "u2" not in r.stdout,  # note texts never leak into a metrics report
+          r.stdout + r.stderr)
+    check("usage: time in state and plan meters show",
+          "busy 1.0h" in r.stdout and "idle" in r.stdout and "*" in r.stdout
+          and "5-hour 42% used" in r.stdout
+          and "grok" in r.stdout and "spent until" in r.stdout, r.stdout + r.stderr)
+    empty_home = Path(tmp) / "usage-home-empty"
+    empty_home.mkdir()
+    r = run(["usage"], "owner", extra={"COMMS_DECK_HOME": str(empty_home)})
+    check("usage: an empty deck reports and doesn't crash",
+          r.returncode == 0 and "none in the log" in r.stdout and "no meters" in r.stdout,
+          r.stdout + r.stderr)
     code = ("import importlib.machinery as m, importlib.util as u, sys\n"
             f"l = m.SourceFileLoader('lp', {me!r}); s = u.spec_from_loader('lp', l)\n"
             "x = u.module_from_spec(s); l.exec_module(x)\n"
@@ -4483,6 +4626,8 @@ def main():
     p = sub.add_parser("note")
     p.add_argument("text", nargs="+")
     sub.add_parser("status")
+    p = sub.add_parser("usage", help="notes, activity and plan limits for the deck, from its logs")
+    p.add_argument("--days", type=int, default=7)
     sub.add_parser("watch")
     p = sub.add_parser("chat")
     p.add_argument("--hide-private", action="store_true")
@@ -4529,6 +4674,8 @@ def main():
             print("added to the commentary")
         elif args.cmd == "status":
             print(status_text())
+        elif args.cmd == "usage":
+            print(usage_report(max(1, args.days)))
         elif args.cmd == "watch":
             watch()
         elif args.cmd == "chat":
