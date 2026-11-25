@@ -2571,28 +2571,36 @@ def fit(text, width):
     return ANSI.sub("", text)[:max(0, width - 1)] + "…"
 
 
-def bar(pct, width, step=None):
+def bar(pct, width, step=None, animate=True):
     """A coloured bar for a 0-100 percentage, pulsing like the context rows.
 
     Same holographic recipe (the owner, 02:15): the threshold hue never
     changes (green/amber/red by how full), each cell breathes
-    dim/normal/bold, and one white glint sweeps left to right on the
-    redraw clock. `step` freezes the phase (tests).
+    dim/normal/bold, and one white glint sweeps left to right. The phase
+    is now continuous in time (a float on the 0-8 breathe cycle), so on
+    the fast redraw clock the wave and glint glide instead of stepping.
+    `step` freezes the phase (tests). `animate=False` (the agent is
+    idle, 04:02) draws a still fill in the threshold hue: no breathing,
+    no glint, no trail -- bars only glow while the agent works.
     """
     pct = max(0.0, min(100.0, float(pct)))
     full = round(width * pct / 100)
     shade = 78 if pct < 60 else 214 if pct < 85 else 196
-    step = pulse_step() if step is None else step
-    glint = (step * 2) % (width + 4) - 2
+    fstep = float(step) if step is not None else time.time() / PULSE_EVERY
+    glint = (fstep * 2) % (width + 4) - 2
     esc = "\033["
     cells = []
     for pos in range(width):
         if pos >= full:
             cells.append(f"{esc}0;38;5;238m░{esc}0m")
-        elif pos == glint:
-            cells.append(f"{esc}1;38;5;255m█{esc}0m")
+        elif not animate:
+            cells.append(f"{esc}38;5;{shade}m█{esc}0m")
+        elif abs(pos - glint) <= 0.5:
+            cells.append(f"{esc}1;38;5;255m█{esc}0m")  # the foil's white glint
+        elif 0 < glint - pos <= 1.5:
+            cells.append(f"{esc}38;5;250m█{esc}0m")    # its fading trail
         else:
-            cells.append(f"{esc}{pulse_style(shade, (pos + step) % 8)}m█{esc}0m")
+            cells.append(f"{esc}{breathe_style(shade, pos + fstep)}m█{esc}0m")
     return "".join(cells)
 
 
@@ -2725,16 +2733,18 @@ AVAILABILITY = {"ready": 0, "busy": 1, "stuck": 3, "draft in box": 3,
                 "spent": 7}  # idle until its limit resets: always the bottom (the owner, 07:23)
 
 
-def availability(seat, state, now=None):
+def availability(seat, state, now=None, snap=None):
     """How available `seat` is, as the ACTIVITY panel shows it and the router uses it.
 
     One function for both, so the screen always shows who the next task
     would go to. `state` is the seat file's state (or an app seat's). Returns
     a dict: rank (level, notes waiting; lower is more available), word
     ("ready", "busy", "stuck", "spent", ...), mark, shade, waiting, usage.
+    `snap`, when given (the chat screen's panel_scans snapshot), is where
+    the waiting count comes from.
     """
     usage = (read_json(DATA / "usage" / f"{seat}.json") or {}).get("data") or {}
-    waiting = len(pending(seat))
+    waiting = len(pending(seat)) if snap is None else len(snap["waiting"].get(seat, ()))
     mark, word, shade = activity_view(state, usage, now, waiting=waiting, marked=spent_mark(seat, now))
     # A seat that only checks on its own (Lumo) is not stuck, and not busy, once
     # that check is late: the row says idle until she calls again.
@@ -2893,7 +2903,7 @@ def context_split():
     return out
 
 
-def context_pie(split, width, step=None):
+def context_pie(split, width, step=None, busy=None):
     """The CONTEXT SPLIT lines: a text pie of live context, colour per seat.
 
     Drawn from characters, since the chat is a terminal: each dot is a cell
@@ -2901,14 +2911,16 @@ def context_pie(split, width, step=None):
     quarter of the tokens is a quarter of the disc. Biggest slice starts at
     12 o'clock. beside the disc, one legend row per seat, then one total row
     naming the seats in it (grok's ask). Reports the context now, not
-    lifetime session tokens. The disc breathes with the redraw clock
-    (pulse_step), dimmer and quieter than the bars, so it shimmers without
-    strobing. Returns [] when nobody reports a figure.
+    lifetime session tokens. The disc breathes with the clock (continuous
+    phase), dimmer and quieter than the bars -- and each wedge only
+    shimmers while that seat is actually working: `busy` is the set of
+    working seats, None means everything pulses (tests). Returns [] when
+    nobody reports a figure.
     """
     if not split:
         return []
     esc = "\033["
-    step = pulse_step() if step is None else step
+    fstep = float(step) if step is not None else time.time() / PULSE_EVERY
     total = sum(used for _, used in split)
     box = max(9, min(width - 2, 17))          # cells across the disc
     height = max(max(box // 2 + 1, len(split)), 5)  # chars are twice as tall as wide
@@ -2931,7 +2943,10 @@ def context_pie(split, width, step=None):
             for start, seat in reversed(wedges):
                 if frac >= start - 1e-9:
                     break
-            cells += f"{esc}{pulse_style(colour(seat), (i * 2 + j + step) % 8)}m·{esc}0m"
+            if busy is not None and seat not in busy:
+                cells += f"{esc}38;5;{colour(seat)}m·{esc}0m"  # idle: still, no shimmer
+            else:
+                cells += f"{esc}{breathe_style(colour(seat), i * 2 + j + fstep)}m·{esc}0m"
         disc.append(cells)
     legend = [f"{esc}38;5;{colour(seat)}m■{esc}0m {seat:8} {100 * used / total:4.1f}%  {esc}2m{short_tokens(used)}{esc}0m"
               for seat, used in split]
@@ -2945,7 +2960,8 @@ def context_pie(split, width, step=None):
     return lines
 
 
-PULSE_EVERY = 1.2  # seconds per shimmer step; the screen redraws every 1-2 s
+PULSE_EVERY = 0.5  # seconds per shimmer step (0-8 breathe cycle, so 4 s a wave);
+                   # animated frames redraw far faster now -- the phase is continuous
 
 
 def pulse_style(colour_code, phase):
@@ -2962,12 +2978,31 @@ def pulse_style(colour_code, phase):
     return f"38;5;{colour_code}"
 
 
+def breathe_style(colour_code, phase):
+    """pulse_style made continuous: `phase` may be a float on the 0-8 cycle.
+
+    A cosine on the same dim/normal/bold recipe, matching pulse_style at
+    every integer phase, so on the fast clock (up to 120 frames a second)
+    the brightness wave glides instead of jumping.
+    """
+    b = 0.5 + 0.5 * math.cos(math.tau * (float(phase) - 4) / 8)  # 0..1, peak at 4
+    if b <= 0.15:
+        return f"2;38;5;{colour_code}"   # shadow
+    if b >= 0.85:
+        return f"1;38;5;{colour_code}"   # highlight
+    return f"38;5;{colour_code}"
+
+
 def pulse_step():
-    """The current shimmer step: the redraw clock drives the pulsing."""
+    """The current shimmer step: the redraw clock drives the pulsing.
+
+    Kept for anything that wants the coarse integer phase; the bars
+    themselves now run on a continuous phase (time / PULSE_EVERY).
+    """
     return int(time.time() // PULSE_EVERY)
 
 
-def context_rows(split, width, step=None):
+def context_rows(split, width, step=None, busy=None):
     """One small bar per reporting seat, under the pie: the seat's colour.
 
     Each bar shows how full that seat's context window is (not its share of
@@ -2976,13 +3011,15 @@ def context_rows(split, width, step=None):
     model's nominal window (compaction pulls it back): the fill caps at
     full but the number stays honest. The bars pulse -- the owner wants
     them holographic: a brightness wave along the seat's colour and a white
-    glint sweeping left to right, foil rather than strobe. `step` freezes
-    the phase (tests); None means the redraw clock.
+    glint sweeping left to right, foil rather than strobe -- but only
+    while that seat is actually working (`busy`: the working seats, None
+    pulses everything, tests). Idle bars sit still in the seat's colour.
+    `step` freezes the phase (tests); None means the clock.
     """
     if not split:
         return []
     esc = "\033["
-    step = pulse_step() if step is None else step
+    fstep = float(step) if step is not None else time.time() / PULSE_EVERY
     bar_w = max(4, min(10, width - 15))
     lines = []
     for seat, _ in split:
@@ -2990,15 +3027,20 @@ def context_rows(split, width, step=None):
         pct = context_percent(d) or 0.0
         c = colour(seat)
         full = round(bar_w * min(pct, 100.0) / 100)
-        glint = (step * 2) % (bar_w + 4) - 2  # the white speck travels with time
+        anim = busy is None or seat in busy
+        glint = (fstep * 2) % (bar_w + 4) - 2  # the white speck travels with time
         cells = []
         for pos in range(bar_w):
             if pos >= full:
                 cells.append(f"{esc}0;38;5;238m░{esc}0m")  # the track stays still and dim
-            elif pos == glint:
+            elif not anim:
+                cells.append(f"{esc}38;5;{c}m█{esc}0m")    # idle: still, no glow
+            elif abs(pos - glint) <= 0.5:
                 cells.append(f"{esc}1;38;5;255m█{esc}0m")  # the foil's white glint
+            elif 0 < glint - pos <= 1.5:
+                cells.append(f"{esc}38;5;250m█{esc}0m")    # the glint's fading trail
             else:
-                cells.append(f"{esc}{pulse_style(c, (pos + step) % 8)}m█{esc}0m")
+                cells.append(f"{esc}{breathe_style(c, pos + fstep)}m█{esc}0m")
         lines.append(f"{esc}38;5;{c}m■{esc}0m {seat:8} {''.join(cells)} {pct:3.0f}%"
                      + (" over the window" if pct > 100 else ""))
     return lines
@@ -3070,6 +3112,47 @@ def usage_list():
     return lines
 
 
+PANEL_SCAN_TTL = 0.5  # seconds; the chat's fast clock must not hammer /proc
+
+_panel_scans = {"at": 0.0, "seats": {}, "waiting": {}}
+
+
+def panel_scans():
+    """A half-second cache of the scans the chat panels make.
+
+    load_seat() walks /proc whenever an agent process is gone (an away
+    seat) and pending() reads every inbox -- at up to 120 frames a second
+    (04:02) that's a scan storm. The chat panels read this snapshot
+    instead; the service, the hooks and anything taking notes keep
+    calling load_seat and pending live.
+    """
+    if time.time() - _panel_scans["at"] < PANEL_SCAN_TTL:
+        return _panel_scans
+    now, seats, waiting = time.time(), {}, {}
+    for seat in tuple(AGENTS) + APP_SEATS:
+        if seat in AGENTS:
+            seats[seat] = load_seat(seat)
+        else:
+            d = read_json(seat_file(seat), {}) or {}
+            d["state"] = app_seat_state(seat)
+            seats[seat] = d
+        waiting[seat] = pending(seat)
+    _panel_scans.update(at=now, seats=seats, waiting=waiting)
+    return _panel_scans
+
+
+def busy_seats(snap=None):
+    """The seats whose agent is working right now (state busy).
+
+    This is what lets the bars obey 04:02: only these shimmer. App seats
+    count when the app reports the bot busy (the shared Grok Bot account
+    serves them all, so the account row moves when any bot does).
+    """
+    if snap is None:
+        snap = panel_scans()
+    return {seat for seat, d in snap["seats"].items() if d.get("state") == "busy"}
+
+
 def usage_panel(width):
     """The usage column: context, limits and cost per seat, then the split.
 
@@ -3078,7 +3161,11 @@ def usage_panel(width):
     neither pushes the other off the screen. Under the pie sit the two
     categorised lists the owner asked for (02:43): CONTEXT, one row per
     reporting seat highest first with its share of the pool, and PLAN
-    USAGE, one row per seat with the tighter of its plan meters. """
+    USAGE, one row per seat with the tighter of its plan meters. Bars
+    shimmer only while that seat's agent is busy (04:02); idle bars are
+    still. Sets usage_panel.running for the redraw clock: true while any
+    bar has something to animate, so the screen can tick fast then.
+    """
     inner = width - 2
     bar_w = max(6, inner - 16)
     # A running total of the session costs the agents report themselves
@@ -3099,9 +3186,12 @@ def usage_panel(width):
         head += " " * gap + f"\033[1;38;5;220m{money}\033[0m"
     lines = [head, ""]  # where the figures come from is in the README, not on screen
     shown_account = False
+    snap = panel_scans()  # one shared half-second snapshot for every panel
+    running = busy_seats(snap)
+    app_running = any(seat in running for seat in APP_SEATS)
+    usage_panel.running = bool(running) and width > 2
     for seat in tuple(AGENTS) + APP_SEATS:
         record = read_json(DATA / "usage" / f"{seat}.json")
-        state = load_seat(seat) if seat in AGENTS else {"state": "app"}
         if not record:
             continue  # nothing known: leave it out rather than show an empty section
         if record.get("source") == "grok-bot":
@@ -3115,10 +3205,11 @@ def usage_panel(width):
         if record.get("source") == "grok-bot":
             title, model = "\033[1mGROK BOT ACCOUNT\033[0m", "all bots"
         lines.append(title + (f" \033[2m· {model}\033[0m" if model else ""))
+        anim = (record.get("source") == "grok-bot" and app_running) or seat in running
         pct = context_percent(d)
         size = dig(d, "context_window", "context_window_size")
         if pct is not None:
-            lines.append(f"  Context  {bar(pct, bar_w)} {pct:3.0f}%")
+            lines.append(f"  Context  {bar(pct, bar_w, animate=anim)} {pct:3.0f}%")
             used = dig(d, "context_window", "context_tokens")
             if used is None and isinstance(size, (int, float)):
                 used = size * pct / 100
@@ -3127,7 +3218,7 @@ def usage_panel(width):
         for label, key in (("5-hour", "five_hour"), ("Weekly", "seven_day")):
             used = dig(d, "rate_limits", key, "used_percentage")
             if isinstance(used, (int, float)):
-                lines.append(f"  {label:7}  {bar(used, bar_w)} {used:3.0f}%")
+                lines.append(f"  {label:7}  {bar(used, bar_w, animate=anim)} {used:3.0f}%")
                 reset = dig(d, "rate_limits", key, "resets_at")
                 if isinstance(reset, (int, float)):
                     lines.append(f"\033[2m           {100 - used:.0f}% left · resets {when(reset)}\033[0m")
@@ -3145,9 +3236,9 @@ def usage_panel(width):
         lines.append(f"\033[2m  updated {ago(time.time() - record.get('time', 0))}\033[0m")
         lines.append("")
     split = context_split()
-    pie = context_pie(split, inner)  # [] when nobody reports a context figure
+    pie = context_pie(split, inner, busy=running)  # [] when nobody reports a context figure
     if pie:
-        lines += pie + context_rows(split, inner) + [""]
+        lines += pie + context_rows(split, inner, busy=running) + [""]
     ctx = context_list(split)  # the categorised lists the owner asked for (02:43)
     if ctx:
         lines += ctx + [""]
@@ -3172,11 +3263,12 @@ def activity_panel(width):
     bars only. Since #61 this column is its own on the right of the chat,
     so the ready order is visible instead of scrolling away under the pie.
     """
+    snap = panel_scans()  # one shared half-second snapshot for every panel
     lines = ["\033[1mACTIVITY\033[0m", ""]
     activity_panel.ticking = False
     rows = []
-    for order, (seat, st, since) in enumerate(current_states()):
-        a = availability(seat, st)
+    for order, (seat, st, since) in enumerate(current_states(snap)):
+        a = availability(seat, st, snap=snap)
         usage, waiting, mark, word, shade = a["usage"], a["waiting"], a["mark"], a["word"], a["shade"]
         if word == "spent":
             reset = spent_reset(usage, spent_mark(seat))
@@ -3185,7 +3277,7 @@ def activity_panel(width):
                 activity_panel.ticking = True  # seconds are shown only in the last hour
         elif seat in APP_SEATS and APP_PROCESS.get(seat, "grok-bot") != "grok-bot" and st != "not set up":
             activity_panel.ticking = True  # it polls rather than being woken, so show when it next looks
-            began = poll_countdown(load_seat(seat))
+            began = poll_countdown(snap["seats"].get(seat) or load_seat(seat))
         else:
             began = when(since) if since else ""  # static: "03:27" today, "Fri 18:00" this week, "Nov 12 18:00" further back
         squares = "■" * min(waiting, 5) + (f"+{waiting - 5}" if waiting > 5 else "")
@@ -3193,7 +3285,8 @@ def activity_panel(width):
         # A spent row is all grey, name and squares too, and has no line
         # under it: nothing it holds can start until the reset (the owner, 08:07-08:08).
         spent = word == "spent"
-        summary = "" if spent else task_summary(load_seat(seat).get("doing") if word == "busy" else "", pending(seat))
+        doing = (snap["seats"].get(seat) or load_seat(seat)).get("doing")
+        summary = "" if spent else task_summary(doing if word == "busy" else "", snap["waiting"].get(seat, ()))
         name_shade, square_shade = (shade, shade) if spent else (colour(seat), 33)
         rows.append((*a["rank"], order,
                      [f"  \033[38;5;{name_shade}m{seat.title():8}\033[0m "
@@ -3215,23 +3308,26 @@ def row_status(state, waiting):
     return STATE_MARKS.get(state, "◌"), STATE_COLOURS.get(state, 245), state
 
 
-def current_states():
+def current_states(snap=None):
     """(seat, state, since) for every seat shown on the chat screen.
 
     Terminal agents that are away are left out, except Claude and Grok;
-    hidden app seats are never shown.
+    hidden app seats are never shown. `snap`, when given, is the chat
+    screen's panel_scans snapshot (the fast clock must not re-scan); the
+    router and team_status keep the live reads.
     """
     out = []
     for seat in AGENTS:
-        st = load_seat(seat)
+        st = snap["seats"][seat] if snap is not None else load_seat(seat)
         if st["state"] == "away" and seat not in ("claude", "grok") and not seat_spent(seat):
             continue  # a spent seat stays shown, so its countdown can be seen
         out.append((seat, st["state"], st.get("since")))
     for seat in APP_SEATS:
         if seat in HIDDEN_SEATS:
             continue
-        since = (read_json(seat_file(seat), {}) or {}).get("since")
-        out.append((seat, app_seat_state(seat), since))
+        d = snap["seats"][seat] if snap is not None else read_json(seat_file(seat), {}) or {}
+        out.append((seat, d.get("state") if snap is not None else app_seat_state(seat),
+                    d.get("since")))
     return out
 
 
@@ -3396,7 +3492,17 @@ def chat(history=200, hide_private=False):
                     changed = True
                 if not typed and not in_paste and not pending_esc and fresh_code():
                     raise FreshCode  # nothing half typed: reopen on the new code (after the finally)
-                if changed or time.time() - last_draw >= (1 if getattr(activity_panel, "ticking", False) else 2):
+                # The animation clock (04:02): while a bar has something to
+                # shimmer (a busy seat) or a countdown ticks seconds, the
+                # loop wakes every ~4 ms and frames go out on a 120 fps cap
+                # (measured: ~1.4 ms to build a frame cached, so plenty of
+                # headroom; kitty syncs and drops what can't keep up). The
+                # scans sit behind a half-second snapshot, so the fast clock
+                # doesn't hammer /proc and the inboxes. Quiet screens keep
+                # the old pace -- 0.25 s polls, 1-2 s redraws. Bueno.
+                animating = getattr(activity_panel, "ticking", False) or getattr(usage_panel, "running", False)
+                gap = 1 / 120 if animating else (1 if getattr(activity_panel, "ticking", False) else 2)
+                if changed or time.time() - last_draw >= gap:
                     body = rows - (1 if tty else 0)  # the chat box is the last line
                     left = shown[-body:]
                     left = [""] * (body - len(left)) + left
@@ -3418,9 +3524,9 @@ def chat(history=200, hide_private=False):
                     last_draw = time.time()
                 if tty:
                     import select
-                    select.select([sys.stdin], [], [], 0.25)
+                    select.select([sys.stdin], [], [], 1 / 240 if animating else 0.25)
                 else:
-                    time.sleep(0.25)
+                    time.sleep(1 / 240 if animating else 0.25)
         finally:
             if saved_tty is not None:
                 import termios
@@ -4889,6 +4995,15 @@ def self_test():
         "assert '38;5;255' in x.bar(50, 10, step=1), 'a glint sweeps the usage bars as well'",
         "assert '█' not in x.ANSI.sub('', x.bar(0, 8, step=0)), 'an empty bar draws an empty track, no glint'",
         "assert '38;5;196' in x.bar(95, 10, step=0), 'a full bar reads red, not amber'",
+        "bs0 = x.bar(50, 10, step=0, animate=False); bs5 = x.bar(50, 10, step=5, animate=False)",
+        "assert bs0 == bs5, 'an idle bar is still: no shimmer while the agent rests (04:02)'",
+        "assert '38;5;255' not in bs5 and '38;5;250' not in bs5, 'no glint, no trail on an idle bar'",
+        "assert '38;5;78' in bs0, 'an idle bar keeps the threshold hue'",
+        "assert x.breathe_style(208, 0.0) == '2;38;5;208' and x.breathe_style(208, 4.0) == '1;38;5;208', 'the continuous wave matches pulse_style at the integers'",
+        "assert x.context_rows(sp2, 40, step=0, busy=()) == x.context_rows(sp2, 40, step=3, busy=()), 'rows of idle seats do not move'",
+        "assert x.context_rows(sp2, 40, step=3, busy=None) == x.context_rows(sp2, 40, step=3), 'busy=None keeps the old animate-everything behaviour'",
+        "pidle = x.context_pie(sp, 40, step=0, busy=()); assert x.context_pie(sp, 40, step=5, busy=()) == pidle, 'an all-idle disc is still'",
+        "assert x.context_pie(sp, 40, step=0, busy=None) != x.context_pie(sp, 40, step=5, busy=None), 'the disc breathes when seats work'",
         "up = x.usage_panel(40); up_t = ' '.join(x.ANSI.sub('', l) for l in up)",
         "ap = x.activity_panel(40); ap_t = ' '.join(x.ANSI.sub('', l) for l in ap)",
         "assert 'ACTIVITY' not in up_t and 'ACTIVITY' in ap_t, 'the panels split cleanly'",
