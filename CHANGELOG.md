@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- **USAGE grouped by type, with more pool data.** The usage column now
+  sorts each seat's figures into CONTEXT (window fill and session tokens,
+  fullest first) and USAGE (plan limits and cost, hardest hit first); a
+  seat reporting both appears in both groups. The CONTEXT SPLIT pie's
+  legend shows tokens in use of each window size, and a pool line totals
+  live context against the combined windows. By Devin, on the owner's ask.
 - **The ready order has its own column again.** The chat screen is three
   columns on a wide terminal: USAGE, the bars and the CONTEXT SPLIT on
   the left, the chat in the middle, and the ACTIVITY panel -- the active

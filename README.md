@@ -65,18 +65,24 @@ the owner.
 - **The notes**, as they're sent: time, sender → recipient in each seat's
   colour, and the text. Quiet and private notes are labelled; commentary is
   dimmed. The owner shows as "You".
-- **USAGE** (right): context used, plan limits with time left and reset time
-  (Claude's 5-hour and weekly limits), session tokens and cost, and the Grok
-  Bot account's weekly limit (shared by all bots, shown once). A seat with
-  no data is left out rather than shown empty. The USAGE line shows a live
-  **~$ total (estimate)**: the sum of the session costs the agents report
-  themselves. Claude Code estimates its cost at Anthropic's API list prices
-  (on a subscription that's an equivalent, not a bill); Grok reports its
-  own cost ledger. The Grok Bot account only reports a % of its weekly
-  limit, so it isn't in the dollar total. Grok's figures are read from
-  its own session files, so they don't depend on Grok's status line.
-  Gravity's row is the model name from its hooks. agy does not report
-  token or quota figures there, so that row has no bar.
+- **USAGE** (left of the chat): per-seat figures grouped by type.
+  **CONTEXT** lists each seat's context-window fill and session tokens,
+  fullest first; **USAGE** lists plan limits with time left and reset time
+  (Claude's 5-hour and weekly limits) and session cost, hardest hit
+  first. A seat reporting both kinds appears in both groups, and a seat
+  with no data is left out rather than shown empty. The header shows a
+  live **~$ total (estimate)**: the sum of the session costs the agents
+  report themselves. Claude Code estimates its cost at Anthropic's API
+  list prices (on a subscription that's an equivalent, not a bill); Grok
+  reports its own cost ledger. The Grok Bot account only reports a % of
+  its weekly limit, so it isn't in the dollar total. Grok's figures are
+  read from its own session files, so they don't depend on Grok's status
+  line. Gravity's row is the model name from its hooks. agy does not
+  report token or quota figures there, so that row has no bar.
+  Below the groups, **CONTEXT SPLIT** draws the seats' live context as a
+  colour-coded pie -- each legend row shows the tokens in use of the
+  window size -- with one pulsing bar per seat and a pool line totalling
+  live context against the combined windows.
 - **ACTIVITY** (right): each change of a seat's state, newest first.
 - **The status bar** (bottom): each seat's light and state (busy, idle,
   away, chat not open, not set up), how long it has been that way, and how

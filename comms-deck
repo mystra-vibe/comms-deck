@@ -2933,7 +2933,14 @@ def context_pie(split, width, step=None):
                     break
             cells += f"{esc}{pulse_style(colour(seat), (i * 2 + j + step) % 8)}m·{esc}0m"
         disc.append(cells)
-    legend = [f"{esc}38;5;{colour(seat)}m■{esc}0m {seat:8} {100 * used / total:4.1f}%  {esc}2m{short_tokens(used)}{esc}0m"
+    wins = {}
+    for seat, _ in split:
+        d = (read_json(DATA / "usage" / f"{seat}.json", {}) or {}).get("data", {}) or {}
+        s = dig(d, "context_window", "context_window_size")
+        if isinstance(s, (int, float)) and s > 0:
+            wins[seat] = s
+    legend = [f"{esc}38;5;{colour(seat)}m■{esc}0m {seat:8} {100 * used / total:4.1f}%  {esc}2m"
+              f"{short_tokens(used)}" + (f"/{short_tokens(wins[seat])}" if seat in wins else "") + f"{esc}0m"
               for seat, used in split]
     lines = ["\033[1mCONTEXT SPLIT\033[0m", ""]
     for i in range(max(len(disc), len(legend))):
@@ -3005,11 +3012,15 @@ def context_rows(split, width, step=None):
 
 
 def usage_panel(width):
-    """The usage column: context, limits and cost per seat, then the split.
+    """The usage column: figures grouped by type, then the context split.
 
-    Since #61 this is drawn on the LEFT of the chat (the owner's layout):
-    the ready order moved to its own activity_panel() on the right, so
-    neither pushes the other off the screen. """
+    Seats are grouped by what they report -- CONTEXT (window fill, session
+    tokens) and USAGE (plan limits, cost) -- each ordered by its highest
+    figure, so the seats burning the most sit on top. A seat reporting
+    both kinds appears in both groups. Since #61 this is drawn on the LEFT
+    of the chat (the owner's layout): the ready order moved to its own
+    activity_panel() on the right, so neither pushes the other off the
+    screen. """
     inner = width - 2
     bar_w = max(6, inner - 16)
     # A running total of the session costs the agents report themselves
@@ -3030,9 +3041,9 @@ def usage_panel(width):
         head += " " * gap + f"\033[1;38;5;220m{money}\033[0m"
     lines = [head, ""]  # where the figures come from is in the README, not on screen
     shown_account = False
+    context_seats, usage_seats = [], []
     for seat in tuple(AGENTS) + APP_SEATS:
         record = read_json(DATA / "usage" / f"{seat}.json")
-        state = load_seat(seat) if seat in AGENTS else {"state": "app"}
         if not record:
             continue  # nothing known: leave it out rather than show an empty section
         if record.get("source") == "grok-bot":
@@ -3045,41 +3056,90 @@ def usage_panel(width):
         title = f"\033[1;38;5;{colour(seat)}m{seat.upper()}\033[0m"
         if record.get("source") == "grok-bot":
             title, model = "\033[1mGROK BOT ACCOUNT\033[0m", "all bots"
-        lines.append(title + (f" \033[2m· {model}\033[0m" if model else ""))
+        title += f" \033[2m· {model}\033[0m" if model else ""
         pct = context_percent(d)
         size = dig(d, "context_window", "context_window_size")
-        if pct is not None:
-            lines.append(f"  Context  {bar(pct, bar_w)} {pct:3.0f}%")
-            used = dig(d, "context_window", "context_tokens")
-            if used is None and isinstance(size, (int, float)):
-                used = size * pct / 100
-            if isinstance(used, (int, float)) and isinstance(size, (int, float)):
-                lines.append(f"\033[2m           {short_tokens(used)} of {short_tokens(size)} tokens\033[0m")
+        used = dig(d, "context_window", "context_tokens")
+        if used is None and isinstance(size, (int, float)) and pct is not None:
+            used = size * pct / 100
+        limits = []
         for label, key in (("5-hour", "five_hour"), ("Weekly", "seven_day")):
-            used = dig(d, "rate_limits", key, "used_percentage")
-            if isinstance(used, (int, float)):
-                lines.append(f"  {label:7}  {bar(used, bar_w)} {used:3.0f}%")
-                reset = dig(d, "rate_limits", key, "resets_at")
-                if isinstance(reset, (int, float)):
-                    lines.append(f"\033[2m           {100 - used:.0f}% left · resets {when(reset)}\033[0m")
-        bits = []
+            u = dig(d, "rate_limits", key, "used_percentage")
+            if isinstance(u, (int, float)):
+                limits.append((label, u, dig(d, "rate_limits", key, "resets_at")))
         sin, sout = dig(d, "context_window", "session_input_tokens"), dig(d, "context_window", "session_output_tokens")
+        session = []
         if isinstance(sin, (int, float)):
-            bits.append(f"in {short_tokens(sin)}")
+            session.append(f"in {short_tokens(sin)}")
         if isinstance(sout, (int, float)):
-            bits.append(f"out {short_tokens(sout)}")
+            session.append(f"out {short_tokens(sout)}")
         cost = dig(d, "cost", "total_cost_usd")
-        if isinstance(cost, (int, float)):
-            bits.append(f"${cost:.2f}" + (" est." if dig(d, "rate_limits") is not None else ""))
-        if bits:
-            lines.append(f"  Session  {' · '.join(bits)}")
-        lines.append(f"\033[2m  updated {ago(time.time() - record.get('time', 0))}\033[0m")
-        lines.append("")
+        entry = {"title": title, "record": record, "pct": pct, "used": used, "size": size,
+                 "limits": limits, "session": session,
+                 "cost": cost if isinstance(cost, (int, float)) else None}
+        if pct is not None or isinstance(used, (int, float)) or session:
+            context_seats.append(entry)
+        if limits or entry["cost"]:
+            usage_seats.append(entry)
+    context_seats.sort(key=lambda e: (e["pct"] is None,
+                                      -(e["pct"] if e["pct"] is not None else 0),
+                                      -(e["used"] if isinstance(e["used"], (int, float)) else 0)))
+    usage_seats.sort(key=lambda e: (-max((u for _, u, _ in e["limits"]), default=-1),
+                                    -(e["cost"] or 0)))
+    updated = lambda e: f"\033[2m  updated {ago(time.time() - e['record'].get('time', 0))}\033[0m"
+    if context_seats:
+        lines += ["  \033[1;2mCONTEXT\033[0m", ""]
+        for e in context_seats:
+            lines.append(e["title"])
+            if e["pct"] is not None:
+                lines.append(f"  Context  {bar(e['pct'], bar_w)} {e['pct']:3.0f}%")
+            if isinstance(e["used"], (int, float)):
+                if isinstance(e["size"], (int, float)):
+                    lines.append(f"\033[2m           {short_tokens(e['used'])} of {short_tokens(e['size'])} tokens\033[0m")
+                else:
+                    lines.append(f"\033[2m           {short_tokens(e['used'])} tokens\033[0m")
+            if e["session"]:
+                lines.append(f"  Session  {' · '.join(e['session'])}")
+            lines += [updated(e), ""]
+    if usage_seats:
+        lines += ["  \033[1;2mUSAGE\033[0m", ""]
+        for e in usage_seats:
+            lines.append(e["title"])
+            for label, u, reset in e["limits"]:
+                lines.append(f"  {label:7}  {bar(u, bar_w)} {u:3.0f}%")
+                if isinstance(reset, (int, float)):
+                    lines.append(f"\033[2m           {100 - u:.0f}% left · resets {when(reset)}\033[0m")
+            if e["cost"] is not None:
+                lines.append(f"  {'Cost':7}  ${e['cost']:.2f}" + (" est." if e["limits"] else ""))
+            lines += [updated(e), ""]
     split = context_split()
     pie = context_pie(split, inner)  # [] when nobody reports a context figure
     if pie:
-        lines += pie + context_rows(split, inner) + [""]
+        lines += pie + context_rows(split, inner)
+        pool = context_pool(split)
+        if pool:
+            lines.append(f"\033[2m  pool {short_tokens(pool[0])} of {short_tokens(pool[1])}"
+                         f" · {100 * pool[0] / pool[1]:.0f}% full\033[0m")
+        lines.append("")
     return [fit(" " + line, width) for line in lines]
+
+
+def context_pool(split):
+    """(tokens in context, window tokens) across the reporting seats.
+
+    The pie shows each seat's share of the pool; this is the pool itself --
+    how much context is live right now against the windows it sits in.
+    Seats reporting tokens but no window size still count toward the used
+    total but not the denominator. None when no window size is known.
+    """
+    used = size = 0.0
+    for seat, tokens in split:
+        used += tokens
+        d = (read_json(DATA / "usage" / f"{seat}.json", {}) or {}).get("data", {}) or {}
+        s = dig(d, "context_window", "context_window_size")
+        if isinstance(s, (int, float)) and s > 0:
+            size += s
+    return (used, size) if size else None
 
 
 def activity_panel(width):
@@ -4818,6 +4878,9 @@ def self_test():
         "ap = x.activity_panel(40); ap_t = ' '.join(x.ANSI.sub('', l) for l in ap)",
         "assert 'ACTIVITY' not in up_t and 'ACTIVITY' in ap_t, 'the panels split cleanly'",
         "assert 'USAGE' in up_t, up_t",  # usage keeps its column; the ready order keeps its ink
+        "assert 'CONTEXT' in up_t and 'CODEX' in up_t, 'seats group by what they report'",
+        "assert up_t.index('GROK') < up_t.index('GRAVITY') < up_t.index('CODEX'), 'each group runs highest value first'",
+        "assert 'pool' in up_t and 'full' in up_t, 'the context pool total shows'",
         "x.DATA = real_data",
         "assert x.poll_countdown({}, now) == \"hasn't checked yet\"",
         "assert x.poll_countdown({'polled_at': now - 18}, now) == 'next check in 0:42'",
