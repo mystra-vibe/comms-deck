@@ -3557,17 +3557,37 @@ def vibe_model_info(model):
         return model, None
 
 
+def vibe_reported_context(session):
+    """The context size Vibe's own status line shows ("ctx 17.4k/202k"), or None.
+
+    It is last_reported_context_tokens in the newest generation's
+    checkpoint.json. That file also holds the conversation, so only this one
+    number is taken out of it, by pattern, and nothing else is kept.
+    """
+    generations = sorted((session / "generations").glob("*/checkpoint.json"))
+    if not generations:
+        return None
+    try:
+        text = generations[-1].read_text(errors="replace")
+    except OSError:
+        return None
+    m = re.search(r'"last_reported_context_tokens"\s*:\s*(\d+)', text)
+    return int(m.group(1)) if m else None
+
+
 def vibe_usage_from_session():
     """Vibe's context use, from the files Vibe writes for its live session.
 
     The owner OK'd reading these (2026-11-25). Vibe keeps one folder per
-    session under ~/.vibe/logs/session/unified/. The live one is the folder
-    whose context-breakdown.json changed last: it holds the tokens now in
-    context (system, tools, skills, conversation), and meta.json names the
-    model. The window size comes from Vibe's model catalog. Vibe's free
-    models report no plan limit, so there's no 5-hour or weekly bar.
-    Returns (time, data) in the status-line shape, or None if Vibe isn't
-    running.
+    session under ~/.vibe/logs/session/unified/; the live one changed last.
+    The tokens are the figure Vibe's own status line shows
+    (vibe_reported_context). context-breakdown.json is only a fallback: it
+    can count far more than is really in context (it read 578k of a 262k
+    window on 2026-11-25, when Vibe's screen said 17.4k of 202k). The
+    window is the one Vibe's UI uses (ui_startup_config.json), else the
+    model catalog's. meta.json names the model. Vibe's free models report
+    no plan limit, so there's no 5-hour or weekly bar. Returns (time, data)
+    in the status-line shape, or None if Vibe isn't running.
     """
     if not any(proc_name(int(d.name)) == AGENTS["vibe"] for d in Path("/proc").iterdir() if d.name.isdigit()):
         return None
@@ -3580,9 +3600,17 @@ def vibe_usage_from_session():
         meta = json.loads((newest.parent / "meta.json").read_text())
     except (OSError, ValueError):
         return None
-    tokens = sum(v for v in breakdown.values() if isinstance(v, (int, float)))
+    reported = vibe_reported_context(newest.parent)
+    tokens = reported if reported is not None else sum(
+        v for v in breakdown.values() if isinstance(v, (int, float)))
     model = dig(meta, "config", "active_model") or dig(meta, "config", "model_name") or ""
     label, window = vibe_model_info(model) if model else ("", None)
+    try:  # the window Vibe's own status line divides by ("17.4k/202k")
+        ui = json.loads((HOME / ".vibe/ui_startup_config.json").read_text())
+        if ui.get("contextWindow") and str(ui.get("activeModelDisplayName") or "").startswith(label or "\0"):
+            window = ui["contextWindow"]
+    except (OSError, ValueError):
+        pass
     data = {"model": {"id": model, "display_name": label}, "context_window": {"context_tokens": tokens}}
     if isinstance(window, (int, float)) and window > 0:
         data["context_window"]["context_window_size"] = window
@@ -4778,6 +4806,11 @@ def self_test():
         "(vh / '.vibe/model_catalog_cache.json').write_text('{\"k\": [{\"id\": \"m-free\", \"label\": \"M Free\", \"max_context_length\": 40000}]}')",
         "_, vd = x.vibe_usage_from_session()",
         "assert vd['model']['display_name'] == 'M Free' and x.context_percent(vd) == 25.0, vd",
+        "g = sd / 'generations/0000000000000002'; g.mkdir(parents=True); (sd / 'generations/0000000000000001').mkdir()",
+        "(g / 'checkpoint.json').write_text('{\"compaction_count\": 2, \"last_reported_context_tokens\": 4000, \"turn\": {}}')",
+        "(vh / '.vibe/ui_startup_config.json').write_text('{\"activeModelDisplayName\": \"M Free[high]\", \"contextWindow\": 20000}')",
+        "_, vd = x.vibe_usage_from_session()",
+        "assert x.context_percent(vd) == 20.0, vd",  # Vibe's own figure and window win over the breakdown and catalog
         "x.AGENTS['vibe'] = 'no-such-program-xyz'; assert x.vibe_usage_from_session() is None",
         "x.HOME, x.AGENTS['vibe'] = real_home, real_vibe",
         # The context-split pie reads usage/<seat>.json only: counts, never text.
