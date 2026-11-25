@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- **03 USAGE is usage only.** The owner (21:35): 06 CONTEXT SPLIT already
+  covers context, so the usage column drops each seat's Context bar and
+  the CONTEXT list. It shows each seat's 5-hour and weekly limits,
+  session tokens and cost, and PLAN USAGE. A seat with nothing but context
+  to report no longer gets an empty section. By Claude.
 - **The deck look.** On a screen 150 columns or wider the chat is now a
   dashboard (the owner, after Argona's video): a strip of big numbers
   along the top (seats, working, notes today, waiting, context, cost,
