@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- **ACTIVITY cooldowns in metric time.** The spent "idle until" countdown
+  (under an hour) and the polling seats' "next check"/"check late" timers
+  now show milliseconds — `58:20.250`, `1d 00:00:00.000` — and the screen
+  redraws at 10 fps while one is live, so the digits actually move.
+  Longer waits keep the coarse countdown. By Devin, on the owner's ask.
 - **Scratchpad cells meet.** The gap between the cells is 0, so the agent
   windows sit flush. The outer margin stays 22. Hyprland still draws a 2px
   border, rounded corners and a shadow on each window; the layout script
