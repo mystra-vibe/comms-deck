@@ -129,6 +129,8 @@
 # Hook idle rules, promptId, and the kitty draft check: Grok (2026-11-24).
 # Grok Bot page adapter, Gravity's model line and tool allow list, and the
 # reason on a failed app-seat send: Grok (2026-11-24).
+# Recipient exclusion ("-seat" in send() and the chat box's route()):
+# Vibe (2026-11-25, PR #49, reviewed by Claude).
 
 import argparse
 import base64
