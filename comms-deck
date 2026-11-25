@@ -651,6 +651,15 @@ def send(sender, to, text, quiet=False, private=False):
     record = {"kind": "message", "id": new_id(), "from": sender or "unknown",
               "to": to, "time": now(), "machine": MACHINE,
               "quiet": bool(quiet), "private": bool(private), "text": text}
+    balancer = load_balancer() if sender == "owner" else None
+    if balancer:
+        try:
+            task = balancer.create_task(record, targets)
+        except Exception as error:  # the note must still go out
+            task = None
+            log(f"load-balancer couldn't make a task: {error}")
+        if task:
+            record["task"] = task["id"]
     for seat in targets:
         if seat == "owner":
             notify(f"Note from {record['from']}", text)
@@ -673,6 +682,59 @@ def add_note(sender, text):
     queue_out(record)
     append_log(record)
     return record
+
+
+# -- Load balancer: the task board, in its own repo -----------------------------
+# The owner (2026-11-25): requests to several agents were being picked up by
+# two or three of them at once. The task board that stops this lives in its
+# own repo, https://github.com/whyyyyyai/load-balancer: a note from the owner
+# to two or more agents becomes one task with one holder, chosen by the
+# program, and the holder keeps it only while it can work on it.
+#
+# comms-deck loads it if it's installed (~/.local/bin/load-balancer, or
+# $COMMS_DECK_LOAD_BALANCER) and hands it this module, so it uses the deck's
+# own availability ranking, mailbox and notes. Without it, nothing changes:
+# no tasks, and every note is delivered exactly as before.
+_balancer = None
+
+
+class _DeckView:
+    """This module's globals as attributes, read live.
+
+    The load balancer is handed the deck it runs in. When comms-deck runs as
+    a script that's sys.modules["__main__"], but a loader (a test, another
+    program) may load it without registering it, so this view stands in.
+    """
+
+    def __getattr__(self, name):
+        try:
+            return globals()[name]
+        except KeyError:
+            raise AttributeError(name) from None
+
+    def __setattr__(self, name, value):
+        globals()[name] = value
+
+
+def load_balancer():
+    """The load-balancer module, attached to this deck, or None if it isn't installed."""
+    global _balancer
+    if _balancer is None:
+        path = Path(setting("LOAD_BALANCER") or HOME / ".local/bin/load-balancer")
+        _balancer = False
+        if path.exists():
+            try:
+                import importlib.machinery
+                import importlib.util
+                loader = importlib.machinery.SourceFileLoader("load_balancer", str(path))
+                spec = importlib.util.spec_from_loader("load_balancer", loader)
+                module = importlib.util.module_from_spec(spec)
+                loader.exec_module(module)
+                module.attach(sys.modules.get(__name__) or _DeckView())
+                _balancer = module
+            except Exception as error:  # a broken balancer must never stop the deck
+                log(f"load-balancer at {path} didn't load: {error}")
+    return _balancer or None
 
 
 PRIVATE_NAMES_FILE = CONFIG / "private-names"
@@ -773,7 +835,11 @@ def team_snapshot(seat, records):
         waiting = len(pending(other))
         rows.append(f"{other} {st}{began}, {waiting} waiting")
     text = f"Team at {time.strftime('%H:%M')}: " + "; ".join(rows) + "."
-    shared = [r for r in records if r.get("to") == "all" or "+" in str(r.get("to"))]
+    balancer = load_balancer()
+    board = [t for t in balancer.all_tasks() if t["state"] in balancer.TASK_ACTIVE][-5:] if balancer else []
+    if board:
+        text += " Tasks: " + "; ".join(f"{t['id']} {t.get('holder') or 'open'}" for t in board) + "."
+    shared = [r for r in records if (r.get("to") == "all" or "+" in str(r.get("to"))) and not r.get("task")]
     if shared:
         text += (" This note went to more than one agent. Before starting work on it, check "
                  "who is already on it (team_status, or ask). If it was sent a while ago and "
@@ -790,6 +856,19 @@ def render(records, seat):
         to = "" if r.get("to") == seat else f" (to {str(r.get('to')).replace('+', ', ')})"
         tag = f" [{', '.join(tags)}]" if tags else ""
         lines.append(f"From {r['from']}{to} at {r['time'][11:16]} ({note_age(r)}){tag}:\n{r['text']}")
+        balancer = load_balancer() if r.get("task") else None
+        task = balancer.load_task(r.get("task")) if balancer else None
+        if task and task["state"] in balancer.TASK_ACTIVE:
+            holder = task.get("holder")
+            if holder == seat:
+                lines.append(f"Task {task['id']} is YOURS (picked by the deck). Do it, then "
+                             f"`done_task {task['id']}`; `release_task {task['id']}` if you can't.")
+            elif holder:
+                lines.append(f"Task {task['id']} is {holder}'s. Don't start it yourself; "
+                             f"help only if {holder} asks.")
+            else:
+                lines.append(f"Task {task['id']} is open: nobody was free. `claim_task {task['id']}` "
+                             f"to take it.")
     lines.append(team_snapshot(seat, records))
     senders = sorted({r["from"] for r in records} & set(SEATS))
     reply = (f"\n\nReply with the send_message tool (to: {senders[0]})"
@@ -1078,7 +1157,8 @@ def agy_hook(event):
 # owner, 09:00). Vibe keys a tool's permission as [tools.<server>_<tool>]:
 # checked live, where [tools."mcp_comms_deck.<tool>"] (the name it shows) and
 # [tools.mcp_comms_deck_<tool>] both still asked.
-VIBE_ALLOWED_TOOLS = ("team_status", "read_messages", "send_message", "add_note", "set_status")
+VIBE_ALLOWED_TOOLS = ("team_status", "read_messages", "send_message", "add_note", "set_status",
+                      "tasks", "claim_task", "release_task", "done_task")
 
 
 def grant_vibe_tools(config):
@@ -2489,6 +2569,12 @@ def serve():
                 refresh_vibe_usage()
             except Exception as error:  # the same: never stop the service for it
                 log(f"couldn't read Vibe's usage: {error}")
+            balancer = load_balancer()
+            if balancer:
+                try:
+                    balancer.refresh_tasks()  # keep every task with someone who can do it
+                except Exception as error:
+                    log(f"load-balancer pass failed: {error}")
             try:
                 refresh_screen_limits()
             except Exception as error:  # never stop the service for it
@@ -3295,6 +3381,14 @@ def activity_panel(width):
                       + (f" \033[38;5;{square_shade}m{squares}\033[0m" if squares else "")]
                      + ([f"    \033[2m↳ {summary}\033[0m"] if summary else [])))
     lines += [line for row in sorted(rows) for line in row[-1]]
+    balancer = load_balancer()
+    board = [t for t in balancer.all_tasks() if t["state"] in balancer.TASK_ACTIVE] if balancer else []
+    if board:
+        lines += ["", "\033[1mTASKS\033[0m"]
+        for t in board[-6:]:
+            who = t.get("holder") or "open"
+            lines.append(f"  \033[38;5;{colour(who) if t.get('holder') else 245}m{t['id']:4} {who:7}\033[0m "
+                         f"\033[2m{'(private)' if t.get('private') else t['summary']}\033[0m")
     return [fit(" " + line, width) for line in lines]
 
 
@@ -4068,6 +4162,20 @@ MCP_TOOLS = [
     {"name": "team_status",
      "description": "Which agents are busy, idle or away, and how many notes wait for each.",
      "inputSchema": {"type": "object", "properties": {}}},
+    {"name": "tasks",
+     "description": "The task board: requests from the owner to several agents, each with one "
+                    "holder chosen by the deck. Don't start a task someone else holds.",
+     "inputSchema": {"type": "object", "properties": {
+         "all": {"type": "boolean", "description": "Include finished tasks."}}}},
+    {"name": "claim_task",
+     "description": "Take an open task (refused if another seat holds it).",
+     "inputSchema": {"type": "object", "required": ["id"], "properties": {"id": {"type": "string"}}}},
+    {"name": "release_task",
+     "description": "Give up a task you hold; the deck hands it to the next most available seat.",
+     "inputSchema": {"type": "object", "required": ["id"], "properties": {"id": {"type": "string"}}}},
+    {"name": "done_task",
+     "description": "Mark a task you hold as finished.",
+     "inputSchema": {"type": "object", "required": ["id"], "properties": {"id": {"type": "string"}}}},
 ]
 
 
@@ -4168,6 +4276,13 @@ def mcp_tool(seat, name, args):
         return "Status set.", False
     if name == "team_status":
         return status_text(), False
+    if name in ("tasks", "claim_task", "release_task", "done_task"):
+        balancer = load_balancer()
+        if not balancer:
+            return "The load balancer isn't installed on this machine, so there are no tasks.", True
+        if name == "tasks":
+            return balancer.tasks_text(active_only=not args.get("all")), False
+        return balancer.task_action(seat, name.split("_")[0], str(args.get("id", "")).strip()), False
     return f"Unknown tool {name}", True
 
 
@@ -4344,6 +4459,13 @@ def install(yes):
                 old.symlink_to(new)
     step("move ~/.local/share/launchpad and ~/.config/launchpad to the comms-deck names", migrate)
 
+    def link_balancer():
+        repo = HOME / "load-balancer" / "load-balancer"
+        if repo.exists():
+            bin_dir.mkdir(parents=True, exist_ok=True)
+            link("load-balancer", repo)
+    step(f"link {bin_dir}/load-balancer to ~/load-balancer, if that repo is cloned (the task board)",
+         link_balancer)
     step(f"link {bin_dir}/comms-deck (and the old name, launchpad) and push-courier to this repo",
          lambda: (bin_dir.mkdir(parents=True, exist_ok=True), link("comms-deck", here / "comms-deck"),
                   link("launchpad", here / "comms-deck"), link("push-courier", here / "push-courier")))
@@ -4534,7 +4656,10 @@ def self_test():
     """Check the mailbox, hooks, loop guard and MCP server. Exit 1 on failure."""
     tmp = tempfile.mkdtemp(prefix="comms-deck-test-")
     os.environ["COMMS_DECK_NO_NOTIFY"] = "1"  # test notes to the owner must not pop up on the desktop
+    # The deck's checks test the deck alone: the load balancer (the task board)
+    # has its own `load-balancer self-test`, so it's switched off here.
     env = dict(os.environ, COMMS_DECK_HOME=f"{tmp}/data", COMMS_DECK_CONFIG=f"{tmp}/config",
+               COMMS_DECK_LOAD_BALANCER="/nonexistent-in-self-test",
                COMMS_DECK_AUTO_LIMIT="2")
     me = str(Path(__file__).resolve())
     failures = []
@@ -4892,8 +5017,8 @@ def self_test():
     check("Vibe's composer: the > line under its labelled rule", composer_text(vibe_screen) ==
           "Hello. Check the local directory", repr(composer_text(vibe_screen)))
     granted = grant_vibe_tools('theme = "ansi-dark"\n\n[tools.comms-deck_send_message]\npermission = "ask"\n')
-    check("vibe's five deck tools are allowed, a choice already made is kept, and twice is once",
-          granted.count("[tools.comms-deck_") == 5 and 'send_message]\npermission = "ask"' in granted
+    check("vibe's deck tools are allowed, a choice already made is kept, and twice is once",
+          granted.count("[tools.comms-deck_") == len(VIBE_ALLOWED_TOOLS) and 'send_message]\npermission = "ask"' in granted
           and grant_vibe_tools(granted) == granted, granted)
     check("Vibe's empty composer reads as empty",
           composer_text(vibe_screen.replace("Hello. Check the local directory", "")) == "",
@@ -5303,6 +5428,9 @@ def self_test():
         "assert 'PLAN USAGE' in pl_t and 'codex' in pl_t and '40%' in pl_t, pl_t  # the 5-hour figure shows",
         "assert pl_t.index('codex') < pl_t.index('gravity') if 'gravity' in pl_t else True, pl_t  # sorted highest first",
         "x.DATA = real_data",
+        "x._balancer = False; text, failed = x.mcp_call('claude', 'tasks', {})",
+        "assert failed and 'isn' in text and 'installed' in text, text",  # no load balancer: said plainly
+        "x._balancer = False",
         "assert x.poll_countdown({}, now) == \"hasn't checked yet\"",
         "assert x.poll_countdown({'polled_at': now - 18}, now) == 'next check in 0:42'",
         "assert x.poll_countdown({'polled_at': now - 125, 'poll_gap': 60}, now) == 'check late 1:05'",
