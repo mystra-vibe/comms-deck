@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- **03 ALLOCATION shows every window.** Each row's name sits on its own
+  line with one bar per window it reports (5-hour and weekly alike), so a
+  long account label no longer pushes the figures off the edge. The
+  header total says "est." when any figure in it is an estimate. By
+  Claude, after reviewing #92.
 - **03 USAGE: three families from one telemetry record.** The renderer
   half of the 03 redesign (Vibe, against claude/telemetry's pinned shape):
   ALLOCATION (severity-shaded, tighter window, resets), TOKENS & ACTIVITY

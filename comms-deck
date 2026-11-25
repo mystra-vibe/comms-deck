@@ -3528,7 +3528,7 @@ def usage_panel(width, sort="provider"):
     inner = width - 2
     # A compact bar: name + bar + "40% · 5h · resets 22:19" must share the
     # row, so the bar stays small and the words survive even at 50 columns.
-    bar_w = max(6, inner - 42)
+    bar_w = max(6, inner - 38)  # "  5h " + bar + " 69% · resets tomorrow 02:30"
     esc = "\033["
     recs = telemetry()
     snap = panel_scans()  # one shared half-second snapshot for every panel
@@ -3550,11 +3550,14 @@ def usage_panel(width, sort="provider"):
 
     # Family C's head total: the spend the seat reporting it claims for the
     # account, one figure per row.
-    total = sum(r["spend"]["session_usd"] for r in telemetry_rows(recs)
-                if r["available"] and isinstance(r["spend"]["session_usd"], (int, float)))
+    priced = [r for r in telemetry_rows(recs)
+              if r["available"] and isinstance(r["spend"]["session_usd"], (int, float))]
+    total = sum(r["spend"]["session_usd"] for r in priced)
+    # Any estimate in the sum makes the sum an estimate.
+    est_total = " est." if any(r["spend"]["kind"] == "estimate" for r in priced) else ""
     head = f"{esc}1mUSAGE{esc}0m"
     if total > 0:
-        money = f"~${total:,.2f}"
+        money = f"~${total:,.2f}{est_total}"
         gap = max(1, inner - 5 - len(money))
         head += " " * gap + f"{esc}1;38;5;220m{money}{esc}0m"
     lines = [head, ""]  # where the figures come from is in the README, not on screen
@@ -3569,15 +3572,18 @@ def usage_panel(width, sort="provider"):
             sorted(alloc, key=lambda r: -max(a["used_pct"] for a in r["allocation"]))
         out = []
         for r in alloc:
-            best = max(r["allocation"], key=lambda a: a["used_pct"])
+            # The name on its own line, then every window the row reports
+            # (rolling and weekly alike, the brief's rule 2), so a long
+            # account label never pushes a figure off the edge.
             anim = any(s in running for s in r["seats"])
-            shade = 78 if best["used_pct"] < 60 else 214 if best["used_pct"] < 85 else 196
-            reset = (f" · resets {when(best['resets_at'])}"
-                     if isinstance(best["resets_at"], (int, float)) else "")
             name, c = who(r)
-            out.append(f"{esc}38;5;{c}m■{esc}0m {esc}1;38;5;{c}m{name}{esc}0m "
-                       f"{bar(best['used_pct'], bar_w, animate=anim)} "
-                       f"{esc}38;5;{shade}m{best['used_pct']:3.0f}%{esc}0m {esc}2m· {best['window']}{reset}{esc}0m")
+            out.append(f"{esc}38;5;{c}m■{esc}0m {esc}1;38;5;{c}m{name}{esc}0m")
+            for a in sorted(r["allocation"], key=lambda a: a["window"] != "5h"):
+                shade = 78 if a["used_pct"] < 60 else 214 if a["used_pct"] < 85 else 196
+                reset = (f" · resets {when(a['resets_at'])}"
+                         if isinstance(a["resets_at"], (int, float)) else "")
+                out.append(f"  {a['window']:3} {bar(a['used_pct'], bar_w, animate=anim)} "
+                           f"{esc}38;5;{shade}m{a['used_pct']:3.0f}%{esc}0m{esc}2m{reset}{esc}0m")
         lines += [f"{esc}1mALLOCATION{esc}0m"] + out + [""]
     else:
         lines += [f"{esc}1mALLOCATION{esc}0m {esc}2mnone reported{esc}0m", ""]
@@ -6798,6 +6804,14 @@ def self_test():
         "up2 = x.usage_panel(60); up2_t = ' '.join(x.ANSI.sub('', l) for l in up2)",
         "assert 'ALLOCATION' in up2_t and 'TOKENS & ACTIVITY' in up2_t and 'FINANCIAL' not in up2_t, up2_t  # three families, kept apart: only those with data",
         "assert '40%' in up2_t and '50%' in up2_t and 'resets' in up2_t, up2_t  # the tighter window, its percentage and reset",
+        "x.write_json(pc / 'usage' / 'gravity.json', {'time': 3, 'source': 'test', 'data': {'rate_limits': {'five_hour': {'used_percentage': 12}, 'seven_day': {'used_percentage': 77}}, 'cost': {'total_cost_usd': 2.0}}})",
+        "up3 = [x.ANSI.sub('', l) for l in x.usage_panel(60)]; up3_t = ' '.join(up3)",
+        "assert '12%' in up3_t and '77%' in up3_t, up3_t  # every window a row reports, rolling and weekly both",
+        "assert all(len(l) <= 60 for l in up3), 'rows fit the column'",
+        "assert 'est.' not in up3[0] or 'est.' in up3_t.split('FINANCIAL')[-1], up3[0]  # the total is an estimate only when one of its figures is",
+        "x.write_json(pc / 'usage' / 'claude.json', {'time': 3, 'source': 'claude', 'data': {'cost': {'total_cost_usd': 1.0}, 'rate_limits': {}}})",
+        "assert 'est.' in x.ANSI.sub('', x.usage_panel(60)[0]), 'an estimate in the sum tags the total'",
+        "(pc / 'usage' / 'claude.json').unlink(); (pc / 'usage' / 'gravity.json').unlink()",
         "assert 'in 12.3k' in up2_t and 'out 6.8k' in up2_t, up2_t  # grok's activity row shows what it reported",
         "du = [r for r in x.telemetry() if r['seat'] == 'devin'][0]",
         "assert du['connected'] and not du['available'] and du['updated'] is None, 'no record: connected, unavailable, never reported'",
