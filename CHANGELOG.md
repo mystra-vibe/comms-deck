@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- **03: no token block, and Grok is one pool.** The owner (22:53): the
+  TOKENS & ACTIVITY block isn't useful on screen, so 03 shows ALLOCATION
+  and FINANCIAL only (token counts stay in `comms-deck usage <seat>`). A
+  seat with neither a limit nor a cost is listed under CONNECTED / NO LIMIT
+  OR COST REPORTED instead of vanishing. Grok and the Grok Bot bots (alice,
+  juno) draw from one xAI pool, so they share the account `grok` and show as
+  one GROK row. Each part of the row comes from the freshest seat that
+  reports it: the weekly limit from the bots, the cost from Grok's CLI.
+  By Claude.
 - **The chat screen lives on workspace 1, fullscreen.** The owner
   (22:49): it should always appear fullscreen on desktop 1. The Hyprland
   rule that `comms-deck install` writes, the launcher and the docs now say

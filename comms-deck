@@ -3349,6 +3349,10 @@ PROVIDER_LABELS = {"claude": "Anthropic", "grok": "xAI", "grok-bot": "xAI",
                    "devin-db": "Cognition", "devin-otel": "Cognition",
                    "vibe-session": "Mistral", "gravity-hook": "Google",
                    "codex": "OpenAI", "lumo": "Proton", "lumo-desktop": "Proton"}
+# Sources whose seats draw on one pool, by the account id they share. The
+# owner (22:53): Grok and the Grok Bot bots (alice, juno) all draw from the
+# same xAI pool, so 03 shows them as one GROK row.
+SHARED_ACCOUNTS = {"grok": "grok", "grok-bot": "grok"}
 TELEMETRY_STALE = 6 * 3600  # seconds: an older update is shown as stale, not hidden
 
 
@@ -3362,7 +3366,7 @@ def telemetry_record(seat, record):
     record = record or {}
     d = record.get("data") or {}
     source = record.get("source")
-    account = source if source == "grok-bot" else None  # one account shared by every bot
+    account = SHARED_ACCOUNTS.get(source)  # seats drawing on one pool share an id
     model = dig(d, "model", "display_name") or dig(d, "model", "id")
     program = AGENTS.get(seat) or APP_PROCESS.get(seat)  # what the seat runs as: names a provider with no file yet
     allocation = []
@@ -3439,28 +3443,41 @@ def telemetry():
 def telemetry_rows(records=None):
     """telemetry() with seats that share an account folded into one row.
 
-    The row is the account's freshest record (each bot writes the same
-    account's figures at its own moments, so an older copy is just older),
-    with "seats" listing every seat on it. A seat with no account is its
-    own row, seats == [seat].
+    Seats on one pool report different parts of it at different moments
+    (the bots the weekly limit, Grok's CLI its session cost), so each part
+    of the row comes from the freshest seat that reports it: allocation,
+    each token field, and spend. The row's `updated`, `stale`, `models`
+    and `available` cover the whole account, and "seats" lists every seat
+    on it. A seat with no account is its own row, seats == [seat].
     """
-    rows, by_account = [], {}
+    rows, groups = [], {}
     for r in telemetry() if records is None else records:
         key = r["account"]
         if key is None:
             rows.append(dict(r, seats=[r["seat"]]))
+        elif key in groups:
+            groups[key].append(r)
+        else:
+            groups[key] = [r]
+            rows.append(key)  # placeholder: keeps the first seat's place in the order
+    out = []
+    for row in rows:
+        if not isinstance(row, str):
+            out.append(row)
             continue
-        held = by_account.get(key)
-        if held is None:
-            by_account[key] = dict(r, seats=[r["seat"]])
-            rows.append(by_account[key])
-            continue
-        seats = held["seats"] + [r["seat"]]
-        if (r["updated"] or 0) > (held["updated"] or 0):
-            held.clear()
-            held.update(r)
-        held["seats"] = seats
-    return rows
+        group = sorted(groups[row], key=lambda r: r["updated"] or 0, reverse=True)  # freshest first
+        first = lambda pick: next((pick(r) for r in group if pick(r)), None)
+        merged = dict(group[0], seats=[r["seat"] for r in groups[row]])
+        merged["allocation"] = first(lambda r: r["allocation"]) or []
+        merged["tokens"] = {k: next((r["tokens"][k] for r in group if r["tokens"][k] is not None), None)
+                            for k in group[0]["tokens"]}
+        merged["spend"] = first(lambda r: r["spend"] if r["spend"]["session_usd"] is not None else None) \
+            or group[0]["spend"]
+        merged["models"] = list(dict.fromkeys(m for r in group for m in r["models"]))
+        merged["available"] = any(r["available"] for r in group)
+        merged["stale"] = all(r["stale"] for r in group)
+        out.append(merged)
+    return out
 
 
 def telemetry_detail(seat=None):
@@ -3603,18 +3620,19 @@ def set_sort(mode):
 
 
 def usage_panel(width, sort=None):
-    """The usage column: three blocks from telemetry_rows(), then the rest.
+    """The usage column: two blocks from telemetry_rows(), then the rest.
 
     The owner's multi-provider brief (22:03, via alice): 03 is one
     observability panel over every connected provider, not a per-provider
     collection. It renders ALLOCATION (family A: subscription and window
-    limits), TOKENS & ACTIVITY (family B) and FINANCIAL (family C), each
+    limits) and FINANCIAL (family C), each
     from the pinned telemetry() records via telemetry_rows(), so the
     families never merge and seats sharing an account (the grok-bot bots)
-    are one row, that account's freshest figures. A seat that reports no
-    telemetry at all renders CONNECTED / TELEMETRY UNAVAILABLE with its
-    last update, never a misleading zero; a field nobody reported reads
-    "—", and a stale row says so. `sort` orders the rows: "provider"
+    are one row, that account's freshest figures. TOKENS & ACTIVITY (family
+    B) was dropped from the screen (the owner, 22:53: not useful to show);
+    `comms-deck usage <seat>` still prints it. A seat with no limit and no
+    cost renders under CONNECTED / NO LIMIT OR COST REPORTED with its last
+    update, never a misleading zero, and a stale row says so. `sort` orders the rows: "provider"
     orders every block by provider then seat; "consumption" and "spend"
     order their own block only (allocation's percentages and the financial
     figures). A `sort` argument at the call site wins; the default reads
@@ -3638,11 +3656,11 @@ def usage_panel(width, sort=None):
     usage_panel.running = bool(running) and width > 2
 
     def who(r):
-        # One row per account: a shared account's row names the account and
-        # its seats, everyone else names their seat. The label comes from the
+        # One row per account: a shared account's row is named for the
+        # account, everyone else for their seat. The label comes from the
         # record; no provider is named in the renderer (the brief's rule 1).
-        if r["account"]:
-            return f"{r['account'].upper()} ACCOUNT · {', '.join(r['seats'])}", colour(r["seats"][0])
+        if r["account"]:  # one pool (the owner, 22:53): just the account's name
+            return r["account"].upper(), colour(r["seats"][0])
         return r["seats"][0].upper(), colour(r["seats"][0])
 
     def by_provider(rs):
@@ -3694,33 +3712,6 @@ def usage_panel(width, sort=None):
     else:
         lines += [f"{esc}1mALLOCATION{esc}0m {esc}2mnone reported{esc}0m", ""]
 
-    # Family B: tokens and activity. One row per account that reports any
-    # of it; a field nobody reported stays "—", a reported zero shows as 0.
-    def consumes(r):
-        return (r["tokens"]["input"] or 0) + (r["tokens"]["output"] or 0)
-    act = [r for r in rows if any(v is not None for v in r["tokens"].values())]
-    out = []
-    for r in (sorted(act, key=lambda r: -consumes(r)) if sort == "consumption" else by_provider(act)):
-        t = r["tokens"]
-        bits = ["in " + (short_tokens(t["input"]) if isinstance(t["input"], (int, float)) else "—"),
-                "out " + (short_tokens(t["output"]) if isinstance(t["output"], (int, float)) else "—")]
-        if t["cache_read"] is not None:
-            bits.append(f"cache {short_tokens(t['cache_read'])}")
-        if t["requests"] is not None:
-            bits.append(f"{t['requests']:.0f} requests")
-        if t["sessions"] is not None:
-            bits.append(f"{t['sessions']:.0f} session{'s' if t['sessions'] != 1 else ''}")
-        if t["active_s"] is not None:
-            bits.append("active " + (f"{t['active_s'] / 3600:.1f}h" if t["active_s"] >= 3600
-                                     else f"{t['active_s'] / 60:.0f}m"))
-        model = f" · {r['models'][0]}" if r["models"] else ""
-        name, c = who(r)
-        stale = " · stale" if r.get("stale") else ""
-        out.append(f"{esc}38;5;{c}m■{esc}0m {name}{esc}0m "
-                   f"{esc}2m{' · '.join(bits)}{model}{stale}{esc}0m")
-    if out:
-        lines += [f"{esc}1mTOKENS & ACTIVITY{esc}0m"] + out + [""]
-
     # Family C: financial. Only expenditure a source itself reported, kind
     # tagging the estimate.
     spend = [r for r in rows if isinstance(r["spend"]["session_usd"], (int, float))]
@@ -3736,9 +3727,13 @@ def usage_panel(width, sort=None):
     # The brief's rule 5: connected but silent is a state -- shown, not
     # hidden, and never a zero. The row reads as an inventory: what the
     # seat is, when it last reported, and whether that report is stale.
-    quiet = [r for r in telemetry_rows(recs) if not r["available"]]
+    # Token counts left 03 (the owner, 22:53: not useful on screen; they're
+    # in `comms-deck usage <seat>`), so a seat with no limit and no cost
+    # has nothing above and is listed here rather than vanishing.
+    quiet = [r for r in telemetry_rows(recs)
+             if not r["allocation"] and r["spend"]["session_usd"] is None]
     if quiet:
-        lines.append(f"{esc}1mCONNECTED / TELEMETRY UNAVAILABLE{esc}0m")
+        lines.append(f"{esc}1mCONNECTED / NO LIMIT OR COST REPORTED{esc}0m")
         for r in by_provider(quiet):
             fresh = (f"last update {ago(time.time() - r['updated'])}"
                      if isinstance(r["updated"], (int, float)) and r["updated"]
@@ -4302,7 +4297,7 @@ def look_screen(cols, body_h, shown, records, now):
             LOOK_ACCENT["crew"], w, h, look_crew(w - 4, h - 4, records, snap, busy, split, now))),
         # The look drops 03's own head line, so the /sort choice takes the
         # frame's subtitle (a narrow column would cut it off the end).
-        (None, lambda w, h: look_frame("03", "USAGE", "allocation · tokens · spend"
+        (None, lambda w, h: look_frame("03", "USAGE", "allocation · spend"
                                        if usage_sort() == "provider" else f"sorted by {usage_sort()}", "",
                                        LOOK_ACCENT["usage"], w, h, fit_column(usage, h - 4))),
     ], lw, body_h)
@@ -6673,8 +6668,7 @@ def self_test():
         "assert d['otel']['metrics']['devin.session.count'] == 2",
         "assert d['otel']['metrics']['devin.active_time.total'] == 60",
         "panel = x.usage_panel(80)",
-        "assert any('DEVIN' in l for l in panel)",
-        "assert any('active 1m' in l and '2 sessions' in l for l in panel)",
+        "assert any('devin' in x.ANSI.sub('', l) and 'NO LIMIT' not in l for l in panel), 'devin is still listed in 03'",
         # the sessions db fills what OTEL cannot: real tokens, context, model
         "x.refresh_devin_usage()",
         "d = json.load(open(x.DATA / 'usage' / 'devin.json'))['data']",
@@ -6925,7 +6919,7 @@ def self_test():
         "assert 'Context' not in up_t and 'CONTEXT' not in up_t, 'usage only: 06 CONTEXT SPLIT has the context (the owner, 21:35)'",
         "x.write_json(pc / 'usage' / 'grok.json', {'time': 3, 'source': 'test', 'data': {'rate_limits': {'five_hour': {'used_percentage': 50, 'resets_at': x.time.time() + 600}}, 'context_window': {'session_input_tokens': 12345, 'session_output_tokens': 6789}}})",
         "up2 = x.usage_panel(60); up2_t = ' '.join(x.ANSI.sub('', l) for l in up2)",
-        "assert 'ALLOCATION' in up2_t and 'TOKENS & ACTIVITY' in up2_t and 'FINANCIAL' not in up2_t, up2_t  # three families, kept apart: only those with data",
+        "assert 'ALLOCATION' in up2_t and 'TOKENS' not in up2_t and 'in 12.3k' not in up2_t and 'FINANCIAL' not in up2_t, up2_t  # no token block (the owner, 22:53); only families with data",
         "assert '40%' in up2_t and '50%' in up2_t and 'resets' in up2_t, up2_t  # the tighter window, its percentage and reset",
         "x.write_json(pc / 'usage' / 'gravity.json', {'time': 3, 'source': 'test', 'data': {'rate_limits': {'five_hour': {'used_percentage': 12}, 'seven_day': {'used_percentage': 77}}, 'cost': {'total_cost_usd': 2.0}}})",
         "up3 = [x.ANSI.sub('', l) for l in x.usage_panel(60)]; up3_t = ' '.join(up3)",
@@ -6935,13 +6929,12 @@ def self_test():
         "x.write_json(pc / 'usage' / 'claude.json', {'time': 3, 'source': 'claude', 'data': {'cost': {'total_cost_usd': 1.0}, 'rate_limits': {}}})",
         "assert 'est.' in x.ANSI.sub('', x.usage_panel(60)[0]), 'an estimate in the sum tags the total'",
         "(pc / 'usage' / 'claude.json').unlink(); (pc / 'usage' / 'gravity.json').unlink()",
-        "assert 'in 12.3k' in up2_t and 'out 6.8k' in up2_t, up2_t  # grok's activity row shows what it reported",
         "du = [r for r in x.telemetry() if r['seat'] == 'devin'][0]",
         "assert du['connected'] and not du['available'] and du['updated'] is None, 'no record: connected, unavailable, never reported'",
         "cu = [r for r in x.telemetry() if r['seat'] == 'codex'][0]",
         "assert cu['allocation'][0]['used_pct'] == 40.0 and cu['tokens']['input'] is None and cu['spend']['session_usd'] is None, 'pinned shape: reported fields only, the rest None'",
         "assert not x.re.search(r'(?<!\\d)0%', up2_t), up2_t  # a figure nobody reported is never a zero (a bare 0%, not 40%)",
-        "assert 'TELEMETRY UNAVAILABLE' in up2_t, up2_t  # a silent seat is shown, not hidden",
+        "assert 'NO LIMIT OR COST REPORTED' in up2_t, up2_t  # a seat with nothing above is shown, not hidden",
         "rows2 = x.telemetry_rows([dict(cu, account='shared', updated=1), dict(cu, account='shared', seat='claude', updated=3, allocation=[{'window': 'wk', 'used_pct': 90.0}])])",
         "assert len(rows2) == 1 and rows2[0]['seats'] == ['codex', 'claude'] and rows2[0]['allocation'][0]['used_pct'] == 90.0, 'the fold keeps the freshest figures'",
         "assert x.usage_panel(60, sort='bogus') == x.usage_panel(60), 'an unknown sort falls back to provider'",
@@ -6980,6 +6973,11 @@ def self_test():
         "acc = [dict(r, account='shared', updated=t, allocation=[{'window': 'wk', 'used_pct': p}]) for r, t, p in ((tm['codex'], 1, 10.0), (tm['claude'], 3, 90.0))]",
         "rows = x.telemetry_rows(acc); assert len(rows) == 1 and rows[0]['seats'] == ['codex', 'claude'], rows",
         "assert rows[0]['allocation'][0]['used_pct'] == 90.0, 'a shared account shows its freshest figures'",
+        "pool = [dict(tm['codex'], seat='grok', account='grok', updated=5, allocation=[], spend={'session_usd': 1.25, 'cumulative_usd': None, 'kind': 'reported'}),"
+        " dict(tm['codex'], seat='alice', account='grok', updated=9, allocation=[{'window': 'wk', 'used_pct': 99.0}])]",
+        "pr = x.telemetry_rows(pool); assert len(pr) == 1 and pr[0]['seats'] == ['grok', 'alice'], pr",
+        "assert pr[0]['allocation'][0]['used_pct'] == 99.0 and pr[0]['spend']['session_usd'] == 1.25, 'one pool: the limit from the bot, the cost from the CLI'",
+        "assert x.SHARED_ACCOUNTS['grok'] == x.SHARED_ACCOUNTS['grok-bot'], 'grok and the bots are one pool (the owner, 22:53)'",
         # comms-deck usage <seat>: the full record, honest about gaps
         "dl = x.telemetry_detail(None); assert all(any(l.startswith(r['seat'] + ' ') for l in dl) for r in x.telemetry()), dl",
         "dc = '\\n'.join(x.telemetry_detail('codex'))",
