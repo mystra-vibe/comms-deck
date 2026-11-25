@@ -3455,6 +3455,24 @@ def route(text):
     return list(dict.fromkeys(names)) + ["-" + s for s in excludes], None
 
 
+def fit_column(lines, height):
+    """A side column's lines, trimmed to fit `height` rows without losing content.
+
+    The "updated 3s ago" footers go first, then the blank spacer lines. Only
+    if it still doesn't fit is the bottom cut. (The owner, 2026-11-25: after
+    the context split was added, ACTIVITY and its blue squares were pushed
+    off the bottom of the screen.)
+    """
+    if len(lines) <= height:
+        return lines
+    plain = [re.sub(r"\033\[[0-9;:?]*[A-Za-z]", "", line) for line in lines]
+    lines = [line for line, text in zip(lines, plain) if not text.strip().startswith("updated ")]
+    if len(lines) > height:
+        lines = [line for i, line in enumerate(lines)
+                 if i == 0 or re.sub(r"\033\[[0-9;:?]*[A-Za-z]", "", line).strip()]
+    return lines[:height]
+
+
 class FreshCode(Exception):
     """Raised inside chat() to leave the screen cleanly before run_fresh()."""
 
@@ -3676,8 +3694,8 @@ def chat(history=200, hide_private=False):
                         usage_panel.running = False  # no usage column: don't let a stale True spin the clock
                         usg = []
                     act = activity_panel(panel_w) if panel_w else []
-                    usg = (usg + [""] * body)[:body]
-                    right = (act + [""] * body)[:body]
+                    usg = (fit_column(usg, body) + [""] * body)[:body]
+                    right = (fit_column(act, body) + [""] * body)[:body]
                     screen = ["\033[H", deck_header(cols), "\n"]
                     for i in range(body):
                         row = (fit(usg[i], usage_w) + f" \033[38;5;238m│\033[0m ") if usage_w else ""
@@ -5507,6 +5525,11 @@ def self_test():
         "assert 'PLAN USAGE' in pl_t and 'codex' in pl_t and '40%' in pl_t, pl_t  # the 5-hour figure shows",
         "assert pl_t.index('codex') < pl_t.index('gravity') if 'gravity' in pl_t else True, pl_t  # sorted highest first",
         "x.DATA = real_data",
+        "col = ['USAGE', '', 'A', '  updated 1s ago', '', 'B', '  updated 2s ago', '', 'C']",
+        "assert x.fit_column(col, 20) == col",  # fits: untouched
+        "assert x.fit_column(col, 7) == ['USAGE', '', 'A', '', 'B', '', 'C']",  # footers go first
+        "assert x.fit_column(col, 4) == ['USAGE', 'A', 'B', 'C']",  # then the spacers
+        "assert x.fit_column(col, 2) == ['USAGE', 'A']",  # only then the bottom
         "x._balancer = False; text, failed = x.mcp_call('claude', 'tasks', {})",
         "assert failed and 'isn' in text and 'installed' in text, text",  # no load balancer: said plainly
         "x._balancer = False",
