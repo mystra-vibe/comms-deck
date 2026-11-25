@@ -3463,6 +3463,77 @@ def telemetry_rows(records=None):
     return rows
 
 
+def telemetry_detail(seat=None):
+    """`comms-deck usage <seat>`: one provider's telemetry in full, for inspection.
+
+    03 shows the overview; this is the other half of the owner's brief
+    (22:03): every model, account, window, token count and spend figure a
+    seat reports, how fresh it is, and the raw fields as written, so
+    nothing the panel summarises is out of reach. `seat` may be a seat, an
+    account id (every seat on it) or a provider label; None lists every
+    record in brief. A figure the provider doesn't report prints as
+    "not reported", never 0.
+    """
+    recs = telemetry()
+    if seat is None:
+        out = [f"{'SEAT':9} {'PROVIDER':11} {'ACCOUNT':10} {'TELEMETRY':12} UPDATED"]
+        for r in sorted(recs, key=lambda r: (r["provider"], r["seat"])):
+            state = "available" if r["available"] else "unavailable"
+            upd = ago(time.time() - r["updated"]) if r["updated"] else "never"
+            out.append(f"{r['seat']:9} {r['provider']:11} {(r['account'] or '-'):10} {state:12} "
+                       f"{upd}{' (stale)' if r['stale'] else ''}")
+        return out + ["", "comms-deck usage <seat|account|provider> for the full record"]
+    want = seat.lower()
+    pick = [r for r in recs if want in (r["seat"].lower(), (r["account"] or "").lower(), r["provider"].lower())]
+    if not pick:
+        return [f"no seat, account or provider called {seat!r}; known seats: "
+                + ", ".join(r["seat"] for r in recs)]
+    nr = "not reported"
+    out = []
+    for r in pick:
+        out += [f"{r['seat'].upper()}  ·  {r['provider']}"
+                + (f"  ·  account {r['account']}" if r["account"] else ""),
+                f"  registered   {'yes' if r['connected'] else 'no (usage file only)'}",
+                f"  telemetry    {'available' if r['available'] else 'CONNECTED / TELEMETRY UNAVAILABLE'}",
+                f"  source       {r['source'] or nr}",
+                f"  updated      " + (f"{when(r['updated'])} ({ago(time.time() - r['updated'])})"
+                                      + (" · stale" if r["stale"] else "") if r["updated"] else "never"),
+                f"  models       {', '.join(r['models']) or nr}",
+                "  ALLOCATION"]
+        if r["allocation"]:
+            for a in r["allocation"]:
+                reset = f" · resets {when(a['resets_at'])}" if a["resets_at"] else " · reset not reported"
+                out.append(f"    {a['window']:4} {a['used_pct']:5.1f}% used · {a['remaining_pct']:5.1f}% left{reset}")
+        else:
+            out.append(f"    {nr}")
+        out.append("  TOKENS & ACTIVITY")
+        for k, label in (("input", "input"), ("output", "output"), ("cache_read", "cache read"),
+                         ("requests", "requests"), ("sessions", "sessions"), ("active_s", "active")):
+            v = r["tokens"][k]
+            shown = nr if v is None else (f"{v / 60:.0f}m" if k == "active_s" else f"{v:,.0f}")
+            out.append(f"    {label:11} {shown}")
+        sp = r["spend"]
+        out += ["  FINANCIAL",
+                f"    session     " + (nr if sp["session_usd"] is None else f"${sp['session_usd']:,.2f} ({sp['kind']})"),
+                f"    cumulative  " + (nr if sp["cumulative_usd"] is None else f"${sp['cumulative_usd']:,.2f}"),
+                "  RAW (as the source wrote it)"]
+        raw = json.dumps(redact_raw(r["raw"]), indent=2, sort_keys=True, default=str).splitlines()
+        out += ["    " + l for l in raw] + [""]
+    return out
+
+
+def redact_raw(d):
+    """The raw usage data minus paths and ids that say nothing about usage.
+
+    A Claude Code status line carries the transcript path, working folder and
+    session id; they aren't telemetry and needn't be on a screen.
+    """
+    if not isinstance(d, dict):
+        return d
+    drop = {"transcript_path", "cwd", "workspace", "session_id", "prompt_id", "scratchpad_dir"}
+    return {k: redact_raw(v) for k, v in d.items() if k not in drop}
+
+
 PANEL_SCAN_TTL = 0.5  # seconds; the chat's fast clock must not hammer /proc
 
 _panel_scans = {"at": 0.0, "seats": {}, "waiting": {}}
@@ -6847,6 +6918,13 @@ def self_test():
         "acc = [dict(r, account='shared', updated=t, allocation=[{'window': 'wk', 'used_pct': p}]) for r, t, p in ((tm['codex'], 1, 10.0), (tm['claude'], 3, 90.0))]",
         "rows = x.telemetry_rows(acc); assert len(rows) == 1 and rows[0]['seats'] == ['codex', 'claude'], rows",
         "assert rows[0]['allocation'][0]['used_pct'] == 90.0, 'a shared account shows its freshest figures'",
+        # comms-deck usage <seat>: the full record, honest about gaps
+        "dl = x.telemetry_detail(None); assert all(any(l.startswith(r['seat'] + ' ') for l in dl) for r in x.telemetry()), dl",
+        "dc = '\\n'.join(x.telemetry_detail('codex'))",
+        "assert 'TELEMETRY UNAVAILABLE' not in dc and '40.0% used' in dc and 'input       not reported' in dc, dc",
+        "dn = '\\n'.join(x.telemetry_detail('newbot')); assert '$0.00' in dn and 'no (usage file only)' in dn, dn  # a real zero stays a zero",
+        "assert x.telemetry_detail('nobody-xyz')[0].startswith('no seat'), 'an unknown name says so'",
+        "assert x.redact_raw({'cwd': '/x', 'cost': {'total_cost_usd': 1, 'session_id': 's'}}) == {'cost': {'total_cost_usd': 1}}",
         "x.DATA = real_data",
         # The top bar's notification queue mirrors into the deck's feed.
         "nd = x.Path(x.tempfile.mkdtemp()); real_nd, real_nq = x.DATA, x.NOTIFY_QUEUE",
@@ -7296,7 +7374,9 @@ def main():
     p.add_argument("text", nargs="+")
     p = sub.add_parser("status")
     p.add_argument("--json", action="store_true", help="every seat as JSON, for programs")
-    p = sub.add_parser("usage", help="notes, activity and plan limits for the deck, from its logs")
+    p = sub.add_parser("usage", help="notes, activity and plan limits for the deck, from its logs;"
+                                     " with a seat (or 'all'), that seat's telemetry in full")
+    p.add_argument("seat", nargs="?", help="a seat, account or provider; 'all' lists every record")
     p.add_argument("--days", type=int, default=7)
     sub.add_parser("watch")
     p = sub.add_parser("chat")
@@ -7358,7 +7438,10 @@ def main():
         elif args.cmd == "status":
             print(json.dumps(status_json(), indent=1) if args.json else status_text())
         elif args.cmd == "usage":
-            print(usage_report(max(1, args.days)))
+            if args.seat:
+                print("\n".join(telemetry_detail(None if args.seat == "all" else args.seat)))
+            else:
+                print(usage_report(max(1, args.days)))
         elif args.cmd == "watch":
             watch()
         elif args.cmd == "chat":

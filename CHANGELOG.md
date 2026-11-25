@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- **`comms-deck usage <seat>`: one provider's telemetry in full.** The
+  inspection half of the 03 brief. `usage all` lists every record
+  (provider, account, available or not, last update, stale); `usage
+  <seat|account|provider>` prints the record's models, every allocation
+  window, tokens and activity, spend and its kind, and the raw fields as
+  the source wrote them (paths and session ids left out). Anything not
+  reported says "not reported", never 0. Plain `comms-deck usage` is the
+  old log report, unchanged. By Claude.
 - **03 ALLOCATION shows every window.** Each row's name sits on its own
   line with one bar per window it reports (5-hour and weekly alike), so a
   long account label no longer pushes the figures off the edge. The
