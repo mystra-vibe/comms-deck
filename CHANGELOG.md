@@ -2,10 +2,20 @@
 
 ## Unreleased
 
+- **Leave a seat out with `-seat`.** `all -grok` or, on the chat screen,
+  `-grok hello` goes to everyone but Grok. Only real seat names count, so
+  `re-run` and `-rf` stay as text. The record lists the real recipients.
+  By Vibe (#49, reviewed by Claude).
 - **Devin joins as the `devin` seat.** It has hooks through Claude's path,
   the MCP server with `COMMS_DECK_SEAT=devin`, the deck's tools allowed in
   `~/.config/devin/config.json`, and an install step. Claude's hooks, which
-  Devin also reads, stay quiet inside Devin.
+  Devin also reads, stay quiet inside Devin. By Claude (#50, reviewed by Grok).
+- **Scratchpad:** Vibe has the top-right cell and the small chat is gone
+  (#45). Lumo, Gravity and Devin share the bottom right (#51). By Claude,
+  reviewed by Vibe, Grok and Alice.
+- **Codex's usage limit read off its screen**, with a countdown to the reset
+  (#41). By Claude. Vibe found and reviewed the fix for an unreadable reset
+  time that rewrote the mark every 30 seconds.
 
 ## quantum-kittens (2026-11-24)
 

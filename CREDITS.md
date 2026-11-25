@@ -1,7 +1,8 @@
 # Who wrote what
 
-Several AI agents (Grok, Codex and Claude) build this repo together for
-the repo's owner. This file records who wrote each part, so credit stays with the
+Several AI agents build this repo together for the repo's owner: Grok,
+Codex and Claude from the start. Gravity, Vibe and Alice have since added
+code or reviews. This file records who wrote each part, so credit stays with the
 right agent as the code changes hands.
 
 **Joint work** means the agents built it together, and nobody recorded at
@@ -15,7 +16,9 @@ agents, and no agent claims them alone.
 | [`comms-deck`](comms-deck), [`systemd/comms-deck.service`](systemd/comms-deck.service) | Claude (2026-11-24) | comms-deck. Replaces `relay-protocol` (joint: Grok, Codex, Claude), `scheduler` and `relay-watch` (Claude), which are in the git history. Keeps their message file format, the public/private split and the secret patterns. |
 | `comms-deck`: Grok Bot app adapter (SECTION 7b), hook idle rules, promptId handling, the kitty draft check, the app-seat failure reason, Gravity's prompt line, model and tool permissions | Grok (2026-11-24) | PRs #11, #12, #13 and #14, reviewed by Claude. Grok also reviewed the usage reader and the activity descriptions. |
 | `comms-deck`: chat screen, usage panel and ~$ total, activity log and set_status, app seats, the Gravity seat, name redaction, Grok usage reader, installer | Claude (2026-11-24) | |
-| [`desktop/comms-deck-chat`](desktop/comms-deck-chat), [`desktop/scratchpad-layout`](desktop/scratchpad-layout) | Claude (2026-11-24) | |
+| `comms-deck`: recipient exclusion, a `-seat` token in `send()` and in the chat box's `route()` ("all -grok", "-grok hello") | **Vibe** (2026-11-25) | PR #49, reviewed by Claude. |
+| `comms-deck`: the Vibe seat, its tool grants and the 3-handover cap (#46–#48); the Codex screen limit (#41); the Devin seat (#50) | Claude (2026-11-24/25) | #41's repeated-rewrite bug was found by Vibe in review. #47 was reviewed by Vibe, #50 by Grok. |
+| [`desktop/comms-deck-chat`](desktop/comms-deck-chat), [`desktop/scratchpad-layout`](desktop/scratchpad-layout) | Claude (2026-11-24) | Vibe top right (#45, reviewed by Vibe and Grok). Lumo, Gravity and Devin sharing the bottom right (#51, reviewed by Alice). |
 | [`agent-chat/agent-chat`](agent-chat/agent-chat) | **Joint: Grok, Codex, Claude** | Built together before 2026-11-20. Claude added the comments on 2026-11-20, with no code changes. |
 | [`agent-chat/install.sh`](agent-chat/install.sh), [`agent-chat/test.sh`](agent-chat/test.sh) | **Joint: Grok, Codex, Claude** | Claude added the header comments on 2026-11-21. |
 | [`push-courier`](push-courier), [`systemd/push-courier.service`](systemd/push-courier.service) | Claude (2026-11-21) | Reviewed by Grok (2026-11-22); its findings were fixed before it landed here. On 2026-11-24 Claude moved it onto comms-deck's mailbox and paths. |
@@ -34,6 +37,19 @@ agents, and no agent claims them alone.
 | [`CHANGELOG.md`](CHANGELOG.md) | Claude (2026-11-24) |
 | [`PRIMER.md`](PRIMER.md) | Claude (2026-11-22), from the team's record and the joint work of Grok, Codex and Claude |
 | [`docs/REDUNDANCY.md`](docs/REDUNDANCY.md) | Grok (2026-11-24) |
+
+## Reviews
+
+A pull request into `test` needs a different seat's review (see
+COMMS-DECK.md). These are the reviews recorded on merged pull requests.
+Earlier reviews are in the notes above and in each PR.
+
+| Reviewer | Pull requests |
+| --- | --- |
+| **Vibe** | #41 (found the unreadable-reset bug, then re-reviewed the fix), #43, #44, #45, #47. Also #40, the load-balancer spec, which is still open. |
+| Grok | #38, #39, #45, #50 |
+| Claude | #49 |
+| Alice | #51 (after it merged) |
 
 ## Work in progress
 
