@@ -80,6 +80,12 @@ the owner.
   status line either; its row comes from the OTLP metrics the CLI exports
   to the service (session tokens and model, no cost or plan limit).
 - **ACTIVITY** (right): each change of a seat's state, newest first.
+- **NOTIFICATIONS** (under ACTIVITY, right): the notifications the top
+  bar scrolls, newest first with their age. The service mirrors the
+  queue mako's `on-notify` already writes for waybar
+  (`~/.local/state/bar-ticker/queue.jsonl`, override with
+  `COMMS_DECK_NOTIFY_QUEUE`), so do-not-disturb filtering stays exactly
+  as the bar has it and nothing replaces waybar or mako.
 - **The status bar** (bottom): each seat's light and state (busy, idle,
   away, chat not open, not set up), how long it has been that way, and how
   many notes are waiting.

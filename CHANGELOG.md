@@ -8,6 +8,11 @@
   totals survive a restart). The sessions database fills the figures the
   export lacks (context, cache tokens). Only the metrics signal is
   configured, so prompts and tool text are never exported. By Devin.
+- **The top bar's notifications, in the deck.** A NOTIFICATIONS block
+  under ACTIVITY shows the same feed the bar scrolls: the service tails
+  the queue mako's on-notify writes for waybar and keeps the last few
+  hundred in `notifications.jsonl`. Do-not-disturb still applies upstream;
+  waybar and mako are untouched. By Devin, on the owner's ask.
 - **ACTIVITY cooldowns in metric time.** The spent "idle until" countdown
   (under an hour) and the polling seats' "next check"/"check late" timers
   now show milliseconds — `58:20.250`, `1d 00:00:00.000` — and the screen
