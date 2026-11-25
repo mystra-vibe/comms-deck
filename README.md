@@ -213,7 +213,19 @@ guard and the git copies. The older `LAUNCHPAD_*` names still work.
 The data lives in `~/.local/share/comms-deck/`: `inbox/` and `delivered/`
 per seat, `seats/` (state), `log.jsonl` (every note), `activity.jsonl`
 (state changes), `remote-heads/` (the git heads the remote-seat import last
-saw) and `usage/`.
+saw), `usage/`, and `cost-ledger.json`: the all-time cost behind the top
+bar's COST figure.
+
+**The cost ledger** keeps one entry per (seat, session) at the highest cost
+that session reported, and the all-time figure is their sum. Entries only go
+up and are never removed, so a reboot or an upgrade changes nothing. The
+service copies it to the private relay repo (`ledger/costs.json`) at most
+every ten minutes. At each pass it merges the two both ways, taking the
+higher figure per entry. On a reinstalled machine, cloning `private-relay`
+and starting the service brings the history back. It counts from the day
+the ledger began (the top bar says "since <date>"). Claude Code's figures
+are estimates at API list prices, so the total says "est." while any are in
+it.
 
 ## Use it
 
