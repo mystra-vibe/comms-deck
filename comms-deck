@@ -677,19 +677,37 @@ def send(sender, to, text, quiet=False, private=False):
             log(f"load-balancer couldn't make a task: {error}")
         if task:
             record["task"] = task["id"]
+    deliver(record, targets)
+    return record, warning
+
+
+def deliver(record, targets, enqueue=True):
+    """One delivery path, shared by send() (and, once #75 lands,
+    import_remote()): each target gets the note (an inbox file; the desktop
+    bell for the owner; nothing for a remote seat, whose mailbox is the git
+    copy), then the git queue, then the log, then the @deck actions.
+
+    `enqueue=False` is import_remote's case: the record came FROM the git
+    copy of the flight-log, so queueing it again would commit it back a
+    second time.
+
+    Written by: mystra (2026-11-25); the body is send()'s tail moved rather
+    than changed, with the `if enqueue` around queue_out — at the owner's
+    instruction, from the Wave-1 package on quantum-kittens (PR #7).
+    """
     for seat in targets:
         if seat == "owner":
-            notify(f"Note from {record['from']}", text)
+            notify(f"Note from {record['from']}", record["text"])
         elif APP_PROCESS.get(seat) == "remote":
-            pass  # a remote seat (docs/REMOTE.md) takes its notes from the git
-                  # copy; nothing here would ever take it out of an inbox, so
-                  # the squares on the screen must not count one that won't be read
+            pass  # a remote seat takes its notes from the git copy; nothing here
+                  # would ever take it out of an inbox, so the screen's squares
+                  # must not count one that won't be read
         else:
             write_json(DATA / "inbox" / seat / f"{record['id']}.json", record)
-    queue_out(record)
+    if enqueue:
+        queue_out(record)
     append_log(record)
     queue_actions(record)
-    return record, warning
 
 
 def add_note(sender, text):
@@ -3143,57 +3161,55 @@ def context_split():
 
 
 def context_pie(split, width, step=None, busy=None):
-    """The CONTEXT SPLIT lines: a text pie of live context, colour per seat.
+    """The CONTEXT SPLIT lines: a box of dots filled in each seat's colour.
 
-    Drawn from characters, since the chat is a terminal: each dot is a cell
-    whose distance and 'clock angle' from the centre pick its wedge, so a
-    quarter of the tokens is a quarter of the disc. Biggest slice starts at
-    12 o'clock. beside the disc, one legend row per seat, then one total row
-    naming the seats in it (grok's ask). Reports the context now, not
-    lifetime session tokens. The disc breathes with the clock (continuous
-    phase), dimmer and quieter than the bars -- and each wedge only
-    shimmers while that seat is actually working: `busy` is the set of
-    working seats, None means everything pulses (tests). Returns [] when
-    nobody reports a figure.
+    The owner (06:36): no pie, a box of dots that fill up with the right
+    colour and glow while in use. Every dot is an equal slice of the context
+    pool, so a seat with a quarter of the tokens fills a quarter of the box.
+    Seats fill in order, biggest first, left to right and row by row, so
+    each seat is one solid run of colour. A working seat's dots breathe
+    (`busy` is the set of working seats; None makes everything glow, for
+    tests). An idle seat's dots sit still in its colour. Under the box: one
+    legend row per seat, then the total. The name is kept so callers don't
+    change. Returns [] when nobody reports a figure.
     """
     if not split:
         return []
     esc = "\033["
     fstep = float(step) if step is not None else time.time() / PULSE_EVERY
     total = sum(used for _, used in split)
-    box = max(9, min(width - 2, 17))          # cells across the disc
-    height = max(max(box // 2 + 1, len(split)), 5)  # chars are twice as tall as wide
-    cx, cy = (box - 1) / 2, (height - 1) / 2
-    radius = min(cx, cy) + 0.25
-    acc = 0.0
-    wedges = []  # (clockwise fraction where the slice starts, seat)
-    for seat, used in sorted(split, key=lambda s: -s[1]):
-        wedges.append((acc / total, seat))
-        acc += used
-    disc = []
-    for i in range(height):
-        cells = ""
-        for j in range(box):
-            dx, dy = (j - cx) * 0.5, i - cy
-            if dx * dx + dy * dy > radius * radius:
-                cells += f"{esc}38;5;238m·{esc}0m"
-                continue
-            frac = (math.atan2(dx, -dy) / (2 * math.pi)) % 1.0  # 12 o'clock = 0, clockwise
-            for start, seat in reversed(wedges):
-                if frac >= start - 1e-9:
-                    break
+    cols = max(10, min(width - 2, 40))
+    rows = 4
+    cells = cols * rows
+    order = sorted(split, key=lambda s: -s[1])
+    # Largest remainder: the counts add up to every dot, and no reporting
+    # seat is left with none.
+    raw = [(seat, cells * used / total) for seat, used in order]
+    counts = {seat: max(1, int(share)) for seat, share in raw}
+    spare = cells - sum(counts.values())
+    for seat, share in sorted(raw, key=lambda r: -(r[1] - int(r[1]))):
+        if spare <= 0:
+            break
+        counts[seat] += 1
+        spare -= 1
+    while spare < 0:  # the minimum of one dot overshot: take from the biggest
+        big = max(counts, key=counts.get)
+        counts[big] -= 1
+        spare += 1
+    owners = [seat for seat, _ in order for _ in range(counts[seat])]
+    lines = [f"{esc}1mCONTEXT SPLIT{esc}0m", ""]
+    for r in range(rows):
+        row = ""
+        for c in range(cols):
+            seat = owners[r * cols + c]
             if busy is not None and seat not in busy:
-                cells += f"{esc}38;5;{colour(seat)}m·{esc}0m"  # idle: still, no shimmer
+                row += f"{esc}38;5;{colour(seat)}m●{esc}0m"   # idle: still
             else:
-                cells += f"{esc}{breathe_style(colour(seat), i * 2 + j + fstep)}m·{esc}0m"
-        disc.append(cells)
-    legend = [f"{esc}38;5;{colour(seat)}m■{esc}0m {seat:8} {100 * used / total:4.1f}%  {esc}2m{short_tokens(used)}{esc}0m"
+                row += f"{esc}{breathe_style(colour(seat), r * 2 + c + fstep)}m●{esc}0m"
+        lines.append(row)
+    lines.append("")
+    lines += [f"{esc}38;5;{colour(seat)}m■{esc}0m {seat:8} {100 * used / total:4.1f}%  {esc}2m{short_tokens(used)}{esc}0m"
               for seat, used in split]
-    lines = ["\033[1mCONTEXT SPLIT\033[0m", ""]
-    for i in range(max(len(disc), len(legend))):
-        left = disc[i] if i < len(disc) else " " * box
-        right = legend[i] if i < len(legend) else ""
-        lines.append(f"{left}  {right}".rstrip())
     lines.append(f"{esc}1mTotal{esc}0m {short_tokens(total)} across "
                  f"{esc}2m{' + '.join(seat for seat, _ in split)}{esc}0m")
     return lines
@@ -3261,10 +3277,15 @@ def context_rows(split, width, step=None, busy=None):
     fstep = float(step) if step is not None else time.time() / PULSE_EVERY
     bar_w = max(4, min(10, width - 15))
     lines = []
-    for seat, _ in split:
+    for seat, used in split:
         d = (read_json(DATA / "usage" / f"{seat}.json", {}) or {}).get("data", {}) or {}
-        pct = context_percent(d) or 0.0
+        pct = context_percent(d)
         c = colour(seat)
+        if not isinstance(pct, (int, float)):
+            # No window size reported (Devin's CLI gives tokens only): a bar
+            # would claim 0%, so show the tokens it does report instead.
+            lines.append(f"{esc}38;5;{c}m■{esc}0m {seat:8} {esc}2m{short_tokens(used)} tokens, window unknown{esc}0m")
+            continue
         full = round(bar_w * min(pct, 100.0) / 100)
         anim = busy is None or seat in busy
         glint = (fstep * 2) % (bar_w + 4) - 2  # the white speck travels with time
@@ -3297,9 +3318,9 @@ def context_list(split):
     """
     if not split:
         return []
-    esc = "\\033["
+    esc = "\033["
     total = sum(used for _, used in split)
-    lines = [f"\\033[1mCONTEXT\\033[0m \\033[2mpool {short_tokens(total)} tokens\\033[0m"]
+    lines = [f"{esc}1mCONTEXT{esc}0m {esc}2mpool {short_tokens(total)} tokens{esc}0m"]
     for seat, used in sorted(split, key=lambda s: -s[1]):
         lines.append(f"{esc}38;5;{colour(seat)}m■{esc}0m {seat:8} "
                      f"{esc}2m{short_tokens(used):>6}{esc}0m {100 * used / total:4.1f}%")
@@ -3341,8 +3362,8 @@ def usage_list():
         rows.append((best[0], seat, tag_seat, best[1]))
     if not rows:
         return []
-    esc = "\\033["
-    lines = ["\\033[1mPLAN USAGE\\033[0m \\033[2mhighest first\\033[0m"]
+    esc = "\033["
+    lines = [f"{esc}1mPLAN USAGE{esc}0m {esc}2mhighest first{esc}0m"]
     for pct, seat, tag_seat, tag in sorted(rows, key=lambda r: -r[0]):
         shade = 78 if pct < 60 else 214 if pct < 85 else 196
         cle = colour(tag_seat)
@@ -3393,14 +3414,16 @@ def busy_seats(snap=None):
 
 
 def usage_panel(width):
-    """The usage column: context, limits and cost per seat, then the split.
+    """The usage column: context, limits and cost per seat, then the lists.
 
     Since #61 this is drawn on the LEFT of the chat (the owner's layout):
     the ready order moved to its own activity_panel() on the right, so
-    neither pushes the other off the screen. Under the pie sit the two
-    categorised lists the owner asked for (02:43): CONTEXT, one row per
-    reporting seat highest first with its share of the pool, and PLAN
-    USAGE, one row per seat with the tighter of its plan meters. Bars
+    neither pushes the other off the screen. The CONTEXT SPLIT pie and
+    bars moved to the right column too (the owner, 05:17: too tall for
+    the left); what stays here are the categorised lists the owner asked
+    for (02:43): CONTEXT, one row per reporting seat highest first with
+    its share of the pool, and PLAN USAGE, one row per seat with the
+    tighter of its plan meters. Bars
     shimmer only while that seat's agent is busy (04:02); idle bars are
     still. Sets usage_panel.running for the redraw clock: true while any
     bar has something to animate, so the screen can tick fast then.
@@ -3486,9 +3509,6 @@ def usage_panel(width):
         lines.append(f"\033[2m  updated {ago(time.time() - record.get('time', 0))}\033[0m")
         lines.append("")
     split = context_split()
-    pie = context_pie(split, inner, busy=running)  # [] when nobody reports a context figure
-    if pie:
-        lines += pie + context_rows(split, inner, busy=running) + [""]
     ctx = context_list(split)  # the categorised lists the owner asked for (02:43)
     if ctx:
         lines += ctx + [""]
@@ -3652,6 +3672,12 @@ def activity_panel(width):
             who = t.get("holder") or "open"
             lines.append(f"  \033[38;5;{colour(who) if t.get('holder') else 245}m{t['id']:4} {who:7}\033[0m "
                          f"\033[2m{'(private)' if t.get('private') else t['summary']}\033[0m")
+    # The context split lives on this column now (the owner, 05:17): the pie
+    # and bars were too tall for the usage column on the left.
+    split = context_split()
+    pie = context_pie(split, width - 2, busy=busy_seats(snap))  # [] when nobody reports a figure
+    if pie:
+        lines += [""] + pie + context_rows(split, width - 2, busy=busy_seats(snap)) + [""]
     return [fit(" " + line, width) for line in lines]
 
 
@@ -5489,7 +5515,7 @@ def self_test():
     run(["--from", "owner", "send", "grok", "from the owner"], "owner")
     r = run(["hook", "--source", "grok", "--event", "Stop"], "grok", "{}", {"GROK_HOOK_EVENT": "stop"})
     check("an owner note gets through a paused loop guard", "from the owner" in r.stdout, r.stdout)
-    now = time.time()
+    stamp0 = time.time()
     uhome = Path(tmp) / "usage-home"
     (uhome / "usage").mkdir(parents=True)
     (uhome / "limits").mkdir(parents=True)
@@ -5504,8 +5530,8 @@ def self_test():
         {"seat": "claude", "state": "idle", "time": 1795563600.0},
     ]))
     (uhome / "usage" / "claude.json").write_text(json.dumps(
-        {"data": {"rate_limits": {"five_hour": {"used_percentage": 42, "resets_at": now + 3600}}}}))
-    (uhome / "limits" / "grok.json").write_text(json.dumps({"resets_at": now + 7200, "set_by": "claude", "set_at": now}))
+        {"data": {"rate_limits": {"five_hour": {"used_percentage": 42, "resets_at": stamp0 + 3600}}}}))
+    (uhome / "limits" / "grok.json").write_text(json.dumps({"resets_at": stamp0 + 7200, "set_by": "claude", "set_at": stamp0}))
     r = run(["usage"], "owner", extra={"COMMS_DECK_HOME": str(uhome)})
     check("usage: notes counted, old rows and commentary excluded",
           r.returncode == 0 and "notes: 2 sent (1 quiet, 0 private)" in r.stdout
@@ -6141,12 +6167,12 @@ def self_test():
                        capture_output=True, text=True, timeout=30)
     check("OTLP metrics listener fills usage/<seat>.json (JSON and protobuf, delta and cumulative)",
           r.returncode == 0 and r.stdout.strip().splitlines()[-1:] == ["ok"], r.stdout + r.stderr)
-    now = 1_700_000_000
+    fixed_now = 1_700_000_000  # a local, not `now`: the name stays free for the module's clock (see remote_commit)
     code = "\n".join([
         "import importlib.machinery as m, importlib.util as u, json",
         f"l = m.SourceFileLoader('lp', {me!r}); s = u.spec_from_loader('lp', l)",
         "x = u.module_from_spec(s); l.exec_module(x)",
-        f"now = {now}",
+        f"now = {fixed_now}",
         "future, past = now + 3600, now - 3600",
         "full = lambda reset: {'used_percentage': 100, 'resets_at': reset}",
         "assert x.limit_spent({'rate_limits': {'five_hour': full(future)}}, now)",
@@ -6283,6 +6309,13 @@ def self_test():
         "assert 'CONTEXT SPLIT' in pt and 'Total' in pt and 'claude + grok + gravity' in pt, pt",
         "assert '67.4%' in pt and '32768' not in pt and '32.8k' in pt and 'codex' not in pt, pt  # shares of the total; no-figure seat left out, not zero",
         "assert x.context_pie([], 40) == [], 'an empty deck draws nothing'",
+        # The box of dots (the owner, 06:36): every dot used, each seat's run sized by its share.
+        "bx = [x.ANSI.sub('', l) for l in pl[2:6]]",
+        "assert len(bx) == 4 and all(len(r) == 38 and set(r) == {'●'} for r in bx), bx",
+        "dots = ''.join(x.context_pie(sp, 40, busy=())[2:6]); n = {s: dots.count(f'[38;5;{x.colour(s)}m●') for s, _ in sp}",
+        "assert sum(n.values()) == 152 and n['claude'] == 102 and n['grok'] == 33 and n['gravity'] == 17, n",
+        "tiny = x.context_pie([['claude', 1e9], ['grok', 1.0]], 40, busy=())",
+        "assert f'[38;5;{x.colour(\"grok\")}m●' in ''.join(tiny), 'a reporting seat always gets at least one dot'",
         "(pc / 'usage' / 'claude.json').write_text('{\"time\": 1, \"data\": {\"cost\": {\"total_cost_usd\": \"no\"}}}')",
         "assert [s for s, _ in x.context_split()] == ['grok', 'gravity'], 'garbage data drops out too'",
         "x.write_json(pc / 'usage' / 'grok.json', {'time': 1, 'source': 'test', 'data': {'context_window': {'context_tokens': 294000, 'context_window_size': 262144}}})",
@@ -6332,6 +6365,12 @@ def self_test():
         "pl2 = x.usage_list(); pl_t = ' '.join(x.ANSI.sub('', l) for l in pl2)",
         "assert 'PLAN USAGE' in pl_t and 'codex' in pl_t and '40%' in pl_t, pl_t  # the 5-hour figure shows",
         "assert pl_t.index('codex') < pl_t.index('gravity') if 'gravity' in pl_t else True, pl_t  # sorted highest first",
+        "assert chr(92) not in ''.join(cl + pl2), 'the lists send real escapes, not a printed backslash-033'",
+        # A seat that reports tokens but no window (Devin's CLI) gets no 0% bar.
+        "x.write_json(pc / 'usage' / 'devin.json', {'time': 1, 'source': 'test', 'data': {'context_window': {'context_tokens': 122605}}})",
+        "sp3 = x.context_split(); assert 'devin' in [s for s, _ in sp3], sp3",
+        "dr = [x.ANSI.sub('', l) for l in x.context_rows(sp3, 40) if 'devin' in l]",
+        "assert len(dr) == 1 and 'window unknown' in dr[0] and '122.6k' in dr[0] and '%' not in dr[0], dr",
         "x.DATA = real_data",
         # The top bar's notification queue mirrors into the deck's feed.
         "nd = x.Path(x.tempfile.mkdtemp()); real_nd, real_nq = x.DATA, x.NOTIFY_QUEUE",
@@ -6419,7 +6458,10 @@ def self_test():
     remote_config = Path(tmp) / "remote-config"
     remote_config.mkdir(exist_ok=True)
     (remote_config / "app-seats").write_text("mystra:remote\n")
-    remote_env = {"COMMS_DECK_CONFIG": str(remote_config), "COMMS_DECK_PUBLIC_REPO": str(rlog)}
+    # PRIVATE_REPO would otherwise fall back to the real ~/private-relay and turn this
+    # hermetic test into a network pull of the owner's repos; point it at a plain dir.
+    remote_env = {"COMMS_DECK_CONFIG": str(remote_config), "COMMS_DECK_PUBLIC_REPO": str(rlog),
+                  "COMMS_DECK_PRIVATE_REPO": str(Path(tmp) / "remote-private")}
 
     def remote_commit(sender, to, text, box, message):
         """One commit the way the remote device pushes one: a message file
@@ -6448,12 +6490,17 @@ def self_test():
                              capture_output=True, text=True, timeout=30).stdout.strip()
 
     # first sight: one old note is already in the repo, and it is the archive, not news
+    # (earlier tests leave notes in these inboxes, so the check is: nothing is added)
+    pre = {s: {p.name for p in Path(f"{tmp}/data/inbox/{s}").glob("*.json")}
+           for s in ("grok", "claude")}
     remote_commit("mystra", "grok", "an old hello from the archive", "archive-box", "seed")
     subprocess.run(["git", "-C", str(rlog), "push", "-q", "-u", "origin", "HEAD"],
                    capture_output=True, timeout=30)
     r = run(["fetch-remote"], "claude", extra=remote_env)
     check("the first fetch imports nothing: the backlog is the archive",
-          r.returncode == 0 and in_texts("grok") == [] and in_texts("claude") == [], r.stdout + r.stderr)
+          r.returncode == 0
+          and all({p.name for p in Path(f"{tmp}/data/inbox/{s}").glob("*.json")} == pre[s]
+                  for s in ("grok", "claude")), r.stdout + r.stderr)
 
     # one real note, one note for two recipients, the deck's own echo
     # (its Machine is this machine), and a stranger's note
@@ -6508,11 +6555,54 @@ def self_test():
           r.returncode == 0 and "kitten of the day" in r.stdout
           and r.stdout == again.stdout, r.stdout + r.stderr)
     r = run(["kitten", "--all"], "claude")
-    team = tuple(AGENTS) + APP_SEATS
+    # the team the verb itself sees (this process's seats read the host config,
+    # the test one reads the tmp config - ask the same interpreter the verb ran in)
+    seats_probe = ("import importlib.machinery as m, importlib.util as u\n"
+                   f"l = m.SourceFileLoader('lp', {me!r}); s = u.spec_from_loader('lp', l)\n"
+                   "x = u.module_from_spec(s); l.exec_module(x)\n"
+                   "print(' '.join(list(x.AGENTS) + list(x.APP_SEATS)))")
+    team = tuple(subprocess.run([sys.executable, "-c", seats_probe], env=env,
+                                capture_output=True, text=True, timeout=30).stdout.split())
     widest = max((len(line) for line in r.stdout.splitlines()), default=0)
     check("the whole team's kittens fit 80 columns and name every seat",
           r.returncode == 0 and widest <= 80 and all(seat in r.stdout for seat in team),
           r.stdout + r.stderr)
+    # cite-check: rule 4's gate beside review-check (docs/CITATION.md,
+    # Mystra's Wave-1 piece 3). Two independent gates; never one verdict.
+    body.write_text("Written by: grok\nReviewed by: claude\ncomms-deck\nREADME.md\n")
+    r = run(["cite-check", "--file", str(body)], "grok")
+    check("a cited PR passes cite-check", r.returncode == 0 and "grok" in r.stdout, r.stdout + r.stderr)
+    body.write_text("Reviewed by: claude\n")
+    r = run(["cite-check", "--file", str(body)], "grok")
+    check("a PR with no Written by fails cite-check",
+          r.returncode != 0 and "no Written by" in r.stderr, r.stderr)
+    body.write_text("Written by: grok\n")
+    r = run(["cite-check", "--file", str(body), "--strict"], "grok")
+    check("strict mode needs a PR number to diff the files",
+          r.returncode != 0 and "needs a PR number" in r.stderr, r.stderr)
+    # (the strict pass case is the stubbed cite_gap check below: files cited
+    # in the text, strict mode, no gh call)
+    code = "\n".join([
+        "import importlib.machinery as m, importlib.util as u",
+        f"l = m.SourceFileLoader('cd', {me!r}); s = u.spec_from_loader('cd', l)",
+        "x = u.module_from_spec(s); l.exec_module(x)",
+        # stub the fetch: strict mode compares against the PR's file list
+        "x.pr_files = lambda n: ['comms-deck', 'docs/README.md']",
+        "gap = x.cite_gap('Written by: grok\\nREADME.md\\n', 99)",
+        "assert gap and 'never cites' in gap and 'docs/README.md' in gap, gap",
+        "assert x.cite_gap('Written by: grok\\nPR touches comms-deck, docs/README.md.\\n', 99) is None, 'a sentence-ending period still cites'",
+        "assert x.cite_gap('Written by: grok\\nPR touches `comms-deck` and **docs/README.md**\\n', 99) is None, 'markdown-wrapped paths cite'",
+        "gap = x.cite_gap('Written by: grok\\ndocs/README.md.backup is a different file\\n', 99)",
+        "assert gap and 'docs/README.md' in gap, gap",
+        "gap = x.cite_gap('Reviewed by: claude\\n')",
+        "assert gap == 'no Written by line naming a seat', gap",
+        "assert x.cite_gap('Written by: grok\\nReviewed by: grok\\n') is None, 'cite-check never gates on review-check'",
+        "assert x.cite_gap('Written by: grok\\n') is None, 'plain mode has no file list'",
+        "print('ok')",
+    ])
+    r = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True, timeout=30)
+    check("strict cite-check refuses PRs whose text never cites the touched files",
+          r.returncode == 0 and r.stdout.strip() == "ok", r.stdout + r.stderr)
     shutil.rmtree(tmp, ignore_errors=True)
     print(f"\n{'all passed' if not failures else f'{len(failures)} failed'}")
     return 1 if failures else 0
@@ -6643,6 +6733,54 @@ def pr_review_text(number):
     return "\n".join(parts)
 
 
+def pr_files(number):
+    """The file paths a PR touches, from gh. Raises on failure. One
+    --name-only call; no content is fetched.
+
+    Written by: mystra (2026-11-25, Wave-1 piece 3).
+    """
+    result = subprocess.run(
+        ["gh", "pr", "diff", str(number), "--repo", "whyyyyyai/comms-deck", "--name-only"],
+        capture_output=True, text=True, timeout=30)
+    if result.returncode != 0:
+        raise RuntimeError((result.stderr or result.stdout or "gh pr diff failed").strip())
+    return [line for line in result.stdout.splitlines() if line.strip()]
+
+
+def cite_gap(text, number=None):
+    """None if the PR text carries the authorship citation rule 4 asks for
+    (docs/CITATION.md), otherwise a short reason.
+
+    Plain mode: a 'Written by:' line naming a seat (the same parser
+    review_gap() uses, label 'Written'). With `number` (--strict): every
+    file the PR touches must be named somewhere in the PR text -- the
+    body's citation list, a per-file 'Written by:' table, anything citable
+    -- so a PR that cannot say who wrote each file does not merge. Two
+    independent gates: cite_gap never reads review_gap's verdict and never
+    looks at CREDITS tables.
+
+    Written by: mystra (2026-11-25, Wave-1 piece 3).
+    """
+    writers = credited_seats(text, "Written")
+    if not writers:
+        return "no Written by line naming a seat"
+    if number:
+        # Markdown-emphasis and inline-code marks wouldn't stop a reader
+        # from seeing the path, so strip them before matching (claude's
+        # review of the first cut): `docs/CITATION.md` or **README.md**
+        # cite the file just as plainly as bare text.
+        plain = re.sub(r"`{1,3}([^`]*)`{1,3}", r"\1", text).replace("**", "")
+        # Whole-path match: docs/README.md is not cited by README.md. A
+        # sentence-ending period after the path still counts; a period that
+        # starts another path segment (docs/README.md.backup) does not.
+        cited = lambda path: re.search(r"(?<![\w./-])" + re.escape(path)
+                                       + r"(?=$|[\s,;:)]|\.(?![\w]))", plain) is not None
+        missing = [path for path in pr_files(number) if not cited(path)]
+        if missing:
+            return "files the PR touches that its text never cites: " + ", ".join(missing[:6])
+    return None
+
+
 def main():
     """The command line: send, read, the chat screen, the service, hooks and install."""
     parser = argparse.ArgumentParser(prog="comms-deck", description=__doc__.split("\n")[0])
@@ -6689,6 +6827,11 @@ def main():
     p = sub.add_parser("kitten", help="one small ASCII kitten (the deck is called quantum-kittens)")
     p.add_argument("seat", nargs="?", help="a seat name, for its own kitten")
     p.add_argument("--all", dest="kitten_all", action="store_true", help="the whole team, one kitten each")
+    p = sub.add_parser("cite-check", help="fail unless the PR cites the seat that wrote it (docs/CITATION.md)")
+    p.add_argument("number", nargs="?", type=int, help="pull request number on this repo")
+    p.add_argument("--file", help="check this text instead of fetching the PR")
+    p.add_argument("--strict", action="store_true",
+                   help="also require every changed file to be cited in the PR text")
     args = parser.parse_args()
 
     def me():
@@ -6770,6 +6913,26 @@ def main():
             others = [s for s in credited_seats(text, "Reviewed")
                       if s not in credited_seats(text, "Written")]
             print("ok: reviewed by " + ", ".join(others))
+        elif args.cmd == "cite-check":
+            # What it checks is the PR's *text* (rule 4, docs/CITATION.md);
+            # commits' Co-Authored-By trailers are CI's job, not this verb's.
+            if args.strict and not args.number:
+                sys.exit("comms-deck: cite-check --strict needs a PR number to diff its files")
+            try:
+                if args.file:
+                    text = Path(args.file).read_text()
+                elif args.number:
+                    text = pr_review_text(args.number)
+                else:
+                    sys.exit("comms-deck: cite-check needs a PR number or --file")
+                gap = cite_gap(text, args.number if args.strict else None)  # may raise: gh fecthes the file list
+            except (OSError, RuntimeError, json.JSONDecodeError, subprocess.SubprocessError) as error:
+                sys.exit(f"comms-deck: {error}")
+            if gap:
+                who = f"PR #{args.number}" if args.number else f"file {args.file}"
+                sys.exit(f"comms-deck: {who}: {gap}")
+            print("ok: cited by " + ", ".join(credited_seats(text, "Written"))
+                  + (" (strict: every file cited)" if args.strict else ""))
     except ValueError as error:
         sys.exit(f"comms-deck: {error}")
     except KeyboardInterrupt:

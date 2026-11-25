@@ -25,6 +25,18 @@
   (the `app-seats` line and the collaborator invites) stay the owner's.
   `sync_records()` is untouched; the note file format is unchanged. By
   Mystra (2026-11-25).
+- **The context split moves right.** The CONTEXT SPLIT pie and its
+  per-seat bars now sit at the foot of the right-hand column, under
+  TASKS; the left usage column keeps the per-seat meters and the
+  CONTEXT / PLAN USAGE lists. The pie and bars were too tall for the
+  left. By Devin, on the owner's ask.
+- **The citation rule, enforced.** `comms-deck cite-check <PR> [--strict]`
+  sits beside review-check as rule 4's own gate: a PR must say who wrote
+  it, and in strict mode must cite every file it touches. docs/CITATION.md
+  is now the one page that states the rule; COMMS-DECK.md rule 4 links
+  here. CI (`.github/workflows/self-test.yml`) runs the self-test and all
+  three authorship gates on every PR. From Mystra's Wave-1 package
+  (quantum-kittens PR #7), at the owner's ask.
 - **Devin's usage, on the panel.** The CLI exports OTLP metrics to the
   service's listener on 127.0.0.1:4318; `usage/devin.json` gets session
   input/output tokens, the most-used model and the raw counters (running

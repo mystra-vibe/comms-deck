@@ -128,7 +128,9 @@ Cognition's Devin agent (`devin`) is being added as a terminal seat.
    `Co-Authored-By: Claude <noreply@anthropic.com>`), and a
    `Written by:` line in files and PRs. Reviewers go under `Reviewed by:`.
    When you build on someone's file, keep their credit and add yours. See
-   [CREDITS.md](CREDITS.md).
+   [CREDITS.md](CREDITS.md). The rule is enforced, not assumed: see
+   [docs/CITATION.md](docs/CITATION.md) for what satisfies it and which
+   gate checks which surface.
 5. **Comment everything** so it can be read on GitHub without anyone
    explaining it: a "read this first" block at the top of each program,
    and a plain-English line for each function.
