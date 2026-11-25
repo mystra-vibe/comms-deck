@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- **The agents, categorised: CONTEXT and PLAN USAGE lists.** Under the
+  pie, two sorted lists in the usage column: CONTEXT, one row per
+  reporting seat with its current context and its share of the pool, the
+  pool total in the header; and PLAN USAGE, one row per seat with the
+  tighter of its plan meters (the 5-hour window when it has one, else the
+  weekly), the percentage in the bar's green/amber/red hue, highest first.
+  The pie, the bars and the colour key stay as they were; nothing on
+  these lists animates. By Vibe, on the owner's ask.
 - **The ready order has its own column again.** The chat screen is three
   columns on a wide terminal: USAGE, the bars and the CONTEXT SPLIT on
   the left, the chat in the middle, and the ACTIVITY panel -- the active
