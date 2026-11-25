@@ -5554,6 +5554,11 @@ def self_test():
     r = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True, timeout=30)
     check("a full plan limit is spent until its reset, and waiting notes are counted from the inbox",
           r.returncode == 0 and r.stdout.strip() == "ok", r.stdout + r.stderr)
+    layout = Path(__file__).resolve().parent / "desktop" / "scratchpad-layout"
+    r = subprocess.run([sys.executable, str(layout), "--self-test"], env=env,
+                       capture_output=True, text=True, timeout=30)
+    check("scratchpad cells tile flush, including Vibe and the shared bottom right",
+          r.returncode == 0 and "layout tiles ok" in r.stdout, r.stdout + r.stderr)
     body = Path(tmp) / "pr-body.txt"
     body.write_text("Written by: Grok\nReviewed by: Claude\n")
     r = run(["review-check", "--file", str(body)], "grok")

@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- **Scratchpad cells meet.** The gap between the cells is 0, so the agent
+  windows sit flush. The outer margin stays 22. Hyprland still draws a 2px
+  border, rounded corners and a shadow on each window; the layout script
+  clears those on the scratchpad windows only, and leaves the global config
+  alone. By Alice.
 - **The task board.** An owner request to two or more agents becomes one
   task with one holder, chosen by the deck from availability. Every copy of
   the note says who holds it, a second claim is refused, and the service hands
