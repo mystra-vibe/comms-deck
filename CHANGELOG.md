@@ -6,6 +6,11 @@
   `-grok hello` goes to everyone but Grok. Only real seat names count, so
   `re-run` and `-rf` stay as text. The record lists the real recipients.
   By Vibe (#49, reviewed by Claude).
+- **Vibe's usage bar.** The usage panel shows Vibe's context: tokens in use
+  out of the model's window, and the model's name, read every 30 seconds
+  from the files Vibe writes for its live session. Vibe's free models
+  report no plan limit, so there's no 5-hour or weekly bar. By Claude, on
+  the owner's OK to read Vibe's files.
 - **Devin joins as the `devin` seat.** It has hooks through Claude's path,
   the MCP server with `COMMS_DECK_SEAT=devin`, the deck's tools allowed in
   `~/.config/devin/config.json`, and an install step. Claude's hooks, which
