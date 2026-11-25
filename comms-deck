@@ -3171,6 +3171,9 @@ def activity_panel(width):
     The words and countdowns don't animate: the owner put the pulse on the
     bars only. Since #61 this column is its own on the right of the chat,
     so the ready order is visible instead of scrolling away under the pie.
+    Since the 02:45 ask, the top-bar notifications (ticker_notes()) draw
+    under the rows when there is room; the ready order is drawn first, so
+    a fuller screen cuts notices before it ever cuts a seat row.
     """
     lines = ["\033[1mACTIVITY\033[0m", ""]
     activity_panel.ticking = False
@@ -3202,6 +3205,51 @@ def activity_panel(width):
                      + ([f"    \033[2m↳ {summary}\033[0m"] if summary else [])))
     lines += [line for row in sorted(rows) for line in row[-1]]
     return [fit(" " + line, width) for line in lines]
+
+
+# The top-bar ticker: the desktop's notification hook appends one record per
+# banner to this queue file and the bar-ticker script does the scrolling
+# (popups are configured invisible). The deck joins in as another reader.
+TICKER = Path.home() / ".local/state/bar-ticker/queue.jsonl"
+
+
+def ticker_notes(limit=4):
+    """The last few top-bar notifications, oldest first: the NOTICES block.
+
+    The owner asked (02:45) for the notifications from the scrolling top
+    bar to appear in the deck too. They are already on disk before the bar
+    scrolls them, so the deck reads the tail of the queue file in -- read
+    only, nothing written back, the ticker itself untouched. Only the last
+    few kilobytes are read, since the queue is only appended to. Each line
+    goes through the same redaction rules as every other word on the
+    screen: a token in a notification shows as '(something private)'.
+    Missing file, unreadable file or no text: an empty list, no error.
+    """
+    try:
+        with TICKER.open("rb") as handle:
+            handle.seek(0, 2)
+            size = handle.tell()
+            handle.seek(max(0, size - 8192))  # the tail is enough for a few rows
+            chunk = handle.read().decode("utf-8", "replace")
+    except OSError:
+        return []
+    texts = []
+    for line in chunk.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            item = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        text = item.get("text") if isinstance(item, dict) else None
+        if isinstance(text, str) and text.strip():
+            texts.append(text)
+    shown = [describe(text, 70) for text in texts[-limit:]]
+    shown = [text for text in shown if text]
+    if not shown:
+        return []
+    return ["\033[1mNOTICES\033[0m", ""] + [f"\033[2m· {text}\033[0m" for text in shown]
 
 
 def row_status(state, waiting):
@@ -3402,8 +3450,9 @@ def chat(history=200, hide_private=False):
                     left = [""] * (body - len(left)) + left
                     usg = usage_panel(usage_w) if usage_w else []
                     act = activity_panel(panel_w) if panel_w else []
+                    tips = ticker_notes() if panel_w else []  # the bar's notifications, under the ready order (the owner, 02:45)
                     usg = (usg + [""] * body)[:body]
-                    right = (act + [""] * body)[:body]
+                    right = (act + ([""] + tips if tips else []) + [""] * body)[:body]
                     screen = ["\033[H"]
                     for i in range(body):
                         row = (fit(usg[i], usage_w) + f" \033[38;5;238m│\033[0m ") if usage_w else ""
@@ -4901,6 +4950,18 @@ def self_test():
         "pl2 = x.usage_list(); pl_t = ' '.join(x.ANSI.sub('', l) for l in pl2)",
         "assert 'PLAN USAGE' in pl_t and 'codex' in pl_t and '40%' in pl_t, pl_t  # the 5-hour figure shows",
         "assert pl_t.index('codex') < pl_t.index('gravity') if 'gravity' in pl_t else True, pl_t  # sorted highest first",
+        "tk = x.Path(x.tempfile.mkdtemp()) / 'queue.jsonl'; real_ticker = x.TICKER; x.TICKER = tk",
+        "assert x.ticker_notes() == [], 'no queue file, no NOTICES block'",
+        "tk.write_text('not json\\n{\"text\": \"\"}\\n{\"text\": \"Note from devin: usage groups are up on the bar\"}\\n')",
+        "tn = x.ticker_notes(); tn_t = ' '.join(x.ANSI.sub('', l) for l in tn)",
+        "assert 'NOTICES' in tn_t and 'usage groups are up' in tn_t, tn_t  # garbage and empty lines drop out",
+        "tk.open('a').write(json.dumps({'text': 'token: ' + 'ghp_' + 'a' * 30}) + '\\n')",
+        "assert '(something private)' in ' '.join(x.ANSI.sub('', l) for l in x.ticker_notes()), 'a secret never reaches NOTICES'",
+        "tk.open('a').write(json.dumps({'text': 'the newest notice last'}) + '\\n')",
+        "tn2 = x.ticker_notes(); tn2_t = ' '.join(x.ANSI.sub('', l) for l in tn2)",
+        "assert tn2_t.index('usage groups are up') < tn2_t.index('the newest notice last'), tn2_t  # oldest first, newest last",
+        "assert sum(1 for l in tn2 if 'NOTICES' in x.ANSI.sub('', l)) == 1, 'one header'",
+        "x.TICKER = real_ticker",
         "x.DATA = real_data",
         "assert x.poll_countdown({}, now) == \"hasn't checked yet\"",
         "assert x.poll_countdown({'polled_at': now - 18}, now) == 'next check in 0:42'",
