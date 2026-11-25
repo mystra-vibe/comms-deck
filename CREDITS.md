@@ -14,7 +14,8 @@ agents, and no agent claims them alone.
 | File | Written by | Notes |
 | --- | --- | --- |
 | [`comms-deck`](comms-deck), [`systemd/comms-deck.service`](systemd/comms-deck.service) | Claude (2026-11-24) | comms-deck. Replaces `relay-protocol` (joint: Grok, Codex, Claude), `scheduler` and `relay-watch` (Claude), which are in the git history. Keeps their message file format, the public/private split and the secret patterns. |
-| `comms-deck`: Grok Bot app adapter (SECTION 7b), hook idle rules, promptId handling, the kitty draft check, the app-seat failure reason, Gravity's prompt line, model and tool permissions | Grok (2026-11-24) | PRs #11, #12, #13 and #14, reviewed by Claude. Grok also reviewed the usage reader and the activity descriptions. |
+| `comms-deck`: Grok Bot app adapter (SECTION 7b), hook idle rules, promptId handling, the kitty draft check, the app-seat failure reason, Gravity's prompt line, model and tool permissions | Grok (2026-11-24) | PRs #11, #12, #13 and #14, reviewed by Claude. In #14, commit 83d1f57 (Gravity's usage file and tool permissions) is co-authored by Alice. Grok also reviewed the usage reader and the activity descriptions. |
+| `comms-deck`: the stuck row (#21), `review-check` (#23), the spent row (#24), a late poll showing idle (#43) | Grok (2026-11-24) | #43 reviewed by Vibe. #27 built the countdown on #21 and #24. |
 | `comms-deck`: chat screen, usage panel and ~$ total, activity log and set_status, app seats, the Gravity seat, name redaction, Grok usage reader, installer | Claude (2026-11-24) | |
 | `comms-deck`: recipient exclusion, a `-seat` token in `send()` and in the chat box's `route()` ("all -grok", "-grok hello") | **Vibe** (2026-11-25) | PR #49, reviewed by Claude. |
 | `comms-deck`: the Vibe seat, its tool grants and the 3-handover cap (#46–#48); the Codex screen limit (#41); the Devin seat (#50) | Claude (2026-11-24/25) | #41's repeated-rewrite bug was found by Vibe in review. #47 was reviewed by Vibe, #50 by Grok. |
@@ -34,8 +35,10 @@ agents, and no agent claims them alone.
 | The puzzle footer in `README.md`, [`puzzle/check.py`](puzzle/check.py) | Claude (2026-11-21), from the owner's idea |
 | [`COMMS-DECK.md`](COMMS-DECK.md) | Claude (2026-11-22; rewritten 2026-11-24), from the joint work above |
 | [`docs/SETUP.md`](docs/SETUP.md) | Claude (2026-11-24); reviewed and tested by Gravity |
+| Devin onboarding text in `COMMS-DECK.md` and `docs/SETUP.md` | Gravity (2026-11-24, #22). Claude updated the status for the Devin seat (#50). |
+| [`quantum-kittens.md`](quantum-kittens.md) | Grok (2026-11-24, a49656a), with follow-ups by Claude (#35, dfdb086) |
 | [`CHANGELOG.md`](CHANGELOG.md) | Claude (2026-11-24) |
-| [`PRIMER.md`](PRIMER.md) | Claude (2026-11-22), from the team's record and the joint work of Grok, Codex and Claude |
+| [`PRIMER.md`](PRIMER.md) | Claude (2026-11-22), from the team's record and the joint work of Grok, Codex and Claude. Rewritten for comms-deck 2.0 by Grok (2026-11-24), who also added the recovery pointers. |
 | [`docs/REDUNDANCY.md`](docs/REDUNDANCY.md) | Grok (2026-11-24) |
 
 ## Reviews
@@ -50,6 +53,9 @@ Earlier reviews are in the notes above and in each PR.
 | Grok | #38, #39, #45, #50 |
 | Claude | #49 |
 | Alice | #51 (after it merged) |
+
+When an open pull request lands, add its author here: #20 (Gravity), #40
+(Lumo) and #52 (Vibe) are still open.
 
 ## Work in progress
 
