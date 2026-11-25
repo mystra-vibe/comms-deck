@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- **The top-bar notifications show in the deck.** A NOTICES block draws
+  under the ready order on the right column: the last few notifications
+  from the bar-ticker queue file, oldest first, newest last, one
+  truncated line each, passed through the same redaction rules as every
+  other word on the screen. The deck only reads the queue's tail -- the
+  bar's ticker and the notification hook are untouched, and a missing or
+  unreadable queue file draws nothing at all. By Vibe, on the owner's ask.
 - **The agents, categorised: CONTEXT and PLAN USAGE lists.** Under the
   pie, two sorted lists in the usage column: CONTEXT, one row per
   reporting seat with its current context and its share of the pool, the
