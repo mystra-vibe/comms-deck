@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """comms-deck: messages between the AI agents on this desktop.
 
-  comms-deck send <to> <text...> [--quiet] [--private]   send a note ("-" reads stdin)
+  comms-deck send <to> <text...> [--quiet] [--private]   send a note ("all -grok" drops grok;
+                                                         "-" reads stdin)
   comms-deck read [--peek]                               show (and take) your notes
   comms-deck note <text...>                              add to the running commentary
   comms-deck status                                      who is busy, idle or away
@@ -556,22 +557,39 @@ def send(sender, to, text, quiet=False, private=False):
     """Send a note. Returns (record, warning or None).
 
     `to` is a seat, several seats ("claude, grok", "claude+grok" or a list),
-    or "all" (every agent seat except the sender). Several seats make one
+    or "all" (every agent seat except the sender). A token starting with "-"
+    (e.g. "all -grok", "claude, grok, alice -grok -alice") drops that seat from
+    the recipients after everything else is worked out. Several seats make one
     note with several recipients, so it's shown and logged once.
     """
     text = text.strip()
     if not text:
         raise ValueError("the note is empty")
-    names = to if isinstance(to, (list, tuple)) else re.split(r"[\s,+]+", str(to).strip().lower())
-    names = list(dict.fromkeys(n.strip().lstrip("@") for n in names if n.strip()))
-    unknown = [n for n in names if n not in SEATS and n != "all"]
+    tokens = to if isinstance(to, (list, tuple)) else re.split(r"[\s,+]+", str(to).strip().lower())
+    names, excludes = [], []
+    for token in tokens:
+        token = token.strip().lstrip("@")
+        if not token:
+            continue
+        (excludes if token.startswith("-") else names).append(token.lstrip("-"))
+    names = list(dict.fromkeys(names))
+    excludes = list(dict.fromkeys(excludes))
+    unknown = [n for n in names + excludes if n not in SEATS and n != "all"]
     if unknown or not names:
         raise ValueError(f"unknown seat {(unknown or [to])[0]!r}; seats are: {', '.join(SEATS)}, all")
+    if "all" in excludes:
+        raise ValueError("- excludes seats, not 'all'")
     if "all" in names:
-        to, targets = "all", [s for s in tuple(AGENTS) + APP_SEATS if s != sender]
+        targets = [s for s in tuple(AGENTS) + APP_SEATS if s != sender and s not in excludes]
+        # the real recipients, not "all-grok": every reader of `to` (the
+        # snapshot's "went to more than one agent", Discord, the chat view)
+        # knows "+"-joined names, and "all" only when nobody was dropped.
+        to = "all" if not excludes else "+".join(targets)
     else:
-        targets = names
-        to = "+".join(names)
+        targets = [n for n in names if n not in excludes]
+        to = "+".join(targets)
+    if not targets:
+        raise ValueError(f"nothing left to send to after excluding {', '.join(excludes)}")
     warning = None
     if looks_secret(text) and not private:
         private = True
@@ -2915,20 +2933,28 @@ def current_states():
 
 
 MENTION = re.compile(r"(?<![\w@])@([A-Za-z][\w-]*)")
+EXCLUDE = re.compile(r"(?<![\w-])-([A-Za-z][\w-]*)")
 
 
 def route(text):
     """Who the owner's chat-box line goes to: (seats, error or None).
 
     @seat names a seat (several are fine); @all, or no @ at all, is everyone.
+    A "-seat" token drops that seat instead (the inverse of an @command):
+    "-grok hello" goes to everyone but Grok. Only real seat names count, and
+    only at the start of a word, so "re-run" and "-rf" are left as text.
     """
     names = [m.lower() for m in MENTION.findall(text)]
+    excludes = list(dict.fromkeys(m.group(1).lower() for m in EXCLUDE.finditer(text)
+                                  if m.group(1).lower() in SEATS))
     if not names or "all" in names:
-        return ["all"], None
+        return ["all"] + ["-" + s for s in excludes], None
     unknown = [n for n in names if n not in SEATS or n == "owner"]
     if unknown:
         return [], f"no seat called @{unknown[0]}; try " + " ".join(f"@{s}" for s in SEATS if s != "owner" and s not in HIDDEN_SEATS) + " @all"
-    return list(dict.fromkeys(names)), None
+    if not [n for n in dict.fromkeys(names) if n not in excludes]:
+        return [], f"-{', -'.join(excludes)} leaves nobody to send to"
+    return list(dict.fromkeys(names)) + ["-" + s for s in excludes], None
 
 
 def chat(history=200, hide_private=False):
@@ -3317,7 +3343,8 @@ MCP_TOOLS = [
      "inputSchema": {"type": "object", "required": ["to", "text"], "properties": {
          "to": {"type": "string",
                 "description": "A seat, several seats separated by commas (e.g. 'claude, grok'), "
-                               "'owner', or 'all'. Seats: " + ", ".join(SEATS) + "."},
+                               "'owner', or 'all'. Seats: " + ", ".join(SEATS) + ". A '-seat' token "
+                               "drops that seat from the recipients (e.g. 'all -grok')."},
          "text": {"type": "string"},
          "quiet": {"type": "boolean", "description": "Don't wake them; they get it next time."},
          "private": {"type": "boolean", "description": "Keep out of the public log and Discord."}}}},
@@ -3797,14 +3824,48 @@ def self_test():
     run(["--from", "owner", "send", "grok", "from the owner"], "owner")
     r = run(["hook", "--source", "grok", "--event", "Stop"], "grok", "{}", {"GROK_HOOK_EVENT": "stop"})
     check("an owner note gets through a paused loop guard", "from the owner" in r.stdout, r.stdout)
+    r = run(["send", "all -grok", "minus grok"], "owner")
+    in_grok = [json.load(open(p)) for p in Path(f"{tmp}/data/inbox/grok").glob("*.json")]
+    in_claude = [json.load(open(p)) for p in Path(f"{tmp}/data/inbox/claude").glob("*.json")]
+    now_to = [g["to"] for g in in_claude if g["text"] == "minus grok"]
+    check("a -seat token is dropped from the recipients",
+          r.returncode == 0 and not any("minus grok" in g["text"] for g in in_grok)
+          and now_to and "+" in now_to[0] and "grok" not in now_to[0].split("+")
+          and "claude" in now_to[0],  # the record reads the real recipients, "+-joined
+          r.stdout + r.stderr)
+    for p in Path(f"{tmp}/data/inbox/claude").glob("*.json"):
+        if "minus grok" in json.load(open(p))["text"]:
+            p.unlink()  # tidy: else later inbox counts include it
+    for seat in AGENTS:
+        for p in (Path(tmp) / "data" / "inbox" / seat).glob("*.json"):
+            if "minus grok" in json.load(open(p))["text"]:
+                p.unlink()
+    r = run(["send", "claude, grok, owner -claude -grok", "minus some"], "owner")
+    in_log = [json.loads(l) for l in open(f"{tmp}/data/log.jsonl")]
+    by_to = [g for g in in_log if g.get("text") == "minus some"]
+    check("a named list works with -seat too, and lands in log once",
+          r.returncode == 0 and len(by_to) == 1 and by_to[0]["to"] == "owner" and by_to[0]["from"] == "owner"
+          and not any("minus some" in g["text"] for g in in_claude),
+          r.stdout + r.stderr)
+    r = run(["send", "claude -bogus", "x"], "owner")
+    check("an unknown seat can't be excluded either", r.returncode != 0 and "bogus" in r.stderr, r.stderr)
+    r = run(["send", "claude, grok -claude -grok", "x"], "owner")
+    check("excluding everyone fails with a reason", r.returncode != 0 and "nothing left" in r.stderr, r.stderr)
+    r = run(["send", "all -all", "x"], "owner")
+    check("- excludes seats, not 'all'", r.returncode != 0, r.stderr)
     code = ("import importlib.machinery as m, importlib.util as u, sys\n"
             f"l = m.SourceFileLoader('lp', {me!r}); s = u.spec_from_loader('lp', l)\n"
             "x = u.module_from_spec(s); l.exec_module(x)\n"
             "print(x.route('@grok hi')[0], x.route('hi @Claude and @grok')[0], x.route('@all go')[0],"
-            " bool(x.route('@bob hi')[1]), x.route('no mention')[0] == ['all'], x.MENTION.findall('mail a@grok.com') == [])")
+            " bool(x.route('@bob hi')[1]), x.route('no mention')[0] == ['all'], x.MENTION.findall('mail a@grok.com') == [],"
+            " x.route('-grok hello')[0], x.route('hi @Claude and @grok -claude')[0],"
+            " x.route('@all -grok go')[0], bool(x.route('re-run it -rf')[0] == ['all']),"
+            " x.route('@grok -grok hi')[1])")
     r = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True, timeout=30)
-    check("chat box routing (@seat, several, @all, unknown, no @ = all, not emails)",
-          r.stdout.strip() == "['grok'] ['claude', 'grok'] ['all'] True True True", r.stdout + r.stderr)
+    check("chat box routing (@seat, several, @all, unknown, no @ = all, not emails, -seat drops)",
+          r.stdout.strip() == "['grok'] ['claude', 'grok'] ['all'] True True True "
+          "['all', '-grok'] ['claude', 'grok', '-claude'] ['all', '-grok'] True "
+          "-grok leaves nobody to send to", r.stdout + r.stderr)
     run(["send", "claude", "for claude"], "grok")
     r = run(["hook", "--source", "claude", "--event", "UserPromptSubmit"], "claude", '{"prompt": "hi"}')
     check("Claude gets notes with the owner's prompt", "for claude" in r.stdout, r.stdout + r.stderr)
