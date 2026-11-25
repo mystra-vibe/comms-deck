@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- **The deck look.** On a screen 150 columns or wider the chat is now a
+  dashboard (the owner, after Argona's video): a strip of big numbers
+  along the top (seats, working, notes today, waiting, context, cost,
+  version), numbered panels in frames with corner brackets and an accent
+  each (01 CREW, 02 ACTIVITY, 03 USAGE, 04 LIVE NOTES, 05 TASKS,
+  06 CONTEXT SPLIT, 07 ALERTS), and a ticker of the latest notes along the
+  bottom. Every panel keeps its old content; 01 CREW is new: a braille
+  graph, each seat a cluster sized by its context, notes as links with a
+  dot running along the newest. The ticker shows private notes as
+  "(private)" and redacts names (vibe's #87 review). Narrower screens, or
+  COMMS_DECK_OLD_LOOK=1, keep the old layout. By Claude.
 - **The context split computes once per frame.** Both chat panels asked
   `context_split()` every redraw; the answer is now cached on the usage
   files' names, sizes and mtimes, so a frame costs a stat per file instead

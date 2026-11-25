@@ -3849,6 +3849,279 @@ def deck_header(cols):
     return out
 
 
+# -----------------------------------------------------------------------------
+# The deck look: the chat screen as a dashboard (the owner, 2026-11-25)
+# -----------------------------------------------------------------------------
+#
+# The owner (07:54) wants comms-deck to look a bit like the dashboard in
+# Argona's video, without losing any of the data the screen shows (08:03).
+# So on a wide screen the chat is drawn as numbered panels, each in a frame
+# with bright corner brackets and its own accent, under a strip of big
+# numbers and over a ticker of the latest notes. Every panel's content comes
+# from the builders the old layout used (usage_panel, activity_panel cut at
+# its headings, notify_lines, chat_lines): only the framing is new, plus
+# 01 CREW, a braille graph of who talks to whom. Under LOOK_MIN_COLS, or with
+# COMMS_DECK_OLD_LOOK=1, the old three-column screen draws instead.
+
+LOOK_MIN_COLS = 150
+LOOK_ACCENT = {"crew": 208, "activity": 45, "notes": 255, "usage": 220,
+               "tasks": 141, "split": 213, "alerts": 203}
+LOOK_BORDER = 238
+_LOOK_DOT = ((0x01, 0x08), (0x02, 0x10), (0x04, 0x20), (0x40, 0x80))
+
+
+def look_frame(num, title, sub, right, accent, w, h, body):
+    """One panel, `w` x `h`: corner brackets in the accent over a dim
+    border, a header line with a numbered badge, then `body` fitted inside."""
+    esc = "\033["
+    iw = max(1, w - 4)
+    a, d = f"{esc}38;5;{accent}m", f"{esc}38;5;{LOOK_BORDER}m"
+    arm = min(3, max(0, (w - 2) // 4))
+    rule = lambda l, r: a + l + "─" * arm + d + "─" * max(0, w - 2 - 2 * arm) + a + "─" * arm + r + f"{esc}0m"
+    head = f"{esc}48;5;{accent};38;5;232;1m {num} {esc}0m {esc}1;38;5;255m{title}{esc}0m"
+    head += f" {esc}2m· {sub}{esc}0m" if sub else ""
+    if right and visible_len(head) + visible_len(right) + 1 <= iw:
+        head += " " * (iw - visible_len(head) - visible_len(right)) + right
+    inner = ([head, ""] + list(body) + [""] * h)[:max(0, h - 2)]
+    return ([rule("┌", "┐")]
+            + [f"{d}│{esc}0m " + fit(line, iw) + f" {d}│{esc}0m" for line in inner]
+            + [rule("└", "┘")])[:h]
+
+
+def look_tag(on, word_on="ACTIVE", word_off="IDLE"):
+    return f"\033[38;5;42m● {word_on}\033[0m" if on else f"\033[2m○ {word_off}\033[0m"
+
+
+def look_stack(panels, w, h):
+    """Panels stacked to fill `h` rows: each is (rows or None, maker); the
+    None ones share what the fixed ones leave. A panel under 3 rows is skipped."""
+    fixed = sum(p for p, _ in panels if p)
+    flex = [i for i, (p, _) in enumerate(panels) if not p]
+    spare = max(0, h - fixed)
+    out = []
+    for i, (p, make) in enumerate(panels):
+        n = p if p else spare // len(flex) + (spare % len(flex) if i == flex[-1] else 0)
+        if n >= 3 and len(out) + n <= h:
+            out += make(w, n)
+    return (out + [" " * w] * h)[:h]
+
+
+def record_stamp(r):
+    """A log record's time as epoch seconds (0 if it has none)."""
+    try:
+        return time.mktime(time.strptime(r["time"][:19], "%Y-%m-%d %H:%M:%S"))
+    except (KeyError, TypeError, ValueError):
+        return 0
+
+
+def look_crew(cols, rows, records, snap, busy, split, now):
+    """01 CREW: each seat a cluster of braille dots in its colour, sized by
+    its share of the context pool and breathing while it works; the notes of
+    the last 30 minutes are links (in the sender's colour for 5 minutes),
+    and a dot runs along each link sent in the last 10. You are the middle."""
+    w, h = cols * 2, rows * 4
+    bits = [[0] * cols for _ in range(rows)]
+    ink = [[None] * cols for _ in range(rows)]
+    text = {}
+
+    def plot(px, py, style):
+        px, py = int(px), int(py)
+        if 0 <= px < w and 0 <= py < h:
+            bits[py // 4][px // 2] |= _LOOK_DOT[py % 4][px % 2]
+            ink[py // 4][px // 2] = style
+
+    def label(px, py, s, style):
+        r = int(py) // 4
+        c = max(0, min(cols - len(s), int(px) // 2 - len(s) // 2))
+        if 0 <= r < rows:
+            for i, ch in enumerate(s):
+                text[(r, c + i)] = (ch, style)
+
+    seats = [s for s in tuple(AGENTS) + APP_SEATS if s not in HIDDEN_SEATS]
+    pos = {}
+    for i, s in enumerate(seats):
+        ang = -math.pi / 2 + 2 * math.pi * i / max(1, len(seats))
+        pos[s] = (w / 2 + math.cos(ang) * w * 0.38, h / 2 + math.sin(ang) * h * 0.34)
+    pos["owner"] = (w / 2, h / 2)
+    tokens = dict(split)
+    biggest = max(tokens.values(), default=1) or 1
+    phase = now / PULSE_EVERY
+    recent = [r for r in records[-300:] if r.get("kind") == "message" and now - record_stamp(r) < 1800]
+    ends = lambda r: [(pos.get(r["from"]), pos.get(t)) for t in (seats if r["to"] == "all" else r["to"].split("+"))]
+    for r in recent:
+        style = f"38;5;{colour(r['from']) if now - record_stamp(r) < 300 else 240}"
+        for a, b in ends(r):
+            if a and b and a != b:
+                n = int(max(abs(b[0] - a[0]), abs(b[1] - a[1])) / 3) + 1
+                for k in range(n + 1):
+                    plot(a[0] + (b[0] - a[0]) * k / n, a[1] + (b[1] - a[1]) * k / n, style)
+    look_crew.moving = False
+    for r in recent:
+        if now - record_stamp(r) > 600:
+            continue
+        look_crew.moving = True
+        t = ((now + int(hashlib.sha256(r["id"].encode()).hexdigest()[:4], 16) / 65536 * 3) % 3) / 3
+        for a, b in ends(r):
+            if a and b and a != b:
+                for dx, dy in ((0, 0), (1, 0), (0, 1), (1, 1)):
+                    plot(a[0] + (b[0] - a[0]) * t + dx, a[1] + (b[1] - a[1]) * t + dy, f"1;38;5;{colour(r['from'])}")
+    for s in seats:
+        cx, cy = pos[s]
+        n = int(14 + 140 * math.sqrt(tokens[s] / biggest)) if tokens.get(s) else 8
+        seed = int(hashlib.sha256(s.encode()).hexdigest(), 16)
+        on = s in busy
+        spread = 3 + min(w, h) * 0.11 * math.sqrt(n / 154)
+        for k in range(n):
+            hh = (seed >> (k % 200)) ^ (k * 2654435761)
+            ang = (hh % 6283) / 1000 + (now * 0.15 if on else 0)
+            rad = (((hh >> 13) % 1000) / 1000) ** 0.6 * spread
+            plot(cx + math.cos(ang) * rad, cy + math.sin(ang) * rad,
+                 breathe_style(colour(s), k + phase) if on else f"38;5;{colour(s)}")
+        state = (snap["seats"].get(s) or {}).get("state", "")
+        dim = state in ("away", "not set up", "no chat yet")
+        label(cx, min(h - 1, cy + spread + 5), f"[{s}{' ●' if on else ''}]",
+              "2;38;5;244" if dim else f"1;38;5;{colour(s)}")
+    label(*pos["owner"], "( YOU )", "1;38;5;255")
+    out = []
+    for r in range(rows):
+        row, cur = "", None
+        for c in range(cols):
+            if (r, c) in text:
+                ch, st = text[(r, c)]
+            elif bits[r][c]:
+                ch, st = chr(0x2800 + bits[r][c]), ink[r][c]
+            else:
+                ch, st = " ", None
+            if st != cur:
+                row += "\033[0m" + (f"\033[{st}m" if st else "")
+                cur = st
+            row += ch
+        out.append(row + "\033[0m")
+    return out
+
+
+_look_counts = {"n": -1, "day": "", "today": 0}
+
+
+def look_header(cols, records, snap, busy, split):
+    """The strip along the top: the deck's name, then big numbers -- seats,
+    working, notes today (the whole log, counted once per new record), waiting,
+    context, estimated cost and the version. Too narrow, stats drop from the right."""
+    esc = "\033["
+    day = time.strftime("%Y-%m-%d")
+    if _look_counts["n"] != len(records) or _look_counts["day"] != day:
+        _look_counts.update(n=len(records), day=day, today=sum(
+            1 for r in records if r.get("kind") == "message" and str(r.get("time", "")).startswith(day)))
+    waiting = sum(len(v) for v in snap["waiting"].values())
+    total = sum(t for _, t in split)
+    cost = 0.0
+    for s in tuple(AGENTS) + APP_SEATS:
+        c = dig((read_json(DATA / "usage" / f"{s}.json", {}) or {}).get("data", {}), "cost", "total_cost_usd")
+        cost += c if isinstance(c, (int, float)) and c > 0 else 0
+    count, _, h = (deck_version() or "?").partition("·")
+    stats = [("SEATS", str(len(AGENTS) + len(APP_SEATS)), f"{len(busy)} working", 255),
+             ("NOTES TODAY", str(_look_counts["today"]), "in the log", 45),
+             ("WAITING", str(waiting), "in inboxes", 203 if waiting else 42),
+             ("CONTEXT", short_tokens(total) if total else "–", f"{len(split)} reporting", 213),
+             ("COST", f"${cost:,.0f}", "est. sessions", 220),
+             ("VERSION", f"v{count}", h, 141)]
+    cells = [(f"{esc}2m{a}{esc}0m", f"{esc}1;38;5;{c}m{b}{esc}0m", f"{esc}2m{s}{esc}0m",
+              max(len(a), len(b), len(s)) + 4) for a, b, s, c in stats]
+    left = [f"{esc}48;5;208;38;5;232;1m  COMMS-DECK    {esc}0m  {esc}1;38;5;255mSTARSHIP CREW · LIVE ON {MACHINE.upper()}{esc}0m",
+            f"{esc}48;5;208;38;5;232m  starship crew  {esc}0m  {esc}2mnotes · seats · context · usage · tasks{esc}0m",
+            ""]
+    while cells and max(visible_len(l) for l in left) + sum(c[3] for c in cells) + 1 > cols:
+        cells = cells[:-1]
+    rows = []
+    for i in range(3):
+        right = "".join(fit(c[i], c[3]) for c in cells)
+        rows.append(fit(left[i] + " " * max(1, cols - visible_len(left[i]) - visible_len(right)) + right, cols))
+    return rows
+
+
+def look_ticker(cols, records, now):
+    """The latest notes scrolling right to left along the bottom. A private
+    note shows as '(private)', and names in the rest are redacted: the
+    screen gets recorded for sim-deck (vibe, #87)."""
+    esc = "\033["
+    items = []
+    for r in [r for r in records[-60:] if r.get("kind") == "message"][-10:][::-1]:
+        text = "(private)" if r.get("private") else redact(" ".join(str(r.get("text", "")).split()))[:70]
+        to = "everyone" if r["to"] == "all" else r["to"].replace("+", ", ")
+        items.append((r["from"], f"{r['from']} → {to}: {text}"))
+    if not items:
+        return " " * cols
+    plain = "".join(f"  ▪  {s}" for _, s in items)
+    off = int(now * 8) % len(plain)
+    out = (plain * (2 + cols // len(plain)))[off:off + cols]
+    for seat in {s for s, _ in items}:
+        out = out.replace(f"▪  {seat} →", f"{esc}38;5;208m▪{esc}0m  {esc}1;38;5;{colour(seat)}m{seat}{esc}0;2m →")
+    return f"{esc}2m" + fit(out, cols)
+
+
+def look_activity_parts(lines):
+    """activity_panel draws ACTIVITY, TASKS and CONTEXT SPLIT in one column:
+    cut it at those headings, so each gets its own frame."""
+    parts, name = {"activity": [], "tasks": [], "split": []}, "activity"
+    heads = {"ACTIVITY": "activity", "TASKS": "tasks", "CONTEXT SPLIT": "split"}
+    for line in lines:
+        plain = ANSI.sub("", line).strip()
+        if plain in heads:
+            name = heads[plain]
+            continue
+        parts[name].append(line)
+    blank = lambda l: not ANSI.sub("", l).strip()
+    for k, v in parts.items():
+        while v and blank(v[0]):
+            v.pop(0)
+        while v and blank(v[-1]):
+            v.pop()
+    return parts
+
+
+def look_widths(cols):
+    """(left, centre, right) column widths for the look."""
+    side = max(40, min(64, int(cols * 0.27)))
+    return side, cols - 2 * side, side
+
+
+def look_screen(cols, body_h, shown, records, now):
+    """The look's lines: the strip (3 rows), `body_h` rows of panels, the ticker.
+    `shown` is the chat's own wrapped note lines (chat_lines at the centre's inner width)."""
+    snap = panel_scans()
+    busy = busy_seats(snap)
+    split = context_split()
+    lw, cw, rw = look_widths(cols)
+    usage = usage_panel(lw - 4)[2:]  # its own USAGE heading is in the frame now
+    left = look_stack([
+        (max(10, int(body_h * 0.45)), lambda w, h: look_frame(
+            "01", "CREW", "who talks to whom", look_tag(bool(busy), f"{len(busy)} WORKING"),
+            LOOK_ACCENT["crew"], w, h, look_crew(w - 4, h - 4, records, snap, busy, split, now))),
+        (None, lambda w, h: look_frame("03", "USAGE", "context · limits · cost", "",
+                                       LOOK_ACCENT["usage"], w, h, fit_column(usage, h - 4))),
+    ], lw, body_h)
+    alerts = [l for l in notify_lines(cw - 4) if ANSI.sub("", l).strip()][:6]
+    centre_panels = [(None, lambda w, h: look_frame(
+        "04", "LIVE NOTES", "the crew's notes, newest last", "\033[38;5;42m● LIVE\033[0m",
+        LOOK_ACCENT["notes"], w, h, ([""] * h + shown)[-(h - 4):]))]
+    if alerts:
+        centre_panels.append((len(alerts) + 4, lambda w, h: look_frame(
+            "07", "ALERTS", "desktop notifications", "", LOOK_ACCENT["alerts"], w, h, alerts)))
+    centre = look_stack(centre_panels, cw, body_h)
+    parts = look_activity_parts(activity_panel(rw - 4))
+    right_panels = [(len(parts["activity"]) + 4, lambda w, h: look_frame(
+        "02", "ACTIVITY", "ready order", look_tag(bool(busy)), LOOK_ACCENT["activity"], w, h, parts["activity"]))]
+    if parts["tasks"]:
+        right_panels.append((len(parts["tasks"]) + 4, lambda w, h: look_frame(
+            "05", "TASKS", "one task, one holder", "", LOOK_ACCENT["tasks"], w, h, parts["tasks"])))
+    right_panels.append((None, lambda w, h: look_frame(
+        "06", "CONTEXT SPLIT", "the shared pool", look_tag(bool(busy), "GLOWING", "STILL"),
+        LOOK_ACCENT["split"], w, h, fit_column(parts["split"], h - 4))))
+    right = look_stack(right_panels, rw, body_h)
+    body = [fit(left[i], lw) + fit(centre[i], cw) + fit(right[i], rw) for i in range(body_h)]
+    return look_header(cols, records, snap, busy, split) + body + [look_ticker(cols, records, now)]
+
+
 def chat(history=200, hide_private=False):
     """Full-screen live view: notes on the left, usage on the right, status at the bottom."""
     path = DATA / "log.jsonl"
@@ -3947,7 +4220,11 @@ def chat(history=200, hide_private=False):
         try:
             while True:
                 cols, rows = shutil.get_terminal_size((100, 40))
-                if cols >= 126:  # three columns: usage left, chat middle, the ready order right (the owner, 02:27)
+                look = cols >= LOOK_MIN_COLS and not setting("OLD_LOOK")
+                if look:  # the deck look: notes in the centre frame (the owner, 2026-11-25)
+                    usage_w = panel_w = 0
+                    chat_w = look_widths(cols)[1] - 4
+                elif cols >= 126:  # three columns: usage left, chat middle, the ready order right (the owner, 02:27)
                     usage_w = max(34, min(46, cols // 4))
                     panel_w = max(38, min(52, cols // 3))
                     chat_w = cols - usage_w - panel_w - 6
@@ -3994,10 +4271,20 @@ def chat(history=200, hide_private=False):
                 # /proc and the inboxes. Quiet screens keep the old pace --
                 # 0.25 s polls, 1-2 s redraws. (#66, devin: a live ms
                 # countdown redraws at 10 fps, between the two.)
-                animating = getattr(usage_panel, "running", False)
+                animating = getattr(usage_panel, "running", False) or (look and getattr(look_crew, "moving", False))
                 gap = 1 / 120 if animating else (0.1 if getattr(activity_panel, "fast", False)
                                                  else 1 if getattr(activity_panel, "ticking", False) else 2)
-                if changed or time.time() - last_draw >= gap:
+                if look:
+                    gap = max(gap, 1 / 15)  # a look frame costs tens of ms: 15 fps, not 120
+                if look and (changed or time.time() - last_draw >= gap):
+                    body = rows - 4 - (1 if tty else 0)  # the strip (3), the ticker, the chat box
+                    screen = ["\033[H", "\n".join(look_screen(cols, body, shown, records, time.time()))]
+                    if tty:
+                        screen.append(f"\n\033[48;5;234m{fit(input_line(cols), cols)}")
+                    out.write("".join(screen))
+                    out.flush()
+                    last_draw = time.time()
+                elif changed or time.time() - last_draw >= gap:
                     # A fixed top bar (the version, 04:26), the notes, then
                     # the chat box as the last line.
                     body = rows - (2 if tty else 1)  # top bar + (the chat box | just the bar)
@@ -6594,6 +6881,29 @@ def self_test():
     check("a remote seat reads away, and a missing file isn't a message",
           r.stdout.strip() == "away None", r.stdout + r.stderr)
 
+    # The deck look (the owner, 2026-11-25): every row exactly the screen's
+    # width, the old panels' data still there, and the ticker never shows a
+    # private note's text.
+    code = "\n".join([
+        "import importlib.machinery as m, importlib.util as u, time",
+        f"l = m.SourceFileLoader('lk', {me!r}); s = u.spec_from_loader('lk', l)",
+        "x = u.module_from_spec(s); l.exec_module(x)",
+        "recs = [{'kind': 'message', 'id': '1-a', 'from': 'grok', 'to': 'claude', 'time': x.now(), 'text': 'public hello', 'private': False},",
+        "        {'kind': 'message', 'id': '2-b', 'from': 'claude', 'to': 'owner', 'time': x.now(), 'text': 'the secret plan', 'private': True}]",
+        "shown = [l for r in recs for l in x.chat_lines(r, x.look_widths(200)[1] - 4)]",
+        "for cols in (150, 200, 260):",
+        "    out = x.look_screen(cols, 40, shown, recs, time.time())",
+        "    assert len(out) == 44 and {x.visible_len(l) for l in out} == {cols}, (cols, len(out), {x.visible_len(l) for l in out})",
+        "plain = '\\n'.join(x.ANSI.sub('', l) for l in x.look_screen(200, 40, shown, recs, time.time()))",
+        "for want in ('01 ', 'CREW', 'ACTIVITY', 'LIVE NOTES', 'USAGE', 'CONTEXT SPLIT', 'NOTES TODAY', 'public hello'):",
+        "    assert want in plain, want",
+        "tick = x.ANSI.sub('', x.look_ticker(400, recs, 0))",
+        "assert '(private)' in tick and 'secret plan' not in tick and 'public hello' in tick, tick",
+        "print('look ok')",
+    ])
+    r = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True, timeout=60)
+    check("the deck look fills the screen exactly, keeps the panels, and hides private notes in the ticker",
+          r.returncode == 0 and "look ok" in r.stdout, r.stdout + r.stderr)
     body = Path(tmp) / "pr-body.txt"
     body.write_text("Written by: Grok\nReviewed by: Claude\n")
     r = run(["review-check", "--file", str(body)], "grok")
