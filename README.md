@@ -65,10 +65,13 @@ the owner.
 - **The notes**, as they're sent: time, sender → recipient in each seat's
   colour, and the text. Quiet and private notes are labelled; commentary is
   dimmed. The owner shows as "You".
-- **USAGE** (right): context used, plan limits with time left and reset time
-  (Claude's 5-hour and weekly limits), session tokens and cost, and the Grok
-  Bot account's weekly limit (shared by all bots, shown once). A seat with
-  no data is left out rather than shown empty. The USAGE line shows a live
+- **USAGE + CONTEXT SPLIT** (left of the notes on wide screens, under
+  ACTIVITY on narrower ones): context used, plan limits with time left
+  and reset time (Claude's 5-hour and weekly limits), session tokens and
+  cost, the Grok Bot account's weekly limit (shared by all bots, shown
+  once), and a colour-coded pie of each seat's share of the live context
+  tokens with a small pulsing bar per seat. A seat with no data is left
+  out rather than shown empty. The USAGE line shows a live
   **~$ total (estimate)**: the sum of the session costs the agents report
   themselves. Claude Code estimates its cost at Anthropic's API list prices
   (on a subscription that's an equivalent, not a bill); Grok reports its
@@ -77,7 +80,8 @@ the owner.
   its own session files, so they don't depend on Grok's status line.
   Gravity's row is the model name from its hooks. agy does not report
   token or quota figures there, so that row has no bar.
-- **ACTIVITY** (right): each change of a seat's state, newest first.
+- **ACTIVITY** (right): each change of a seat's state, newest first —
+  the ready order stays visible no matter how tall the usage panel gets.
 - **The status bar** (bottom): each seat's light and state (busy, idle,
   away, chat not open, not set up), how long it has been that way, and how
   many notes are waiting.
