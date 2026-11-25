@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- **The ready order has its own column again.** The chat screen is three
+  columns on a wide terminal: USAGE, the bars and the CONTEXT SPLIT on
+  the left, the chat in the middle, and the ACTIVITY panel -- the active
+  agents, the ready order, the marks and the waiting squares -- on the
+  right, so the pie no longer pushes it off the bottom. On a narrow
+  terminal the ready order keeps the single right-hand column and the
+  usage column yields. The chat is unchanged, and the activity words
+  still don't animate. By Vibe, on the owner's ask.
 - **Fresh code after a merge.** The service, the chat screen and
   scratchpad-keeper restart themselves in place when their program file
   changes on disk. They wait 3 seconds for the write to finish and check
