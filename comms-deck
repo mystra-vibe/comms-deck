@@ -3409,8 +3409,10 @@ def telemetry_record(seat, record):
     model = dig(d, "model", "display_name") or dig(d, "model", "id")
     program = AGENTS.get(seat) or APP_PROCESS.get(seat)  # what the seat runs as: names a provider with no file yet
     allocation = []
-    for key, rl in sorted((dig(d, "rate_limits") or {}).items()):
-        used = _num((rl or {}).get("used_percentage"))
+    limits = dig(d, "rate_limits")
+    for key, rl in sorted((limits if isinstance(limits, dict) else {}).items()):
+        rl = rl if isinstance(rl, dict) else {}  # a malformed window is skipped, not a crash (vibe's #91 nit)
+        used = _num(rl.get("used_percentage"))
         if used is None:
             continue
         window = {"five_hour": "5h", "seven_day": "wk"}.get(key, key)
@@ -6815,7 +6817,9 @@ def self_test():
         "assert tm['claude']['spend'] == {'session_usd': None, 'cumulative_usd': None, 'kind': None}, 'no cost reported: None, not 0'",
         "assert all(v is None for r in tm.values() if not r['available'] for v in r['tokens'].values()), 'unavailable never reads as zero'",
         "x.write_json(pc / 'usage' / 'newbot.json', {'time': 5, 'source': 'acme', 'data': {'cost': {'total_cost_usd': 0.0}}})",
+        "x.write_json(pc / 'usage' / 'oddbot.json', {'time': 5, 'source': 'acme', 'data': {'rate_limits': {'five_hour': 'soon', 'x': 3}}})",
         "tm = {r['seat']: r for r in x.telemetry()}",
+        "assert tm['oddbot']['allocation'] == [] and not tm['oddbot']['available'], 'malformed limits are skipped'",
         "assert tm['newbot']['provider'] == 'acme' and tm['newbot']['connected'] is False, 'an unregistered usage file still shows'",
         "assert tm['newbot']['available'] and tm['newbot']['spend']['session_usd'] == 0.0, 'a real zero stays a zero'",
         "x.write_json(pc / 'usage' / 'grok.json', {'time': 9, 'source': 'grok', 'data': {'context_window': {'session_input_tokens': 7, 'session_output_tokens': 3}, 'cost': {'total_cost_usd': 0.5}}})",
