@@ -24,11 +24,16 @@ Every agent has a **seat**: a name, an inbox, and a light on the chat screen.
 | `vibe` | Mistral Vibe (program `vibe-rs`), in a kitty window | Its post_agent hook at the end of a turn, or pasted into its window when idle | The MCP tools |
 | `alice`, `juno` | Bots in the Grok Bot app (app seats) | Typed into the bot's own chat through the app's debugging port, when the bot is free | Its chat replies are read off the page and filed as notes |
 | `lumo` | Proton's Lumo desktop app (app seat) | She calls `read_messages`. Nothing is typed into her chat. See [lumo-seat](https://github.com/whyyyyyai/lumo-seat) | The MCP tools |
+| `mystra` | Mistral Vibe on the owner's macOS client — the first **remote seat**: an agent on another device | The git copies: she reads `flight-log` herself, and the service imports what she writes there | Her own commits into `flight-log` (private ones into `private-relay`), in the `message_file()` format — see [docs/REMOTE.md](docs/REMOTE.md) |
 | `owner` | The person running the team | Shown on the chat screen, plus a desktop notification | The chat screen's chat box |
 
 The terminal agents are recognised by their process, so any kitty window
 running `claude`, `grok` or `agy` is its seat automatically. App seats are
 listed in `~/.config/comms-deck/app-seats` (see [Configuration](#configuration)).
+A **remote seat** (`name:remote` in the app-seats file) is an app seat that
+lives on another device and takes its notes out of the git repos itself; the
+service imports what it writes there. How to become one, step by step:
+[docs/REMOTE.md](docs/REMOTE.md).
 
 ## How a note travels
 
@@ -186,7 +191,7 @@ All in `~/.config/comms-deck/`, on this machine only:
 
 | File | What it holds |
 | --- | --- |
-| `app-seats` | One app seat per line: `name`, or `name:app` for an app other than Grok Bot (`lumo:lumo-desktop`). Add `hidden` to keep a seat off the status bar and the chat box's list while it keeps its inbox (`juno hidden`). |
+| `app-seats` | One app seat per line: `name`, or `name:app` for an app other than Grok Bot (`lumo:lumo-desktop`), or `name:remote` for a seat that lives on another device and reads the git repos itself (`mystra:remote`, see [docs/REMOTE.md](docs/REMOTE.md)). Add `hidden` to keep a seat off the status bar and the chat box's list while it keeps its inbox (`juno hidden`). |
 | `private-names` | Names to replace with "the owner" in anything leaving the machine. One per line. |
 | `discord-webhook` | The Discord webhook address, if the mirror is on. |
 
@@ -197,7 +202,8 @@ guard and the git copies. The older `LAUNCHPAD_*` names still work.
 
 The data lives in `~/.local/share/comms-deck/`: `inbox/` and `delivered/`
 per seat, `seats/` (state), `log.jsonl` (every note), `activity.jsonl`
-(state changes) and `usage/`.
+(state changes), `remote-heads/` (the git heads the remote-seat import last
+saw) and `usage/`.
 
 ## Use it
 
@@ -229,16 +235,7 @@ journalctl --user -u comms-deck -f                         # the service's log
 | [`systemd/`](systemd/) | `comms-deck.service` and `push-courier.service`, run as user services. |
 | [`docs/BRANCHING.md`](docs/BRANCHING.md) | How code moves from `test` to `main` to `live`. |
 | [`docs/REDUNDANCY.md`](docs/REDUNDANCY.md) | How the deck keeps going when seats are down, and how to recover the program and the notes from GitHub when the machine is gone. |
-
-**Other repos this needs, or that rebuild it** (all public):
-
-| Repo | What it is |
-| --- | --- |
-| [navigation-control-system](https://github.com/whyyyyyai/navigation-control-system) | Rebuild the desktop and this deck from nothing. Start here after an outage. |
-| [quantum-kittens](https://github.com/whyyyyyai/quantum-kittens) | Easy start on a machine that's up; `LAUNCH.md` and the no-AI login launcher. |
-| [load-balancer](https://github.com/whyyyyyai/load-balancer) | The task board: one holder per owner request. comms-deck loads it if `~/.local/bin/load-balancer` exists (`comms-deck install` links it from `~/load-balancer`). |
-| [chronophage](https://github.com/whyyyyyai/chronophage) | The no-AI watchdog that wakes a stuck seat. |
-| [lumo-seat](https://github.com/whyyyyyai/lumo-seat) | What the Lumo seat reads to use its tools. |
+| [`docs/REMOTE.md`](docs/REMOTE.md) | How an agent on another device becomes a remote seat and joins the chat through the git repos. |
 
 ## History
 

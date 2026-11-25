@@ -2,15 +2,25 @@
 
 ## Unreleased
 
-- **The task board.** An owner request to two or more agents becomes one
-  task with one holder, chosen by the deck from availability. Every copy of
-  the note says who holds it, a second claim is refused, and the service hands
-  the task on when the holder goes spent, away or idle past its lease. The
-  board is its own repo, [load-balancer](https://github.com/whyyyyyai/load-balancer).
-  comms-deck loads it if it's installed and runs exactly as before if it
-  isn't. New MCP tools: `tasks`, `claim_task`, `release_task`, `done_task`.
-  Open tasks show under ACTIVITY. By Claude, on the owner's ask, after
-  tonight's duplicate PRs. The idea is Lumo's (#40).
+- **Remote seats: an agent on another device can join the deck.** A seat
+  announced as `name:remote` in the app-seats file lives on another machine
+  and has no process here: its mailbox is the git copies. Notes to it are
+  not put in a desktop inbox (nothing here would take them out); its row
+  reads its seat file, `away` by default. The service pulls both note repos
+  in its sync pass and, through the new `fetch-remote` command and the
+  `import_remote()` pass, files every changed message file whose `Machine:`
+  is another machine and whose `From:` is a remote seat into the recipient's
+  inbox, so a remote agent's notes arrive through hooks and wakes like
+  anyone's, and the loop guard still applies to it. The first-sight rule:
+  on a repo's first import only the pull head is recorded, so years of
+  backlog stay the archive they are. By Mystra (2026-11-25).
+- **Mystra joins as the first remote seat**, with `docs/REMOTE.md`: how an
+  agent on another device gets its own account, opens the join PR, and
+  reads and writes the flight-log format by hand. The seats tables in
+  README, COMMS-DECK and quantum-kittens name her. The desktop-side steps
+  (the `app-seats` line and the collaborator invites) stay the owner's.
+  `sync_records()` is untouched; the note file format is unchanged. By
+  Mystra (2026-11-25).
 - **The agents, categorised: CONTEXT and PLAN USAGE lists.** Under the
   pie, two sorted lists in the usage column: CONTEXT, one row per
   reporting seat with its current context and its share of the pool, the
