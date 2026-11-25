@@ -20,6 +20,9 @@
   comms-deck spent <seat> <+166h|06:20|YYYY-MM-DD HH:MM|clear>
                                                          show a seat spent, counting down to its reset
   comms-deck review-check <PR#>                          fail unless another seat reviewed it
+  comms-deck fetch-remote                                import the notes remote seats wrote to the git repos
+  comms-deck kitten [--all|<seat>]                       one small shared kitten, by date (changes nothing)
+                                                         (the service does this itself; this is the manual run)
 """
 
 # =============================================================================
@@ -445,6 +448,12 @@ def app_seat_state(seat):
     'connected' if a comms-deck MCP server is running for this seat,
     'not connected' if the Grok Bot app is open without one, 'away' if closed."""
     state = read_json(seat_file(seat), {}) or {}
+    if APP_PROCESS.get(seat, "grok-bot") == "remote":
+        # A remote seat (docs/REMOTE.md) is an agent on another device that
+        # takes its own notes out of the git copies. Nothing on this machine
+        # runs its process or its MCP server, so we can't watch it busy:
+        # its seat file's last word wins, and the default is away.
+        return state.get("state") or "away"
     seen = float(state.get("app_seen") or 0)
     if time.time() - seen < 15 and state.get("state") in (
             "busy", "idle", "away", "not connected", "chat not open", "no chat yet", "draft in box"):
@@ -2408,6 +2417,100 @@ def post_discord():
     return 0
 
 
+def parse_message_file(path):
+    """Read one flight-log message file (the format `message_file()` writes)
+    back into a note record. Returns None if the file isn't a message."""
+    try:
+        body = path.read_text()
+    except OSError:
+        return None
+    head, _, text = body.partition("\n\n")
+    if not text:
+        return None
+    fields = {}
+    for line in head.splitlines():
+        name, _, value = line.partition(":")
+        if name.strip() and _:
+            fields[name.strip().lower()] = value.strip()
+    if not (fields.get("from") and fields.get("to") and fields.get("id")):
+        return None
+    return {"kind": "message", "id": fields["id"], "from": fields["from"].lower(),
+            "to": fields["to"], "time": fields.get("time", ""),
+            "machine": fields.get("machine", "(unknown)"),
+            "quiet": fields.get("quiet") == "yes",
+            "private": fields.get("visibility") == "private",
+            "text": text.rstrip("\n")}
+
+
+def import_remote():
+    """Deliver the notes that remote seats wrote to the git repos from their
+    own machines, so they arrive like any other note.
+
+    A remote seat (`name:remote` in ~/.config/comms-deck/app-seats, see
+    docs/REMOTE.md) joins from another device: it reads the flight-log and
+    writes its replies there itself, in `message_file()`'s format. This
+    closes the loop. It runs in the service's sync pass next to
+    `sync_records()`: each repo is pulled, and every message file that
+    changed and came from a remote seat on another machine is handed to the
+    normal path (the inbox, hooks and wakes, append_log, chat screen). The
+    last-seen head lives in DATA/remote-heads/, so on a first sight the old
+    backlog stays the archive it is, and a note is only ever imported when
+    its own file changed.
+    """
+    remote = [s for s, app in APP_PROCESS.items() if app == "remote"]
+    if not remote:
+        return
+    for repo in (PUBLIC_REPO, PRIVATE_REPO):
+        if not (repo / ".git").exists():
+            continue
+        marker = DATA / "remote-heads" / f"{repo.name}.json"
+        try:
+            git(repo, "pull", "--rebase", "--autostash", "-q")
+            current = git(repo, "rev-parse", "HEAD").strip()
+        except (RuntimeError, OSError, subprocess.SubprocessError) as error:
+            log(f"couldn't pull {repo.name} for the remote seats (will retry): {error}")
+            continue
+        last = (read_json(marker, {}) or {}).get("head")
+        if not last:
+            write_json(marker, {"head": current})
+            continue
+        if last == current:
+            continue
+        try:
+            names = git(repo, "diff", "--name-only", last, current).split()
+        except (RuntimeError, OSError, subprocess.SubprocessError) as error:
+            log(f"couldn't compare {repo.name} {last[:7]}..{current[:7]} (will retry): {error}")
+            continue
+        write_json(marker, {"head": current})
+        brought = 0
+        for name in names:
+            path = repo / name
+            if not name.startswith("messages/") or not path.is_file():
+                continue
+            record = parse_message_file(path)
+            if not record or record["from"] not in remote or record["machine"] == MACHINE:
+                continue  # not a message, not from a remote seat, or the deck's own echo
+            if any((DATA / "delivered" / seat / f"{record['id']}.json").exists()
+                   for seat in SEATS):
+                continue  # it was imported and taken once already (a crash after the inbox write)
+            if record["to"] == "all":
+                targets = [s for s in SEATS if s not in (record["from"], "owner")]
+            else:
+                targets = [t for t in record["to"].split("+") if t in SEATS or t == "owner"]
+            if not targets:
+                continue
+            for seat in targets:
+                if seat == "owner":
+                    notify(f"Note from {record['from']}", record["text"])
+                else:
+                    write_json(DATA / "inbox" / seat / f"{record['id']}.json", record)
+            append_log(record)
+            queue_actions(record)
+            brought += 1
+        if brought:
+            log(f"imported {brought} note(s) from the remote seats via {repo.name}")
+
+
 # -----------------------------------------------------------------------------
 # SECTION 9: the service, the chat screen and usage
 # -----------------------------------------------------------------------------
@@ -2624,6 +2727,10 @@ def serve():
         if time.time() - last_sync >= SYNC_EVERY:
             last_sync = time.time()
             sync_records()
+            try:
+                import_remote()
+            except Exception as error:  # a remote seat must not stop the service
+                log(f"importing remote seats' notes failed: {error}")
         if time.time() >= discord_wait_until:
             discord_wait_until = time.time() + post_discord()
         time.sleep(1)
@@ -3078,11 +3185,15 @@ def context_pie(split, width, step=None, busy=None):
     colour and glow while in use. Every dot is an equal slice of the context
     pool, so a seat with a quarter of the tokens fills a quarter of the box.
     Seats fill in order, biggest first, left to right and row by row, so
-    each seat is one solid run of colour. A working seat's dots breathe
-    (`busy` is the set of working seats; None makes everything glow, for
-    tests). An idle seat's dots sit still in its colour. Under the box: one
-    legend row per seat, then the total. The name is kept so callers don't
-    change. Returns [] when nobody reports a figure.
+    each seat is one solid run of colour, and the box's glow wave runs
+    straight on through the row break (one phase per dot, the dot's flat
+    index) at the bars' speed. A working seat's dots breathe (`busy` is
+    the set of working seats; None makes everything glow, for tests). An
+    idle seat's dots sit still in its colour. Under the box: one legend
+    row per seat (biggest first, like the box), then the total -- which
+    names the seats when they fit and "N seats" when they don't. The name
+    is kept so callers don't change. Returns [] when nobody reports a
+    figure.
     """
     if not split:
         return []
@@ -3116,13 +3227,19 @@ def context_pie(split, width, step=None, busy=None):
             if busy is not None and seat not in busy:
                 row += f"{esc}38;5;{colour(seat)}m●{esc}0m"   # idle: still
             else:
-                row += f"{esc}{breathe_style(colour(seat), r * 2 + c + fstep)}m●{esc}0m"
+                # one continuous phase, left to right then row by row (the
+                # flat index), so the wave runs straight through the row
+                # break at the bars' speed instead of tilting and resetting
+                row += f"{esc}{breathe_style(colour(seat), r * cols + c + fstep)}m●{esc}0m"
         lines.append(row)
     lines.append("")
+    # the legend follows the box: biggest first, so run and row line up
     lines += [f"{esc}38;5;{colour(seat)}m■{esc}0m {seat:8} {100 * used / total:4.1f}%  {esc}2m{short_tokens(used)}{esc}0m"
-              for seat, used in split]
-    lines.append(f"{esc}1mTotal{esc}0m {short_tokens(total)} across "
-                 f"{esc}2m{' + '.join(seat for seat, _ in split)}{esc}0m")
+              for seat, used in order]
+    names = " + ".join(seat for seat, _ in split)
+    tail = (f"across {names}" if 1 + len(f"Total {short_tokens(total)} across {names}") <= width
+            else f"across {len(split)} seats")  # narrow: don't chop mid-name
+    lines.append(f"{esc}1mTotal{esc}0m {short_tokens(total)} {esc}2m{tail}{esc}0m")
     return lines
 
 
@@ -5426,7 +5543,7 @@ def self_test():
     run(["--from", "owner", "send", "grok", "from the owner"], "owner")
     r = run(["hook", "--source", "grok", "--event", "Stop"], "grok", "{}", {"GROK_HOOK_EVENT": "stop"})
     check("an owner note gets through a paused loop guard", "from the owner" in r.stdout, r.stdout)
-    now = time.time()
+    stamp0 = time.time()
     uhome = Path(tmp) / "usage-home"
     (uhome / "usage").mkdir(parents=True)
     (uhome / "limits").mkdir(parents=True)
@@ -5441,8 +5558,8 @@ def self_test():
         {"seat": "claude", "state": "idle", "time": 1795563600.0},
     ]))
     (uhome / "usage" / "claude.json").write_text(json.dumps(
-        {"data": {"rate_limits": {"five_hour": {"used_percentage": 42, "resets_at": now + 3600}}}}))
-    (uhome / "limits" / "grok.json").write_text(json.dumps({"resets_at": now + 7200, "set_by": "claude", "set_at": now}))
+        {"data": {"rate_limits": {"five_hour": {"used_percentage": 42, "resets_at": stamp0 + 3600}}}}))
+    (uhome / "limits" / "grok.json").write_text(json.dumps({"resets_at": stamp0 + 7200, "set_by": "claude", "set_at": stamp0}))
     r = run(["usage"], "owner", extra={"COMMS_DECK_HOME": str(uhome)})
     check("usage: notes counted, old rows and commentary excluded",
           r.returncode == 0 and "notes: 2 sent (1 quiet, 0 private)" in r.stdout
@@ -5740,7 +5857,28 @@ def self_test():
     check("Vibe's empty composer reads as empty",
           composer_text(vibe_screen.replace("Hello. Check the local directory", "")) == "",
           repr(composer_text(vibe_screen.replace("Hello. Check the local directory", ""))))
-    app_text = render([{"from": "grok", "to": "alice", "time": "2026-11-24 02:50:00", "text": "hi"}], "alice")
+    # A Grok Bot seat reads its mail in chat with no comms-deck tools.
+    # Deterministic: its own config file lists alice, wherever the test runs
+    # (CI's ubuntu has no ~/.config/comms-deck/app-seats).
+    Path(f"{tmp}/app-config").mkdir(parents=True, exist_ok=True)
+    Path(f"{tmp}/app-config/app-seats").write_text("alice\n")
+    code = "\n".join([
+        "import importlib.machinery as m, importlib.util as u",
+        f"l = m.SourceFileLoader('cd', {me!r}); s = u.spec_from_loader('cd', l)",
+        "x = u.module_from_spec(s); l.exec_module(x)",
+        "assert 'alice' in x.APP_SEATS, x.APP_SEATS",
+        "out = x.render([{'from': 'grok', 'to': 'alice', 'time': '2026-11-24 02:50:00', 'text': 'hi'}], 'alice')",
+        "assert 'Reply here in this chat' in out and 'Your reply goes to grok' in out, out",
+        "assert 'send_message' not in out, out",
+        "owner_note = x.render([{'from': 'owner', 'to': 'alice', 'time': '2026-11-24 02:50:00', 'text': 'hi'}], 'alice')",
+        "assert 'Your reply goes to the owner' in owner_note, owner_note",
+        "print('ok')",
+    ])
+    r = subprocess.run([sys.executable, "-c", code],
+                       env=dict(env, COMMS_DECK_HOME=f"{tmp}/app-data", COMMS_DECK_CONFIG=f"{tmp}/app-config"),
+                       capture_output=True, text=True, timeout=30)
+    check("app seats are told to reply in their chat, not with tools",
+          r.returncode == 0 and r.stdout.strip() == "ok", r.stdout + r.stderr)
     run(["hook", "--source", "grok", "--event", "SessionStart"], "grok", "{}", {"GROK_HOOK_EVENT": "session_start"})
     acts = [json.loads(l) for l in Path(f"{tmp}/data/activity.jsonl").read_text().splitlines()]
     check("state changes are written to the activity log",
@@ -5864,8 +6002,6 @@ def self_test():
                     "text": "do the thing"}], "grok")
     check("delivered notes carry their age and a team snapshot, and flag shared work",
           "(0s ago)" in team and "Team at " in team and "more than one agent" in team, team)
-    check("app seats are told to reply in their chat, not with tools",
-          "Reply here in this chat" in app_text and "send_message" not in app_text, app_text)
     check("Grok's Notification hook matches idle_prompt only",
           grok_hooks("comms-deck")["hooks"]["Notification"][0].get("matcher") == "idle_prompt")
     code = "\n".join([
@@ -6078,12 +6214,12 @@ def self_test():
                        capture_output=True, text=True, timeout=30)
     check("OTLP metrics listener fills usage/<seat>.json (JSON and protobuf, delta and cumulative)",
           r.returncode == 0 and r.stdout.strip().splitlines()[-1:] == ["ok"], r.stdout + r.stderr)
-    now = 1_700_000_000
+    fixed_now = 1_700_000_000  # a local, not `now`: the name stays free for the module's clock (see remote_commit)
     code = "\n".join([
         "import importlib.machinery as m, importlib.util as u, json",
         f"l = m.SourceFileLoader('lp', {me!r}); s = u.spec_from_loader('lp', l)",
         "x = u.module_from_spec(s); l.exec_module(x)",
-        f"now = {now}",
+        f"now = {fixed_now}",
         "future, past = now + 3600, now - 3600",
         "full = lambda reset: {'used_percentage': 100, 'resets_at': reset}",
         "assert x.limit_spent({'rate_limits': {'five_hour': full(future)}}, now)",
@@ -6217,7 +6353,9 @@ def self_test():
         "sp = x.context_split(); assert [s for s, _ in sp] == ['claude', 'grok', 'gravity'], sp",
         "assert abs(sp[0][1] - 200000) < 1 and abs(sp[2][1] - 32768) < 1, sp  # the % x size fallback computes too",
         "pl = x.context_pie(sp, 40); pt = ' '.join(x.ANSI.sub('', l) for l in pl)",
-        "assert 'CONTEXT SPLIT' in pt and 'Total' in pt and 'claude + grok + gravity' in pt, pt",
+        "assert 'CONTEXT SPLIT' in pt and 'Total' in pt and 'across 3 seats' in pt, pt  # 40 wide: the name list doesn't fit, count instead",
+        "pw = x.context_pie(sp, 60); ptw = ' '.join(x.ANSI.sub('', l) for l in pw)",
+        "assert 'claude + grok + gravity' in ptw, ptw  # wide enough: the total still names them",
         "assert '67.4%' in pt and '32768' not in pt and '32.8k' in pt and 'codex' not in pt, pt  # shares of the total; no-figure seat left out, not zero",
         "assert x.context_pie([], 40) == [], 'an empty deck draws nothing'",
         # The box of dots (the owner, 06:36): every dot used, each seat's run sized by its share.
@@ -6227,6 +6365,11 @@ def self_test():
         "assert sum(n.values()) == 152 and n['claude'] == 102 and n['grok'] == 33 and n['gravity'] == 17, n",
         "tiny = x.context_pie([['claude', 1e9], ['grok', 1.0]], 40, busy=())",
         "assert f'[38;5;{x.colour(\"grok\")}m●' in ''.join(tiny), 'a reporting seat always gets at least one dot'",
+        "flipped = x.context_pie([['grok', 200], ['claude', 100]], 40, busy=())[7:-1]",
+        "assert x.ANSI.sub('', flipped[0]).strip().startswith('■ grok'), 'the legend follows the box: biggest first'",
+        "one2 = x.context_pie([['claude', 1e18]], 40, step=0)[2:6]",  # one seat: the whole box glows on its hue
+        "cell = lambda row, i: row.split('\\033[')[2 * i + 1]",
+        "assert cell(one2[1], 1) == cell(one2[0], 7), 'the glow wave runs straight through the row break'",
         "(pc / 'usage' / 'claude.json').write_text('{\"time\": 1, \"data\": {\"cost\": {\"total_cost_usd\": \"no\"}}}')",
         "assert [s for s, _ in x.context_split()] == ['grok', 'gravity'], 'garbage data drops out too'",
         "x.write_json(pc / 'usage' / 'grok.json', {'time': 1, 'source': 'test', 'data': {'context_window': {'context_tokens': 294000, 'context_window_size': 262144}}})",
@@ -6363,6 +6506,94 @@ def self_test():
                        capture_output=True, text=True, timeout=30)
     check("scratchpad cells tile flush, including Vibe and the shared bottom right",
           r.returncode == 0 and "layout tiles ok" in r.stdout, r.stdout + r.stderr)
+
+    # --- remote seats (docs/REMOTE.md): join from another device through the git repos ---
+    upstream, rlog = Path(tmp) / "remote-upstream", Path(tmp) / "remote-log"
+    subprocess.run(["git", "init", "-q", "--bare", str(upstream)], capture_output=True, timeout=30)
+    clone = subprocess.run(["git", "clone", "-q", str(upstream), str(rlog)],
+                           capture_output=True, text=True, timeout=30)
+    check("the remote-seat test repos exist", clone.returncode == 0, clone.stderr)
+    remote_config = Path(tmp) / "remote-config"
+    remote_config.mkdir(exist_ok=True)
+    (remote_config / "app-seats").write_text("mystra:remote\n")
+    # PRIVATE_REPO would otherwise fall back to the real ~/private-relay and turn this
+    # hermetic test into a network pull of the owner's repos; point it at a plain dir.
+    remote_env = {"COMMS_DECK_CONFIG": str(remote_config), "COMMS_DECK_PUBLIC_REPO": str(rlog),
+                  "COMMS_DECK_PRIVATE_REPO": str(Path(tmp) / "remote-private")}
+
+    def remote_commit(sender, to, text, box, message):
+        """One commit the way the remote device pushes one: a message file
+        whose Machine header is another machine, in `message_file()`'s format."""
+        stamp = now()
+        nid = f"{time.time_ns()}-{box}-x"
+        rel = Path("messages") / stamp[:10] / f"{stamp[11:].replace(':', '')}-{sender}-to-{to}-{nid}.txt"
+        head = (f"From: {sender}\nTo: {to}\nTime: {stamp}\nMachine: {box}\n"
+                f"Quiet: no\nVisibility: public\nId: {nid}\n\n")
+        (rlog / rel).parent.mkdir(parents=True, exist_ok=True)
+        (rlog / rel).write_text(head + text + "\n")
+        subprocess.run(["git", "-C", str(rlog), "add", "-A"], capture_output=True, timeout=30)
+        return subprocess.run(["git", "-C", str(rlog), "-c", "user.name=remote",
+                               "-c", "user.email=remote@example", "commit", "-qm", message],
+                              capture_output=True, text=True, timeout=30)
+
+    def in_texts(seat):
+        return [json.load(open(p)).get("text", "") for p in Path(f"{tmp}/data/inbox/{seat}").glob("*.json")]
+
+    # the deck's own machine name, so the echo test below can claim it
+    machine_probe = ("import importlib.machinery as m, importlib.util as u, sys\n"
+                     f"l = m.SourceFileLoader('lp', {me!r}); s = u.spec_from_loader('lp', l)\n"
+                     "x = u.module_from_spec(s); l.exec_module(x)\n"
+                     "print(x.MACHINE)")
+    machine = subprocess.run([sys.executable, "-c", machine_probe], env=env,
+                             capture_output=True, text=True, timeout=30).stdout.strip()
+
+    # first sight: one old note is already in the repo, and it is the archive, not news
+    # (earlier tests leave notes in these inboxes, so the check is: nothing is added)
+    pre = {s: {p.name for p in Path(f"{tmp}/data/inbox/{s}").glob("*.json")}
+           for s in ("grok", "claude")}
+    remote_commit("mystra", "grok", "an old hello from the archive", "archive-box", "seed")
+    subprocess.run(["git", "-C", str(rlog), "push", "-q", "-u", "origin", "HEAD"],
+                   capture_output=True, timeout=30)
+    r = run(["fetch-remote"], "claude", extra=remote_env)
+    check("the first fetch imports nothing: the backlog is the archive",
+          r.returncode == 0
+          and all({p.name for p in Path(f"{tmp}/data/inbox/{s}").glob("*.json")} == pre[s]
+                  for s in ("grok", "claude")), r.stdout + r.stderr)
+
+    # one real note, one note for two recipients, the deck's own echo
+    # (its Machine is this machine), and a stranger's note
+    remote_commit("mystra", "grok", "hello grok, from the Mac", "mystra-box", "a note from the Mac")
+    remote_commit("mystra", "claude+owner", "hello claude, from the Mac", "mystra-box", "a note for two")
+    remote_commit("grok", "owner", "the deck's own echo", MACHINE, "an echo")
+    remote_commit("nobody", "grok", "not a seat on this deck", "stranger-box", "a stranger")
+    subprocess.run(["git", "-C", str(rlog), "push", "-q"], capture_output=True, timeout=30)
+    r = run(["fetch-remote"], "claude", extra=remote_env)
+    check("a remote seat's notes arrive like any other note",
+          "hello grok, from the Mac" in in_texts("grok")
+          and "hello claude, from the Mac" in in_texts("claude"), r.stdout + r.stderr)
+    log_text = Path(f"{tmp}/data/log.jsonl").read_text()
+    check("this machine's echo and a stranger's note are refused",
+          "the deck's own echo" not in log_text and "not a seat on this deck" not in log_text, r.stdout + r.stderr)
+    r = run(["fetch-remote"], "claude", extra=remote_env)
+    check("a fetch with nothing new imports nothing twice",
+          in_texts("grok").count("hello grok, from the Mac") == 1, r.stdout + r.stderr)
+
+    # sending to a remote seat: the git copy is her mailbox, no inbox on this machine
+    r = run(["send", "mystra", "welcome on the roster"], "claude", extra=remote_env)
+    check("the deck sends to a remote seat into the git copy, not an inbox",
+          r.returncode == 0 and in_texts("mystra") == []
+          and any(json.load(open(p)).get("to") == "mystra"
+                  for p in Path(f"{tmp}/data/queue/sync").glob("*.json")), r.stdout + r.stderr)
+
+    code = ("import importlib.machinery as m, importlib.util as u, sys\n"
+            f"l = m.SourceFileLoader('lp', {me!r}); s = u.spec_from_loader('lp', l)\n"
+            "x = u.module_from_spec(s); l.exec_module(x)\n"
+            "print(x.app_seat_state('mystra'), x.parse_message_file(x.Path('no-such-file')))")
+    r = subprocess.run([sys.executable, "-c", code], env={**env, **remote_env},
+                       capture_output=True, text=True, timeout=30)
+    check("a remote seat reads away, and a missing file isn't a message",
+          r.stdout.strip() == "away None", r.stdout + r.stderr)
+
     body = Path(tmp) / "pr-body.txt"
     body.write_text("Written by: Grok\nReviewed by: Claude\n")
     r = run(["review-check", "--file", str(body)], "grok")
@@ -6376,6 +6607,24 @@ def self_test():
     body.write_text("Reviewed by: Claude\n")
     r = run(["review-check", "--file", str(body)], "grok")
     check("a review with no author line fails", r.returncode != 0 and "no Written by" in r.stderr, r.stderr)
+    r = run(["kitten"], "grok")
+    again = run(["kitten"], "grok")
+    check("the kitten of the day is one small repeated kitten",
+          r.returncode == 0 and "kitten of the day" in r.stdout
+          and r.stdout == again.stdout, r.stdout + r.stderr)
+    r = run(["kitten", "--all"], "claude")
+    # the team the verb itself sees (this process's seats read the host config,
+    # the test one reads the tmp config - ask the same interpreter the verb ran in)
+    seats_probe = ("import importlib.machinery as m, importlib.util as u\n"
+                   f"l = m.SourceFileLoader('lp', {me!r}); s = u.spec_from_loader('lp', l)\n"
+                   "x = u.module_from_spec(s); l.exec_module(x)\n"
+                   "print(' '.join(list(x.AGENTS) + list(x.APP_SEATS)))")
+    team = tuple(subprocess.run([sys.executable, "-c", seats_probe], env=env,
+                                capture_output=True, text=True, timeout=30).stdout.split())
+    widest = max((len(line) for line in r.stdout.splitlines()), default=0)
+    check("the whole team's kittens fit 80 columns and name every seat",
+          r.returncode == 0 and widest <= 80 and all(seat in r.stdout for seat in team),
+          r.stdout + r.stderr)
     # cite-check: rule 4's gate beside review-check (docs/CITATION.md,
     # Mystra's Wave-1 piece 3). Two independent gates; never one verdict.
     body.write_text("Written by: grok\nReviewed by: claude\ncomms-deck\nREADME.md\n")
@@ -6415,6 +6664,79 @@ def self_test():
     shutil.rmtree(tmp, ignore_errors=True)
     print(f"\n{'all passed' if not failures else f'{len(failures)} failed'}")
     return 1 if failures else 0
+
+
+# -----------------------------------------------------------------------------
+# SECTION 12b: kitten - one small cat, for no reason the program needs
+# -----------------------------------------------------------------------------
+#
+# The deck is called quantum-kittens. This section prints a small one. It is
+# decorative on purpose: it reads no state, sends nothing and changes nothing.
+# Like everything else in here it is plain code, not an AI: sha256 of the
+# date (and the seat's name) picks the face, so everyone on every machine
+# gets the same kitten of the day, and the same kitten can't be unfixed by a
+# random seed. Written by: Mystra (2026-11-25).
+
+
+KITTEN_NAMES = ("Mochi", "Pixel", "Bagel", "Biscuit", "Comet", "Toffee",
+                "Wasabi", "Nimbus", "Pudding", "Ziggy")
+KITTEN_EYES = ("o.o", "^.^", "> <", "0.0", "=.=", "@.@")
+
+def kitten_lines(which):
+    """The lines of one kitten. `which` (a date, or 'seat on date') picks the
+    face, so kitten-of-the-day is one shared kitten on every machine, worked
+    out by sha256 like everything else in here - no randomness, no AI."""
+    seed = int(hashlib.sha256(which.encode()).hexdigest(), 16)
+    eyes = KITTEN_EYES[seed % len(KITTEN_EYES)]
+    mouth = ("^", "w", "o", ".", "~")[seed // len(KITTEN_EYES) % 5]
+    tail = (" ~", " /", " ?", "")[seed // 61 % 4]
+    ears = "/\\_/\\"   # ears: /\_/\
+    return [ears,
+            f"( {eyes} )",
+            f" > {mouth} <" + tail]
+
+
+def kitten_block(name, day):
+    """One kitten plus its seat's name under it, never a truncated name: the
+    block is as wide as the wider of the picture and the name."""
+    picture = kitten_lines(f"{name} on {day}")
+    width = max(max(len(line) for line in picture), len(name))
+    return [line.ljust(width) for line in picture] + [name.center(width)]
+
+
+def kitten_row(blocks):
+    """Blocks side by side, two spaces apart, one flat picture."""
+    height = max(len(block) for block in blocks)
+    widths = [max(len(line) for line in block) for block in blocks]
+    full = [[line.ljust(width) for line in block] + [" " * width] * (height - len(block))
+            for block, width in zip(blocks, widths)]
+    return ["  ".join(parts).rstrip() for parts in zip(*full)]
+
+
+def kitten(name="", everyone=False):
+    """The kitten verb: no argument, the shared kitten of the day; a seat
+    name, that seat's own kitten; --all, the whole team. Pure decoration."""
+    day = now()[:10]
+    header = KITTEN_NAMES[int(hashlib.sha256(day.encode()).hexdigest(), 16) % len(KITTEN_NAMES)]
+    if everyone:
+        lines = [f"the team on {day} - kitten of the day: {header}"]
+        row = []
+        for seat in tuple(AGENTS) + APP_SEATS:
+            block = kitten_block(seat, day)
+            width = max(len(line) for line in block)
+            if row and sum(max(len(line) for line in b) + 2 for b in row) + width > 78:
+                lines += kitten_row(row)
+                row = []
+            row.append(block)
+        if row:
+            lines += kitten_row(row)
+        return "\n".join(lines)
+    if name and name not in SEATS:
+        raise ValueError(f"no seat called {name!r}; seats are: {', '.join(SEATS)},"
+                         " or leave it off for the kitten of the day")
+    picture = kitten_lines(f"{name} on {day}" if name else f"{day}")
+    for_ = f", for {name}" if name else ""
+    return "\n".join(picture + [f"kitten of the day: {header} ({day}{for_})"])
 
 
 # -----------------------------------------------------------------------------
@@ -6559,6 +6881,10 @@ def main():
     p = sub.add_parser("review-check")
     p.add_argument("number", nargs="?", type=int, help="pull request number on this repo")
     p.add_argument("--file", help="check this text instead of fetching the PR")
+    sub.add_parser("fetch-remote", help="import the notes that remote seats wrote to the git repos")
+    p = sub.add_parser("kitten", help="one small ASCII kitten (the deck is called quantum-kittens)")
+    p.add_argument("seat", nargs="?", help="a seat name, for its own kitten")
+    p.add_argument("--all", dest="kitten_all", action="store_true", help="the whole team, one kitten each")
     p = sub.add_parser("cite-check", help="fail unless the PR cites the seat that wrote it (docs/CITATION.md)")
     p.add_argument("number", nargs="?", type=int, help="pull request number on this repo")
     p.add_argument("--file", help="check this text instead of fetching the PR")
@@ -6617,6 +6943,10 @@ def main():
                 print(f"comms-deck: {error}")
         elif args.cmd == "install":
             install(args.yes)
+        elif args.cmd == "fetch-remote":
+            import_remote()
+        elif args.cmd == "kitten":
+            print(kitten((args.seat or "").lower(), args.kitten_all))
         elif args.cmd == "self-test":
             sys.exit(self_test())
         elif args.cmd == "wake":

@@ -7,6 +7,35 @@
   files' names, sizes and mtimes, so a frame costs a stat per file instead
   of re-reading them all — and any usage write still refreshes it at
   once. By Devin.
+- **`comms-deck kitten [--all|<seat>]`** prints one small ASCII cat - the
+  same shared kitten for the day, picked by sha256 of the date (no AI, no
+  randomness): a seat's own kitten by name, the team's in rows that must fit
+  80 columns, and the self-test checks both. By Mystra, on the owner's ask.
+- **Remote seats: an agent on another device can join the deck.** A seat
+  announced as `name:remote` in the app-seats file lives on another machine
+  and has no process here: its mailbox is the git copies. Notes to it are
+  not put in a desktop inbox (nothing here would take them out); its row
+  reads its seat file, `away` by default. The service pulls both note repos
+  in its sync pass and, through the new `fetch-remote` command and the
+  `import_remote()` pass, files every changed message file whose `Machine:`
+  is another machine and whose `From:` is a remote seat into the recipient's
+  inbox, so a remote agent's notes arrive through hooks and wakes like
+  anyone's, and the loop guard still applies to it. The first-sight rule:
+  on a repo's first import only the pull head is recorded, so years of
+  backlog stay the archive they are. By Mystra (2026-11-25).
+- **Mystra joins as the first remote seat**, with `docs/REMOTE.md`: how an
+  agent on another device gets its own account, opens the join PR, and
+  reads and writes the flight-log format by hand. The seats tables in
+  README, COMMS-DECK and quantum-kittens name her. The desktop-side steps
+  (the `app-seats` line and the collaborator invites) stay the owner's.
+  `sync_records()` is untouched; the note file format is unchanged. By
+  Mystra (2026-11-25).
+- **The dot box polished.** The CONTEXT SPLIT box's glow wave now runs
+  straight through the row break instead of tilting and resetting (the
+  phase is the dot's flat index, at the bars' speed), the legend follows
+  the box instead of arrival order, and the total line falls back to
+  "across N seats" when the name list doesn't fit the column instead of
+  being chopped mid-name. From the #82 review. By Vibe.
 - **The context split moves right.** The CONTEXT SPLIT pie and its
   per-seat bars now sit at the foot of the right-hand column, under
   TASKS; the left usage column keeps the per-seat meters and the
