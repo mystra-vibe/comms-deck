@@ -6324,10 +6324,6 @@ def self_test():
     r = run(["cite-check", "--file", str(body), "--strict"], "grok")
     check("strict mode needs a PR number to diff the files",
           r.returncode != 0 and "needs a PR number" in r.stderr, r.stderr)
-    body.write_text("Written by: grok\n")
-    r = run(["cite-check", "--file", str(body), "--strict"], "grok")
-    check("strict mode needs a PR number to diff the files",
-          r.returncode != 0 and "needs a PR number" in r.stderr, r.stderr)
     # (the strict pass case is the stubbed cite_gap check below: files cited
     # in the text, strict mode, no gh call)
     code = "\n".join([
@@ -6335,10 +6331,12 @@ def self_test():
         f"l = m.SourceFileLoader('cd', {me!r}); s = u.spec_from_loader('cd', l)",
         "x = u.module_from_spec(s); l.exec_module(x)",
         # stub the fetch: strict mode compares against the PR's file list
-        "x.pr_files = lambda n: ['comms-deck', 'README.md']",
-        "gap = x.cite_gap('Written by: grok\\n', 99)",
-        "assert gap and 'never cites' in gap and 'comms-deck' in gap, gap",
-        "assert x.cite_gap('Written by: grok\\nPR touches comms-deck, README.md.\\n', 99) is None",
+        "x.pr_files = lambda n: ['comms-deck', 'docs/README.md']",
+        "gap = x.cite_gap('Written by: grok\\nREADME.md\\n', 99)",
+        "assert gap and 'never cites' in gap and 'docs/README.md' in gap, gap",
+        "assert x.cite_gap('Written by: grok\\nPR touches comms-deck, docs/README.md.\\n', 99) is None, 'a sentence-ending period still cites'",
+        "gap = x.cite_gap('Written by: grok\\ndocs/README.md.backup is a different file\\n', 99)",
+        "assert gap and 'docs/README.md' in gap, gap",
         "gap = x.cite_gap('Reviewed by: claude\\n')",
         "assert gap == 'no Written by line naming a seat', gap",
         "assert x.cite_gap('Written by: grok\\nReviewed by: grok\\n') is None, 'cite-check never gates on review-check'",
@@ -6437,7 +6435,12 @@ def cite_gap(text, number=None):
     if not writers:
         return "no Written by line naming a seat"
     if number:
-        missing = [path for path in pr_files(number) if path not in text]
+        # Whole-path match: docs/README.md is not cited by README.md. A
+        # sentence-ending period after the path still counts; a period that
+        # starts another path segment (docs/README.md.backup) does not.
+        cited = lambda path: re.search(r"(?<![\w./-])" + re.escape(path)
+                                       + r"(?=$|[\s,;:)]|\.(?![\w]))", text) is not None
+        missing = [path for path in pr_files(number) if not cited(path)]
         if missing:
             return "files the PR touches that its text never cites: " + ", ".join(missing[:6])
     return None
@@ -6579,9 +6582,9 @@ def main():
                     text = pr_review_text(args.number)
                 else:
                     sys.exit("comms-deck: cite-check needs a PR number or --file")
+                gap = cite_gap(text, args.number if args.strict else None)  # may raise: gh fecthes the file list
             except (OSError, RuntimeError, json.JSONDecodeError, subprocess.SubprocessError) as error:
                 sys.exit(f"comms-deck: {error}")
-            gap = cite_gap(text, args.number if args.strict else None)
             if gap:
                 who = f"PR #{args.number}" if args.number else f"file {args.file}"
                 sys.exit(f"comms-deck: {who}: {gap}")
