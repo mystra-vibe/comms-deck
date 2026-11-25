@@ -7277,6 +7277,7 @@ def self_test():
         "x.APP_PROCESS['remoteseat'] = 'remote'",
         "rr = x.telemetry_record('remoteseat', None)",
         "assert rr['provider'] == 'unknown' and rr['account'] is None, rr",
+        "x.APP_PROCESS.pop('remoteseat')",
         # comms-deck usage <seat>: the full record, honest about gaps
         "dl = x.telemetry_detail(None); assert all(any(l.startswith(r['seat'] + ' ') for l in dl) for r in x.telemetry()), dl",
         "dc = '\\n'.join(x.telemetry_detail('codex'))",
