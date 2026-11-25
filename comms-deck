@@ -5719,7 +5719,28 @@ def self_test():
     check("Vibe's empty composer reads as empty",
           composer_text(vibe_screen.replace("Hello. Check the local directory", "")) == "",
           repr(composer_text(vibe_screen.replace("Hello. Check the local directory", ""))))
-    app_text = render([{"from": "grok", "to": "alice", "time": "2026-11-24 02:50:00", "text": "hi"}], "alice")
+    # A Grok Bot seat reads its mail in chat with no comms-deck tools.
+    # Deterministic: its own config file lists alice, wherever the test runs
+    # (CI's ubuntu has no ~/.config/comms-deck/app-seats).
+    Path(f"{tmp}/app-config").mkdir(parents=True, exist_ok=True)
+    Path(f"{tmp}/app-config/app-seats").write_text("alice\n")
+    code = "\n".join([
+        "import importlib.machinery as m, importlib.util as u",
+        f"l = m.SourceFileLoader('cd', {me!r}); s = u.spec_from_loader('cd', l)",
+        "x = u.module_from_spec(s); l.exec_module(x)",
+        "assert 'alice' in x.APP_SEATS, x.APP_SEATS",
+        "out = x.render([{'from': 'grok', 'to': 'alice', 'time': '2026-11-24 02:50:00', 'text': 'hi'}], 'alice')",
+        "assert 'Reply here in this chat' in out and 'Your reply goes to grok' in out, out",
+        "assert 'send_message' not in out, out",
+        "owner_note = x.render([{'from': 'owner', 'to': 'alice', 'time': '2026-11-24 02:50:00', 'text': 'hi'}], 'alice')",
+        "assert 'Your reply goes to the owner' in owner_note, owner_note",
+        "print('ok')",
+    ])
+    r = subprocess.run([sys.executable, "-c", code],
+                       env=dict(env, COMMS_DECK_HOME=f"{tmp}/app-data", COMMS_DECK_CONFIG=f"{tmp}/app-config"),
+                       capture_output=True, text=True, timeout=30)
+    check("app seats are told to reply in their chat, not with tools",
+          r.returncode == 0 and r.stdout.strip() == "ok", r.stdout + r.stderr)
     run(["hook", "--source", "grok", "--event", "SessionStart"], "grok", "{}", {"GROK_HOOK_EVENT": "session_start"})
     acts = [json.loads(l) for l in Path(f"{tmp}/data/activity.jsonl").read_text().splitlines()]
     check("state changes are written to the activity log",
@@ -5843,8 +5864,6 @@ def self_test():
                     "text": "do the thing"}], "grok")
     check("delivered notes carry their age and a team snapshot, and flag shared work",
           "(0s ago)" in team and "Team at " in team and "more than one agent" in team, team)
-    check("app seats are told to reply in their chat, not with tools",
-          "Reply here in this chat" in app_text and "send_message" not in app_text, app_text)
     check("Grok's Notification hook matches idle_prompt only",
           grok_hooks("comms-deck")["hooks"]["Notification"][0].get("matcher") == "idle_prompt")
     code = "\n".join([
