@@ -3588,14 +3588,16 @@ def _ledger_load(path):
         d = read_json(path, {}) or {} if sig else {}
         entries = d.get("entries") if isinstance(d.get("entries"), dict) else {}
         gens = d.get("gens") if isinstance(d.get("gens"), dict) else {}
-        hit = (sig, {"version": 1, "entries": entries, "gens": gens})
+        dips = d.get("dips") if isinstance(d.get("dips"), dict) else {}
+        hit = (sig, {"version": 1, "entries": entries, "gens": gens, "dips": dips})
         _ledger_cache[str(path)] = hit
-    return {"version": 1, "entries": dict(hit[1]["entries"]), "gens": dict(hit[1]["gens"])}
+    return {"version": 1, "entries": dict(hit[1]["entries"]), "gens": dict(hit[1]["gens"]),
+            "dips": dict(hit[1]["dips"])}
 
 
 def ledger_merge(a, b):
     """Two ledgers as one: every entry from either, each at its higher figure."""
-    out = {"version": 1, "entries": dict(a["entries"]), "gens": dict(a["gens"])}
+    out = {"version": 1, "entries": dict(a["entries"]), "gens": dict(a["gens"]), "dips": dict(a.get("dips", {}))}
     for key, e in b["entries"].items():
         mine = out["entries"].get(key)
         if not isinstance(e, dict) or _num(e.get("usd")) is None:
@@ -3630,14 +3632,29 @@ def ledger_note(seat, record, path=None):
         fcntl.flock(lock, fcntl.LOCK_EX)
         ledger = _ledger_load(path)
         if isinstance(sid, str) and sid:
-            key = f"{seat}|{sid}"
+            key = f"{seat}|{sid}"  # one session, wherever it's seen: machines max-merge into one entry
         else:
-            gen = ledger["gens"].get(seat) or 0
-            open_entry = ledger["entries"].get(f"{seat}|gen-{gen}")
+            # A generation counter is per machine (each starts at 0), so the
+            # key names the machine; else a restored ledger would merge two
+            # machines' different sessions (vibe's review of #102).
+            gseat = f"{seat}@{MACHINE}"
+            gen = ledger["gens"].get(gseat) or 0
+            open_entry = ledger["entries"].get(f"{seat}|{MACHINE}|gen-{gen}")
             if open_entry and cost < (_num(open_entry.get("usd")) or 0) - 0.005:
+                # A drop opens a new session only when the next reading is low
+                # too: one flaky low figure would otherwise count the climb
+                # back twice (vibe's review of #102).
+                held = _num(ledger.setdefault("dips", {}).get(gseat))
+                if held is None:
+                    ledger["dips"][gseat] = cost
+                    write_json(path, ledger)
+                    return False
+                ledger["dips"].pop(gseat, None)
                 gen += 1
-                ledger["gens"][seat] = gen
-            key = f"{seat}|gen-{gen}"
+                ledger["gens"][gseat] = gen
+            elif ledger.get("dips", {}).pop(gseat, None) is not None:
+                write_json(path, ledger)  # the dip didn't hold: it was a blip
+            key = f"{seat}|{MACHINE}|gen-{gen}"
         entry = ledger["entries"].get(key)
         if entry and cost <= (_num(entry.get("usd")) or 0):
             return False
@@ -3660,7 +3677,11 @@ def ledger_sweep():
 
 
 def ledger_seat_total(seat, path=None):
-    """One seat's all-time spend from the ledger, or None if it has no entry."""
+    """One seat's all-time spend from the ledger, or None if it has no entry.
+
+    Cost is per seat, unlike limits (per account): a pool's all-time figure
+    is the sum of its seats' totals, so a second cost reporter joining a
+    pool adds its own sessions and nothing is counted twice."""
     usd = [e["usd"] for k, e in _ledger_load(path or ledger_path())["entries"].items()
            if k.split("|", 1)[0] == seat and isinstance(e, dict) and _num(e.get("usd")) is not None]
     return sum(usd) if usd else None
@@ -7073,7 +7094,11 @@ def self_test():
         "assert x.ledger_note('claude', rec('s2', 0.5)) and x.ledger_total()[:2] == (3.0, True), x.ledger_total()",
         "g = lambda usd: {'time': 1, 'source': 'grok', 'data': {'cost': {'total_cost_usd': usd}}}",
         "x.ledger_note('grok', g(1.0)); x.ledger_note('grok', g(1.5)); x.ledger_note('grok', g(0.25))",
-        "assert abs(x.ledger_total()[0] - 4.75) < 1e-9, 'no session id: a drop opens a new session, the old one stays counted'",
+        "assert abs(x.ledger_total()[0] - 4.5) < 1e-9, 'one low reading is held, not yet a new session'",
+        "x.ledger_note('grok', g(0.3)); assert abs(x.ledger_total()[0] - 4.8) < 1e-9, 'a drop that holds opens a new session; the old one stays counted'",
+        "assert any(k.startswith('grok|' + x.MACHINE + '|gen-1') for k in x._ledger_load(x.ledger_path())['entries']), 'generation keys name the machine'",
+        "x.ledger_note('grok', g(0.01)); x.ledger_note('grok', g(0.4))",
+        "assert abs(x.ledger_total()[0] - 4.9) < 1e-9 and not x._ledger_load(x.ledger_path())['dips'], 'a blip that comes straight back is ignored, no double count'",
         "assert not x.ledger_note('devin', {'time': 1, 'source': 'devin-db', 'data': {}}), 'no cost, no entry'",
         "assert x.ledger_seat_total('claude') == 3.0 and x.ledger_seat_total('devin') is None, 'per seat: a sum, or None when never priced'",
         "assert 'cost-ledger' not in [r['seat'] for r in x.telemetry()], 'the ledger is not a seat'",
