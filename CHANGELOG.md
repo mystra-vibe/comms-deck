@@ -32,6 +32,8 @@ The easy start guide is [quantum-kittens.md](quantum-kittens.md).
 
 ## Unreleased
 
+- **A late check drops to idle.** A seat that only polls (Lumo) shows idle,
+  not stuck and not busy, once her expected check is late. Notes stay queued.
 - **Recovery is written down.** [docs/REDUNDANCY.md](docs/REDUNDANCY.md)
   says what still works when a seat is down, how another agent brings it
   back, and how to recover the program and the pushed notes from GitHub
