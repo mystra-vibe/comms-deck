@@ -3376,7 +3376,7 @@ def telemetry_record(seat, record):
         used = _num(rl.get("used_percentage"))
         if used is None:
             continue
-        window = {"five_hour": "5h", "seven_day": "wk"}.get(key, key)
+        window = {"five_hour": "5h", "seven_day": "wk", "monthly": "mo"}.get(key, key)
         left = _num(rl.get("remaining_percentage"))
         allocation.append({"window": window, "used_pct": float(used),
                            "remaining_pct": float(left if left is not None else max(0.0, 100.0 - used)),
@@ -5193,8 +5193,8 @@ def vibe_usage_from_session():
     can count far more than is really in context (it read 578k of a 262k
     window on 2026-11-25, when Vibe's screen said 17.4k of 202k). The
     window is the one Vibe's UI uses (ui_startup_config.json), else the
-    model catalog's. meta.json names the model. Vibe's free models report
-    no plan limit, so there's no 5-hour or weekly bar. Returns (time, data)
+    model catalog's. meta.json names the model. The monthly usage gauge
+    isn't in these files; refresh_vibe_usage() reads it off the screen. Returns (time, data)
     in the status-line shape, or None if Vibe isn't running.
     """
     if not any(proc_name(int(d.name)) == AGENTS["vibe"] for d in Path("/proc").iterdir() if d.name.isdigit()):
@@ -5225,15 +5225,54 @@ def vibe_usage_from_session():
     return newest.stat().st_mtime, data
 
 
+VIBE_GAUGE = re.compile(r"\busage\s+[\u2580-\u259f ]*?(\d{1,3})%")
+
+
+def vibe_screen_gauge():
+    """The % on Vibe's footer usage bar ("usage ███▏   52% · ctx …"), or None.
+
+    Vibe fetches its monthly usage from Mistral's billing service and only
+    draws it; nothing on disk holds it. So, like refresh_screen_limits(),
+    this reads Vibe's kitty window, but only its last three lines (the
+    footer), so nothing from the conversation is matched or kept.
+    """
+    state = load_seat("vibe")
+    socket, window = state.get("kitty_socket"), state.get("kitty_window")
+    if not socket or not window or state.get("state") == "away":
+        return None
+    try:
+        screen = kitty(socket, "get-text", "--match", f"id:{window}")
+    except (RuntimeError, OSError, subprocess.SubprocessError):
+        return None
+    for line in reversed([l for l in screen.splitlines() if l.strip()][-3:]):
+        m = VIBE_GAUGE.search(line)
+        if m and 0 <= int(m.group(1)) <= 100:
+            return int(m.group(1))
+    return None
+
+
 def refresh_vibe_usage():
-    """Write usage/vibe.json from Vibe's session files when they're newer."""
+    """Write usage/vibe.json from Vibe's session files and its footer gauge.
+
+    The owner (23:01): Vibe's app shows a usage bar, so 03 should too. The
+    gauge is the monthly allowance, stored as rate_limits.monthly with no
+    reset time (the footer doesn't print one). It's rewritten when the
+    session files are newer or the gauge has moved.
+    """
     found = vibe_usage_from_session()
     if not found:
         return
     when, data = found
     current = read_json(DATA / "usage" / "vibe.json", {}) or {}
-    if when > float(current.get("time") or 0):
-        write_json(DATA / "usage" / "vibe.json", {"time": when, "source": "vibe-session", "data": data})
+    gauge = vibe_screen_gauge()
+    if gauge is None:  # the screen couldn't be read this pass: keep the last reading
+        gauge = dig(current, "data", "rate_limits", "monthly", "used_percentage")
+    if isinstance(gauge, (int, float)):
+        data["rate_limits"] = {"monthly": {"used_percentage": gauge}}
+    moved = gauge != dig(current, "data", "rate_limits", "monthly", "used_percentage")
+    if when > float(current.get("time") or 0) or moved:
+        write_json(DATA / "usage" / "vibe.json",
+                   {"time": max(when, time.time() if moved else 0), "source": "vibe-session", "data": data})
 
 
 def refresh_grok_usage():
@@ -6844,6 +6883,20 @@ def self_test():
         "assert x.context_percent(vd) == 20.0, vd",  # Vibe's own figure and window win over the breakdown and catalog
         "x.AGENTS['vibe'] = 'no-such-program-xyz'; assert x.vibe_usage_from_session() is None",
         "x.HOME, x.AGENTS['vibe'] = real_home, real_vibe",
+        # Vibe's footer gauge (the owner, 23:01): read off the screen, stored as the monthly window
+        "assert x.VIBE_GAUGE.search('~   usage \u2588\u2588\u2588\u258f   52% \u00b7 ctx 75.6k/202k').group(1) == '52'",
+        "assert x.VIBE_GAUGE.search('the usage was 99% last week') is None, 'prose never reads as the gauge'",
+        "vd0 = x.Path(x.tempfile.mkdtemp()); real_d, real_found, real_gauge = x.DATA, x.vibe_usage_from_session, x.vibe_screen_gauge",
+        "x.DATA = vd0; (vd0 / 'usage').mkdir()",
+        "x.vibe_usage_from_session = lambda: (100.0, {'model': {'display_name': 'GLM'}})",
+        "x.vibe_screen_gauge = lambda: 52; x.refresh_vibe_usage()",
+        "vj = x.read_json(vd0 / 'usage' / 'vibe.json'); assert vj['data']['rate_limits'] == {'monthly': {'used_percentage': 52}}, vj",
+        "vr = [r for r in x.telemetry() if r['seat'] == 'vibe'][0]; assert vr['allocation'][0]['window'] == 'mo' and vr['allocation'][0]['used_pct'] == 52.0, vr",
+        "x.vibe_screen_gauge = lambda: None; x.refresh_vibe_usage()",
+        "assert x.read_json(vd0 / 'usage' / 'vibe.json')['data']['rate_limits']['monthly']['used_percentage'] == 52, 'an unreadable screen keeps the last reading'",
+        "x.vibe_screen_gauge = lambda: 53; x.refresh_vibe_usage()",
+        "assert x.read_json(vd0 / 'usage' / 'vibe.json')['data']['rate_limits']['monthly']['used_percentage'] == 53, 'a moved gauge is rewritten'",
+        "x.DATA, x.vibe_usage_from_session, x.vibe_screen_gauge = real_d, real_found, real_gauge",
         # The context-split pie reads usage/<seat>.json only: counts, never text.
         "pc = x.Path(x.tempfile.mkdtemp()); real_data = x.DATA; x.DATA = pc; (pc / 'usage').mkdir()",
         "for s, d in (('claude', {'context_window': {'context_tokens': 200000, 'context_window_size': 262144}}),"
