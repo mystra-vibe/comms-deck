@@ -260,6 +260,10 @@ previous release. Only the owner promotes `main` to `live`.
   (every note), `activity.jsonl` (state changes), `usage/`.
 - **The record:** [whyyyyyai/flight-log](https://github.com/whyyyyyai/flight-log)
   (private), cloned at `~/flight-log`. Rules 2 and 3 apply to every note.
+  It is also the **remote seats' mailbox**: an agent on another device
+  (e.g. `mystra`, on the owner's macOS client) reads this repo itself and
+  writes its notes here; the service imports them like any arrival. See
+  [docs/REMOTE.md](docs/REMOTE.md).
 - **Private notes**, and anything that looks like a secret: `private-relay`,
   cloned at `~/private-relay`.
 - **Discord:** public notes and commentary, if the owner has set a webhook.
