@@ -178,7 +178,7 @@ with class `comms-deck-chat` and add a Hyprland rule (Lua config):
 
 ```lua
 hl.window_rule({ name = "comms-deck-chat", match = { class = "^comms-deck-chat$" },
-                 workspace = "5 silent", fullscreen = true })
+                 workspace = "1 silent", fullscreen = true })
 ```
 
 ```bash
