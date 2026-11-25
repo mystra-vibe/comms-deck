@@ -3492,21 +3492,29 @@ def chat(history=200, hide_private=False):
                     changed = True
                 if not typed and not in_paste and not pending_esc and fresh_code():
                     raise FreshCode  # nothing half typed: reopen on the new code (after the finally)
-                # The animation clock (04:02): while a bar has something to
-                # shimmer (a busy seat) or a countdown ticks seconds, the
-                # loop wakes every ~4 ms and frames go out on a 120 fps cap
+                # The animation clock (04:02, tuned to devin's review): only
+                # the busy bars' shimmer runs the fast clock -- the loop
+                # wakes every ~4 ms and frames go out on a 120 fps cap
                 # (measured: ~1.4 ms to build a frame cached, so plenty of
-                # headroom; kitty syncs and drops what can't keep up). The
-                # scans sit behind a half-second snapshot, so the fast clock
-                # doesn't hammer /proc and the inboxes. Quiet screens keep
-                # the old pace -- 0.25 s polls, 1-2 s redraws. Bueno.
-                animating = getattr(activity_panel, "ticking", False) or getattr(usage_panel, "running", False)
+                # headroom; kitty syncs and drops what can't keep up). A
+                # ticking countdown (a spent reset, an app seat's next
+                # check) keeps the old 1 s cadence: it changes once a
+                # second, so 120 fps of it would be ~1 core of identical
+                # frames for up to an hour. The scans sit behind a
+                # half-second snapshot, so the fast clock doesn't hammer
+                # /proc and the inboxes. Quiet screens keep the old pace --
+                # 0.25 s polls, 1-2 s redraws.
+                animating = getattr(usage_panel, "running", False)
                 gap = 1 / 120 if animating else (1 if getattr(activity_panel, "ticking", False) else 2)
                 if changed or time.time() - last_draw >= gap:
                     body = rows - (1 if tty else 0)  # the chat box is the last line
                     left = shown[-body:]
                     left = [""] * (body - len(left)) + left
-                    usg = usage_panel(usage_w) if usage_w else []
+                    if usage_w:
+                        usg = usage_panel(usage_w)  # sets usage_panel.running for the clock
+                    else:
+                        usage_panel.running = False  # no usage column: don't let a stale True spin the clock
+                        usg = []
                     act = activity_panel(panel_w) if panel_w else []
                     usg = (usg + [""] * body)[:body]
                     right = (act + [""] * body)[:body]
