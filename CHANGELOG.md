@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- **03 USAGE: three families from one telemetry record.** The renderer
+  half of the 03 redesign (Vibe, against claude/telemetry's pinned shape):
+  ALLOCATION (severity-shaded, tighter window, resets), TOKENS & ACTIVITY
+  (in/out/cache/requests/sessions/active, "—" for a field nobody reports)
+  and FINANCIAL (session_usd, est. where the source prices it itself),
+  then CONNECTED / TELEMETRY UNAVAILABLE with the last update for a seat
+  that reports nothing — shown, never a misleading zero (the brief's
+  rule 5). sort= provider | consumption | spend. Seats sharing an account
+  (the grok-bot bots) are one row via telemetry_rows(); usage_list()'s
+  tighter-window meter is the ALLOCATION row now, so it folded away.
+  Subtitle: allocation · tokens · spend.
 - **telemetry(): one shape for every provider's usage.** The data layer
   for the 03 redesign (the owner, 22:03: every provider, model, bot and
   account, never an invented figure). One record per registered seat plus
