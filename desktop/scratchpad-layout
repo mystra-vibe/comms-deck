@@ -62,7 +62,8 @@ def dispatch(expr):
 def set_window_prop(address, prop, value):
     """Set one Hyprland window property on this window only."""
     if isinstance(value, bool):
-        lua_value = "true" if value else "false"
+        # set_prop wants a string, not a Lua boolean (review by Devin on #58).
+        lua_value = '"true"' if value else '"false"'
     elif isinstance(value, str):
         lua_value = '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
     else:
