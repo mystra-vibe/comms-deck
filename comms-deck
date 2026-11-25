@@ -2519,12 +2519,29 @@ def fit(text, width):
     return ANSI.sub("", text)[:max(0, width - 1)] + "…"
 
 
-def bar(pct, width):
-    """A coloured bar for a 0-100 percentage."""
+def bar(pct, width, step=None):
+    """A coloured bar for a 0-100 percentage, pulsing like the context rows.
+
+    Same holographic recipe (the owner, 02:15): the threshold hue never
+    changes (green/amber/red by how full), each cell breathes
+    dim/normal/bold, and one white glint sweeps left to right on the
+    redraw clock. `step` freezes the phase (tests).
+    """
     pct = max(0.0, min(100.0, float(pct)))
     full = round(width * pct / 100)
     shade = 78 if pct < 60 else 214 if pct < 85 else 196
-    return f"\033[38;5;{shade}m{'█' * full}\033[38;5;238m{'░' * (width - full)}\033[0m"
+    step = pulse_step() if step is None else step
+    glint = (step * 2) % (width + 4) - 2
+    esc = "\033["
+    cells = []
+    for pos in range(width):
+        if pos >= full:
+            cells.append(f"{esc}0;38;5;238m░{esc}0m")
+        elif pos == glint:
+            cells.append(f"{esc}1;38;5;255m█{esc}0m")
+        else:
+            cells.append(f"{esc}{pulse_style(shade, (pos + step) % 8)}m█{esc}0m")
+    return "".join(cells)
 
 
 def short_tokens(n):
@@ -2800,6 +2817,141 @@ def waiting_summary(notes):
     return f"{len(notes)} waiting · {detail}{extra}"
 
 
+def context_split():
+    """[(seat, tokens)] for every seat that reports a live context figure.
+
+    A seat joins with context_tokens when it has them, or with a used
+    percentage times a known window size (what the rows above show). A seat
+    with no usage file, or no context in it (today codex's screen meter and
+    gravity's agy), is left out rather than counted as zero. Alice and Juno
+    share one Grok Bot account, which gives a weekly limit, not a context
+    window, so the shared row drops out here too.
+    """
+    out = []
+    for seat in tuple(AGENTS) + APP_SEATS:
+        d = (read_json(DATA / "usage" / f"{seat}.json", {}) or {}).get("data", {}) or {}
+        used = dig(d, "context_window", "context_tokens")
+        if not isinstance(used, (int, float)) or used <= 0:
+            pct, size = context_percent(d), dig(d, "context_window", "context_window_size")
+            if not (isinstance(pct, (int, float)) and pct > 0
+                    and isinstance(size, (int, float)) and size > 0):
+                continue
+            used = size * pct / 100
+        out.append([seat, float(used)])
+    return out
+
+
+def context_pie(split, width, step=None):
+    """The CONTEXT SPLIT lines: a text pie of live context, colour per seat.
+
+    Drawn from characters, since the chat is a terminal: each dot is a cell
+    whose distance and 'clock angle' from the centre pick its wedge, so a
+    quarter of the tokens is a quarter of the disc. Biggest slice starts at
+    12 o'clock. beside the disc, one legend row per seat, then one total row
+    naming the seats in it (grok's ask). Reports the context now, not
+    lifetime session tokens. The disc breathes with the redraw clock
+    (pulse_step), dimmer and quieter than the bars, so it shimmers without
+    strobing. Returns [] when nobody reports a figure.
+    """
+    if not split:
+        return []
+    esc = "\033["
+    step = pulse_step() if step is None else step
+    total = sum(used for _, used in split)
+    box = max(9, min(width - 2, 17))          # cells across the disc
+    height = max(max(box // 2 + 1, len(split)), 5)  # chars are twice as tall as wide
+    cx, cy = (box - 1) / 2, (height - 1) / 2
+    radius = min(cx, cy) + 0.25
+    acc = 0.0
+    wedges = []  # (clockwise fraction where the slice starts, seat)
+    for seat, used in sorted(split, key=lambda s: -s[1]):
+        wedges.append((acc / total, seat))
+        acc += used
+    disc = []
+    for i in range(height):
+        cells = ""
+        for j in range(box):
+            dx, dy = (j - cx) * 0.5, i - cy
+            if dx * dx + dy * dy > radius * radius:
+                cells += f"{esc}38;5;238m·{esc}0m"
+                continue
+            frac = (math.atan2(dx, -dy) / (2 * math.pi)) % 1.0  # 12 o'clock = 0, clockwise
+            for start, seat in reversed(wedges):
+                if frac >= start - 1e-9:
+                    break
+            cells += f"{esc}{pulse_style(colour(seat), (i * 2 + j + step) % 8)}m·{esc}0m"
+        disc.append(cells)
+    legend = [f"{esc}38;5;{colour(seat)}m■{esc}0m {seat:8} {100 * used / total:4.1f}%  {esc}2m{short_tokens(used)}{esc}0m"
+              for seat, used in split]
+    lines = ["\033[1mCONTEXT SPLIT\033[0m", ""]
+    for i in range(max(len(disc), len(legend))):
+        left = disc[i] if i < len(disc) else " " * box
+        right = legend[i] if i < len(legend) else ""
+        lines.append(f"{left}  {right}".rstrip())
+    lines.append(f"{esc}1mTotal{esc}0m {short_tokens(total)} across "
+                 f"{esc}2m{' + '.join(seat for seat, _ in split)}{esc}0m")
+    return lines
+
+
+PULSE_EVERY = 1.2  # seconds per shimmer step; the screen redraws every 1-2 s
+
+
+def pulse_style(colour_code, phase):
+    """The ANSI code for one cell of pulsing material this step.
+
+    The hue never changes -- the seat's colour from the key -- it breathes
+    through dim, normal and bold, so any terminal shows shimmer without
+    inventing a second palette.
+    """
+    if phase in (0, 1):
+        return f"2;38;5;{colour_code}"   # shadow
+    if phase in (4, 5):
+        return f"1;38;5;{colour_code}"   # highlight
+    return f"38;5;{colour_code}"
+
+
+def pulse_step():
+    """The current shimmer step: the redraw clock drives the pulsing."""
+    return int(time.time() // PULSE_EVERY)
+
+
+def context_rows(split, width, step=None):
+    """One small bar per reporting seat, under the pie: the seat's colour.
+
+    Each bar shows how full that seat's context window is (not its share of
+    the total, which is the pie's job), so a seat near its limit stands out
+    at a glance. A seat reports over 100% when its meter's tokens pass the
+    model's nominal window (compaction pulls it back): the fill caps at
+    full but the number stays honest. The bars pulse -- the owner wants
+    them holographic: a brightness wave along the seat's colour and a white
+    glint sweeping left to right, foil rather than strobe. `step` freezes
+    the phase (tests); None means the redraw clock.
+    """
+    if not split:
+        return []
+    esc = "\033["
+    step = pulse_step() if step is None else step
+    bar_w = max(4, min(10, width - 15))
+    lines = []
+    for seat, _ in split:
+        d = (read_json(DATA / "usage" / f"{seat}.json", {}) or {}).get("data", {}) or {}
+        pct = context_percent(d) or 0.0
+        c = colour(seat)
+        full = round(bar_w * min(pct, 100.0) / 100)
+        glint = (step * 2) % (bar_w + 4) - 2  # the white speck travels with time
+        cells = []
+        for pos in range(bar_w):
+            if pos >= full:
+                cells.append(f"{esc}0;38;5;238m░{esc}0m")  # the track stays still and dim
+            elif pos == glint:
+                cells.append(f"{esc}1;38;5;255m█{esc}0m")  # the foil's white glint
+            else:
+                cells.append(f"{esc}{pulse_style(c, (pos + step) % 8)}m█{esc}0m")
+        lines.append(f"{esc}38;5;{c}m■{esc}0m {seat:8} {''.join(cells)} {pct:3.0f}%"
+                     + (" over the window" if pct > 100 else ""))
+    return lines
+
+
 def usage_panel(width):
     """The lines of the right-hand panel: context, limits and cost per seat."""
     inner = width - 2
@@ -2867,6 +3019,10 @@ def usage_panel(width):
             lines.append(f"  Session  {' · '.join(bits)}")
         lines.append(f"\033[2m  updated {ago(time.time() - record.get('time', 0))}\033[0m")
         lines.append("")
+    split = context_split()
+    pie = context_pie(split, inner)  # [] when nobody reports a context figure
+    if pie:
+        lines += pie + context_rows(split, inner) + [""]
     # ACTIVITY: one row per agent. The mark, the word and the colour come
     # from activity_view, which can say spent (a full plan limit, from the
     # agent's meter or a mark set with `comms-deck spent`) or stuck (idle
@@ -4503,6 +4659,41 @@ def self_test():
         "assert vd['model']['display_name'] == 'M Free' and x.context_percent(vd) == 25.0, vd",
         "x.AGENTS['vibe'] = 'no-such-program-xyz'; assert x.vibe_usage_from_session() is None",
         "x.HOME, x.AGENTS['vibe'] = real_home, real_vibe",
+        # The context-split pie reads usage/<seat>.json only: counts, never text.
+        "pc = x.Path(x.tempfile.mkdtemp()); real_data = x.DATA; x.DATA = pc; (pc / 'usage').mkdir()",
+        "for s, d in (('claude', {'context_window': {'context_tokens': 200000, 'context_window_size': 262144}}),"
+        " ('grok', {'context_window': {'context_tokens': 64000, 'context_window_size': 262144}}),"
+        " ('gravity', {'context_window': {'used_percentage': 25, 'context_window_size': 131072}}),"
+        " ('codex', {'rate_limits': {'five_hour': {'used_percentage': 40}}})):",
+        "    x.write_json(pc / 'usage' / f'{s}.json', {'time': 1, 'source': 'test', 'data': d})",
+        "sp = x.context_split(); assert [s for s, _ in sp] == ['claude', 'grok', 'gravity'], sp",
+        "assert abs(sp[0][1] - 200000) < 1 and abs(sp[2][1] - 32768) < 1, sp  # the % x size fallback computes too",
+        "pl = x.context_pie(sp, 40); pt = ' '.join(x.ANSI.sub('', l) for l in pl)",
+        "assert 'CONTEXT SPLIT' in pt and 'Total' in pt and 'claude + grok + gravity' in pt, pt",
+        "assert '67.4%' in pt and '32768' not in pt and '32.8k' in pt and 'codex' not in pt, pt  # shares of the total; no-figure seat left out, not zero",
+        "assert x.context_pie([], 40) == [], 'an empty deck draws nothing'",
+        "(pc / 'usage' / 'claude.json').write_text('{\"time\": 1, \"data\": {\"cost\": {\"total_cost_usd\": \"no\"}}}')",
+        "assert [s for s, _ in x.context_split()] == ['grok', 'gravity'], 'garbage data drops out too'",
+        "x.write_json(pc / 'usage' / 'grok.json', {'time': 1, 'source': 'test', 'data': {'context_window': {'context_tokens': 294000, 'context_window_size': 262144}}})",
+        "sp2 = x.context_split(); cr = x.context_rows(sp2, 40); ct = ' '.join(x.ANSI.sub('', l) for l in cr)",
+        "assert 'grok' in ct and '112%' in ct and 'over the window' in ct, ct  # over the nominal window says so",
+        "assert '25%' in ct or '26%' in ct, ct  # gravity is drawn from its % x size figure",
+        "assert x.context_rows([], 40) == [], 'no figure, no bars'",
+        "cr0 = x.context_rows(sp2, 40, step=0); cr3 = x.context_rows(sp2, 40, step=3)",
+        "assert cr0 != cr3, 'the shimmer moves with the step'",
+        "assert '38;5;45' in cr0[0], 'grok\\'s line keeps grok\\'s hue'",
+        "assert '38;5;255' in ''.join(cr3), 'a glint sweeps the bar; not a strobe'",
+        "pt0 = x.context_pie(sp, 40, step=0); pt5 = x.context_pie(sp, 40, step=5)",
+        "assert pt0 != pt5, 'the disc breathes too'",
+        "assert '38;5;' + str(x.SEAT_COLOURS['grok']) in ''.join(pt0) or '38;5;45' in ''.join(pt0), 'the disc keeps the key as well'",
+        "assert x.pulse_style(208, 0) == '2;38;5;208' and x.pulse_style(208, 4) == '1;38;5;208', 'dim, then bold'",
+        "b0 = x.bar(50, 10, step=0); b2 = x.bar(50, 10, step=2)",
+        "assert b0 != b2, 'the usage bars pulse too'",
+        "assert '38;5;78' in b0, 'the threshold hue (green at 50%) survives the pulse'",
+        "assert '38;5;255' in x.bar(50, 10, step=1), 'a glint sweeps the usage bars as well'",
+        "assert '█' not in x.ANSI.sub('', x.bar(0, 8, step=0)), 'an empty bar draws an empty track, no glint'",
+        "assert '38;5;196' in x.bar(95, 10, step=0), 'a full bar reads red, not amber'",
+        "x.DATA = real_data",
         "assert x.poll_countdown({}, now) == \"hasn't checked yet\"",
         "assert x.poll_countdown({'polled_at': now - 18}, now) == 'next check in 0:42'",
         "assert x.poll_countdown({'polled_at': now - 125, 'poll_gap': 60}, now) == 'check late 1:05'",

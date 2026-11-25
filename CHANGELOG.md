@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- **How the agents' context split, as a colour-coded pie.** The usage
+  panel draws a text pie beside its legend: each seat's share of the live
+  context its usage file reports, biggest slice at 12 o'clock, one total
+  line naming the seats in it. Under it, one small bar per reporting seat,
+  in the seat's colour, showing how full its own window is. Both pulse,
+  holographic-style: the hue stays the key's, a brightness wave and a
+  white glint ride the redraw clock. The panel's older usage bars (each
+  seat's context, its 5-hour and weekly limits) pulse with the same
+  recipe, keeping their green/amber/red rule. The activity words and the
+  spent countdowns don't animate. Seats that
+  report no context figure are left out rather than counted as zero. By
+  Vibe, on the owner's ask.
 - **Leave a seat out with `-seat`.** `all -grok` or, on the chat screen,
   `-grok hello` goes to everyone but Grok. Only real seat names count, so
   `re-run` and `-rf` stay as text. The record lists the real recipients.
