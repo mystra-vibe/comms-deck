@@ -2796,6 +2796,62 @@ def waiting_summary(notes):
     return f"{len(notes)} waiting · {detail}{extra}"
 
 
+def seat_context_used(d):
+    """Tokens sitting in the seat's context window, or None if unknown."""
+    used = dig(d, "context_window", "context_tokens")
+    if isinstance(used, (int, float)):
+        return float(used)
+    size = dig(d, "context_window", "context_window_size")
+    pct = context_percent(d)
+    if pct is not None and isinstance(size, (int, float)):
+        return size * pct / 100
+    return None
+
+
+def seat_session_tokens(d):
+    """Session input + output tokens a seat reports, or None."""
+    total = 0.0
+    for key in ("session_input_tokens", "session_output_tokens"):
+        v = dig(d, "context_window", key)
+        if isinstance(v, (int, float)):
+            total += v
+    return total or None
+
+
+def context_pie(shares, radius=6):
+    """An ASCII donut of `shares` — [(seat, fraction)] summing to 1, each
+    wedge in the seat's colour. Terminal cells are about twice as tall as
+    they are wide, so the grid is 2*radius+1 columns by radius+1 rows and
+    each row's y counts double in the circle test."""
+    rc = radius
+    ry = rc // 2
+    cum, acc = [], 0.0
+    for seat, frac in shares:
+        acc += frac
+        cum.append((acc, seat))
+    hole = (rc // 2) ** 2
+    lines = []
+    for j in range(-ry, ry + 1):
+        row = ""
+        for i in range(-rc, rc + 1):
+            d2 = i * i + 4 * j * j
+            if d2 > rc * rc or d2 < hole:
+                row += " "
+                continue
+            angle = (math.atan2(2 * j, i) + math.pi) % (2 * math.pi) / (2 * math.pi)
+            seat = next((s for limit, s in cum if angle <= limit), cum[-1][1])
+            row += f"\033[48;5;{colour(seat)}m "
+        lines.append(row + "\033[0m")
+    return lines
+
+
+def seat_context_bar(frac, width, seat):
+    """A small bar in the seat's colour: `frac` (0-1) filled, the rest dim."""
+    fill = round(width * max(0.0, min(1.0, frac)))
+    return (f"\033[38;5;{colour(seat)}m{'█' * fill}"
+            f"\033[38;5;238m{'░' * (width - fill)}\033[0m")
+
+
 def usage_panel(width):
     """The lines of the right-hand panel: context, limits and cost per seat."""
     inner = width - 2
@@ -2862,6 +2918,55 @@ def usage_panel(width):
         if bits:
             lines.append(f"  Session  {' · '.join(bits)}")
         lines.append(f"\033[2m  updated {ago(time.time() - record.get('time', 0))}\033[0m")
+        lines.append("")
+    # TEAM CONTEXT: the owner's pie chart — each reporting seat's share of
+    # the context tokens in use, a total across all of them, and a row of
+    # small colour-coded bars (one per seat, % of window when known).
+    entries, shown_bot = [], False
+    for seat in tuple(AGENTS) + APP_SEATS:
+        record = read_json(DATA / "usage" / f"{seat}.json")
+        if not record:
+            continue
+        if record.get("source") == "grok-bot":
+            if shown_bot:
+                continue
+            shown_bot = True
+        d = record.get("data", {})
+        used, sess, pct = seat_context_used(d), seat_session_tokens(d), context_percent(d)
+        if used is None and sess is None:
+            continue
+        entries.append((seat, used or 0.0, pct, sess or 0.0))
+    if entries:
+        lines.append("\033[1mTEAM CONTEXT\033[0m")
+        total_ctx = sum(u for _, u, _, _ in entries)
+        total_sess = sum(s for _, _, _, s in entries)
+        bits = []
+        if total_ctx:
+            bits.append(f"Σ ctx {short_tokens(total_ctx)}")
+        if total_sess:
+            bits.append(f"Σ sess {short_tokens(total_sess)}")
+        if bits:
+            t = " · ".join(bits)
+            lines.append(" " * max(1, inner - len(t)) + f"\033[2m{t}\033[0m")
+        wedges = [(s, u) for s, u, _, _ in entries if u > 0]
+        if wedges:
+            total_w = sum(u for _, u in wedges)
+            lines += ["  " + l for l in context_pie([(s, u / total_w) for s, u in wedges])]
+        max_ctx = max((u for _, u, _, _ in entries), default=0.0)
+        items = []
+        for seat, used, pct, _sess in entries:
+            frac = pct / 100 if pct is not None else (used / max_ctx if max_ctx else 0.0)
+            label = f"{pct:.0f}%" if pct is not None else short_tokens(used)
+            items.append(f"{seat.title()[:7]:7} {seat_context_bar(frac, 8, seat)} {label}")
+        cur = ""
+        for it in items:
+            if cur and visible_len(cur) + 2 + visible_len(it) > inner:
+                lines.append(" " + cur)
+                cur = it
+            else:
+                cur = f"{cur}  {it}" if cur else it
+        if cur:
+            lines.append(" " + cur)
         lines.append("")
     # ACTIVITY: one row per agent. The mark, the word and the colour come
     # from activity_view, which can say spent (a full plan limit, from the
@@ -4467,6 +4572,17 @@ def self_test():
         "(x.DATA / 'usage' / 'gravity.json').unlink()",
         "assert not any(s == 'gravity' for s, _, _ in x.current_states())",
         "assert x.spent_mark('gravity') is None",
+        # TEAM CONTEXT: pie of context shares, totals, and the small bars
+        "x.write_json(x.DATA / 'usage' / 'claude.json', {'time': now, 'data': {'context_window': {'used_percentage': 50.0, 'context_window_size': 100000, 'context_tokens': 50000, 'session_input_tokens': 40000, 'session_output_tokens': 5000}}})",
+        "x.write_json(x.DATA / 'usage' / 'grok.json', {'time': now, 'data': {'context_window': {'context_tokens': 25000, 'session_input_tokens': 20000}}})",
+        "panel = x.usage_panel(80)",
+        "assert any('TEAM CONTEXT' in l for l in panel), panel",
+        "assert any('Σ ctx' in l and 'Σ sess' in l for l in panel), panel",
+        "assert any('48;5;' in l for l in panel), panel",
+        "assert any('Claude' in l and '50%' in l for l in panel), panel",
+        "assert any('Grok' in l and '25k' in l for l in panel), panel",
+        "(x.DATA / 'usage' / 'claude.json').unlink()",
+        "(x.DATA / 'usage' / 'grok.json').unlink()",
         "try:\n    x.mark_spent('nobody', '+1h', 'claude'); raise SystemExit('bad seat accepted')\nexcept ValueError: pass",
         "try:\n    x.parse_until('soonish', now); raise SystemExit('bad time accepted')\nexcept ValueError: pass",
         "msg = '■ You\u2019ve hit your usage limit. Upgrade to Plus to continue using Codex (https://x), or try again\\nat Dec 9th, 2026 3:02 PM.\\n› Ask'",

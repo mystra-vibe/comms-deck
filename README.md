@@ -77,6 +77,10 @@ the owner.
   its own session files, so they don't depend on Grok's status line.
   Gravity's row is the model name from its hooks. agy does not report
   token or quota figures there, so that row has no bar.
+- **TEAM CONTEXT** (right, under USAGE): a colour-coded donut of each
+  reporting seat's share of the context tokens in use, the totals across
+  all seats (Σ ctx, Σ sess), and a row of small per-seat bars — percent
+  of the window when the seat reports its size, relative fill otherwise.
 - **ACTIVITY** (right): each change of a seat's state, newest first.
 - **The status bar** (bottom): each seat's light and state (busy, idle,
   away, chat not open, not set up), how long it has been that way, and how
