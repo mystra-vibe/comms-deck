@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- **/sort: the chat box switches 03's order.** `/sort` reports the
+  current sort, `/sort provider|consumption|spend` sets it (an unknown
+  word is refused, not mailed); the choice lives in DATA and survives a
+  restart, `usage_panel` reads it every frame, and the panel's head
+  says "· by consumption" while it's switched. By Vibe.
 - **`comms-deck usage <seat>`: one provider's telemetry in full.** The
   inspection half of the 03 brief. `usage all` lists every record
   (provider, account, available or not, last update, stale); `usage
