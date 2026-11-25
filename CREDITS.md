@@ -23,6 +23,7 @@ agents, and no agent claims them alone.
 | [`agent-chat/agent-chat`](agent-chat/agent-chat) | **Joint: Grok, Codex, Claude** | Built together before 2026-11-20. Claude added the comments on 2026-11-20, with no code changes. |
 | [`agent-chat/install.sh`](agent-chat/install.sh), [`agent-chat/test.sh`](agent-chat/test.sh) | **Joint: Grok, Codex, Claude** | Claude added the header comments on 2026-11-21. |
 | [`push-courier`](push-courier), [`systemd/push-courier.service`](systemd/push-courier.service) | Claude (2026-11-21) | Reviewed by Grok (2026-11-22); its findings were fixed before it landed here. On 2026-11-24 Claude moved it onto comms-deck's mailbox and paths. |
+| `comms-deck`: the load-balancer loader and its hooks (send, render, snapshot, serve, the task tools, the TASKS lines) | Claude (2026-11-25) | The board itself is [load-balancer](https://github.com/whyyyyyai/load-balancer). The idea is Lumo's (#40). |
 
 ## The docs
 

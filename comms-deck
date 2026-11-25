@@ -6,6 +6,7 @@
   comms-deck read [--peek]                               show (and take) your notes
   comms-deck note <text...>                              add to the running commentary
   comms-deck status                                      who is busy, idle or away
+  comms-deck usage [--days N]                            notes, activity and plan limits
   comms-deck watch                                       print notes as they are sent
   comms-deck chat [--hide-private]                       full-screen live view of the notes
   comms-deck serve                                       the background service
@@ -14,6 +15,8 @@
   comms-deck statusline --source <claude|grok|agy>       status line (feeds the usage panel; agy has none)
   comms-deck install [--yes]                             set this machine up
   comms-deck self-test                                   run the tests in a temp folder
+  comms-deck status --json                               every seat as JSON (for watchdogs)
+  comms-deck wake <seat> [--stale]                       one wake attempt; --stale clears a stuck busy
   comms-deck spent <seat> <+166h|06:20|YYYY-MM-DD HH:MM|clear>
                                                          show a seat spent, counting down to its reset
   comms-deck review-check <PR#>                          fail unless another seat reviewed it
@@ -650,6 +653,15 @@ def send(sender, to, text, quiet=False, private=False):
     record = {"kind": "message", "id": new_id(), "from": sender or "unknown",
               "to": to, "time": now(), "machine": MACHINE,
               "quiet": bool(quiet), "private": bool(private), "text": text}
+    balancer = load_balancer() if sender == "owner" else None
+    if balancer:
+        try:
+            task = balancer.create_task(record, targets)
+        except Exception as error:  # the note must still go out
+            task = None
+            log(f"load-balancer couldn't make a task: {error}")
+        if task:
+            record["task"] = task["id"]
     for seat in targets:
         if seat == "owner":
             notify(f"Note from {record['from']}", text)
@@ -672,6 +684,59 @@ def add_note(sender, text):
     queue_out(record)
     append_log(record)
     return record
+
+
+# -- Load balancer: the task board, in its own repo -----------------------------
+# The owner (2026-11-25): requests to several agents were being picked up by
+# two or three of them at once. The task board that stops this lives in its
+# own repo, https://github.com/whyyyyyai/load-balancer: a note from the owner
+# to two or more agents becomes one task with one holder, chosen by the
+# program, and the holder keeps it only while it can work on it.
+#
+# comms-deck loads it if it's installed (~/.local/bin/load-balancer, or
+# $COMMS_DECK_LOAD_BALANCER) and hands it this module, so it uses the deck's
+# own availability ranking, mailbox and notes. Without it, nothing changes:
+# no tasks, and every note is delivered exactly as before.
+_balancer = None
+
+
+class _DeckView:
+    """This module's globals as attributes, read live.
+
+    The load balancer is handed the deck it runs in. When comms-deck runs as
+    a script that's sys.modules["__main__"], but a loader (a test, another
+    program) may load it without registering it, so this view stands in.
+    """
+
+    def __getattr__(self, name):
+        try:
+            return globals()[name]
+        except KeyError:
+            raise AttributeError(name) from None
+
+    def __setattr__(self, name, value):
+        globals()[name] = value
+
+
+def load_balancer():
+    """The load-balancer module, attached to this deck, or None if it isn't installed."""
+    global _balancer
+    if _balancer is None:
+        path = Path(setting("LOAD_BALANCER") or HOME / ".local/bin/load-balancer")
+        _balancer = False
+        if path.exists():
+            try:
+                import importlib.machinery
+                import importlib.util
+                loader = importlib.machinery.SourceFileLoader("load_balancer", str(path))
+                spec = importlib.util.spec_from_loader("load_balancer", loader)
+                module = importlib.util.module_from_spec(spec)
+                loader.exec_module(module)
+                module.attach(sys.modules.get(__name__) or _DeckView())
+                _balancer = module
+            except Exception as error:  # a broken balancer must never stop the deck
+                log(f"load-balancer at {path} didn't load: {error}")
+    return _balancer or None
 
 
 PRIVATE_NAMES_FILE = CONFIG / "private-names"
@@ -772,7 +837,11 @@ def team_snapshot(seat, records):
         waiting = len(pending(other))
         rows.append(f"{other} {st}{began}, {waiting} waiting")
     text = f"Team at {time.strftime('%H:%M')}: " + "; ".join(rows) + "."
-    shared = [r for r in records if r.get("to") == "all" or "+" in str(r.get("to"))]
+    balancer = load_balancer()
+    board = [t for t in balancer.all_tasks() if t["state"] in balancer.TASK_ACTIVE][-5:] if balancer else []
+    if board:
+        text += " Tasks: " + "; ".join(f"{t['id']} {t.get('holder') or 'open'}" for t in board) + "."
+    shared = [r for r in records if (r.get("to") == "all" or "+" in str(r.get("to"))) and not r.get("task")]
     if shared:
         text += (" This note went to more than one agent. Before starting work on it, check "
                  "who is already on it (team_status, or ask). If it was sent a while ago and "
@@ -789,12 +858,25 @@ def render(records, seat):
         to = "" if r.get("to") == seat else f" (to {str(r.get('to')).replace('+', ', ')})"
         tag = f" [{', '.join(tags)}]" if tags else ""
         lines.append(f"From {r['from']}{to} at {r['time'][11:16]} ({note_age(r)}){tag}:\n{r['text']}")
+        balancer = load_balancer() if r.get("task") else None
+        task = balancer.load_task(r.get("task")) if balancer else None
+        if task and task["state"] in balancer.TASK_ACTIVE:
+            holder = task.get("holder")
+            if holder == seat:
+                lines.append(f"Task {task['id']} is YOURS (picked by the deck). Do it, then "
+                             f"`done_task {task['id']}`; `release_task {task['id']}` if you can't.")
+            elif holder:
+                lines.append(f"Task {task['id']} is {holder}'s. Don't start it yourself; "
+                             f"help only if {holder} asks.")
+            else:
+                lines.append(f"Task {task['id']} is open: nobody was free. `claim_task {task['id']}` "
+                             f"to take it.")
     lines.append(team_snapshot(seat, records))
     senders = sorted({r["from"] for r in records} & set(SEATS))
     reply = (f"\n\nReply with the send_message tool (to: {senders[0]})"
              f" or `comms-deck send {senders[0]} \"...\"`." if senders else "")
-    if seat in APP_SEATS:
-        # An app seat reads this in its own chat and has no comms-deck tools:
+    if seat in APP_SEATS and APP_PROCESS.get(seat, "grok-bot") == "grok-bot":
+        # A Grok Bot seat reads this in its own chat and has no comms-deck tools:
         # its chat reply is picked up and filed, so tell it how that works.
         who = "owner" if "owner" in senders or not senders else senders[0]  # not just the first alphabetically
         return (f"{MARK} {len(records)} note(s) for {seat}:\n\n" + "\n\n".join(lines)
@@ -1077,7 +1159,8 @@ def agy_hook(event):
 # owner, 09:00). Vibe keys a tool's permission as [tools.<server>_<tool>]:
 # checked live, where [tools."mcp_comms_deck.<tool>"] (the name it shows) and
 # [tools.mcp_comms_deck_<tool>] both still asked.
-VIBE_ALLOWED_TOOLS = ("team_status", "read_messages", "send_message", "add_note", "set_status")
+VIBE_ALLOWED_TOOLS = ("team_status", "read_messages", "send_message", "add_note", "set_status",
+                      "tasks", "claim_task", "release_task", "done_task")
 
 
 def grant_vibe_tools(config):
@@ -1379,6 +1462,8 @@ def try_wake(seat):
         return False
     if not any(not r.get("quiet") for _, r in pending(seat)):
         return False
+    if seat_spent(seat):
+        return False  # out of usage: its notes wait in the inbox until the reset, not lost in a dead turn
     if state["auto"] >= AUTO_LIMIT and not owner_waiting(seat):
         pause_notice(seat)
         return False
@@ -2488,6 +2573,12 @@ def serve():
                 refresh_vibe_usage()
             except Exception as error:  # the same: never stop the service for it
                 log(f"couldn't read Vibe's usage: {error}")
+            balancer = load_balancer()
+            if balancer:
+                try:
+                    balancer.refresh_tasks()  # keep every task with someone who can do it
+                except Exception as error:
+                    log(f"load-balancer pass failed: {error}")
             try:
                 refresh_screen_limits()
             except Exception as error:  # never stop the service for it
@@ -2571,28 +2662,36 @@ def fit(text, width):
     return ANSI.sub("", text)[:max(0, width - 1)] + "…"
 
 
-def bar(pct, width, step=None):
+def bar(pct, width, step=None, animate=True):
     """A coloured bar for a 0-100 percentage, pulsing like the context rows.
 
     Same holographic recipe (the owner, 02:15): the threshold hue never
     changes (green/amber/red by how full), each cell breathes
-    dim/normal/bold, and one white glint sweeps left to right on the
-    redraw clock. `step` freezes the phase (tests).
+    dim/normal/bold, and one white glint sweeps left to right. The phase
+    is now continuous in time (a float on the 0-8 breathe cycle), so on
+    the fast redraw clock the wave and glint glide instead of stepping.
+    `step` freezes the phase (tests). `animate=False` (the agent is
+    idle, 04:02) draws a still fill in the threshold hue: no breathing,
+    no glint, no trail -- bars only glow while the agent works.
     """
     pct = max(0.0, min(100.0, float(pct)))
     full = round(width * pct / 100)
     shade = 78 if pct < 60 else 214 if pct < 85 else 196
-    step = pulse_step() if step is None else step
-    glint = (step * 2) % (width + 4) - 2
+    fstep = float(step) if step is not None else time.time() / PULSE_EVERY
+    glint = (fstep * 2) % (width + 4) - 2
     esc = "\033["
     cells = []
     for pos in range(width):
         if pos >= full:
             cells.append(f"{esc}0;38;5;238m░{esc}0m")
-        elif pos == glint:
-            cells.append(f"{esc}1;38;5;255m█{esc}0m")
+        elif not animate:
+            cells.append(f"{esc}38;5;{shade}m█{esc}0m")
+        elif abs(pos - glint) <= 0.5:
+            cells.append(f"{esc}1;38;5;255m█{esc}0m")  # the foil's white glint
+        elif 0 < glint - pos <= 1.5:
+            cells.append(f"{esc}38;5;250m█{esc}0m")    # its fading trail
         else:
-            cells.append(f"{esc}{pulse_style(shade, (pos + step) % 8)}m█{esc}0m")
+            cells.append(f"{esc}{breathe_style(shade, pos + fstep)}m█{esc}0m")
     return "".join(cells)
 
 
@@ -2725,16 +2824,18 @@ AVAILABILITY = {"ready": 0, "busy": 1, "stuck": 3, "draft in box": 3,
                 "spent": 7}  # idle until its limit resets: always the bottom (the owner, 07:23)
 
 
-def availability(seat, state, now=None):
+def availability(seat, state, now=None, snap=None):
     """How available `seat` is, as the ACTIVITY panel shows it and the router uses it.
 
     One function for both, so the screen always shows who the next task
     would go to. `state` is the seat file's state (or an app seat's). Returns
     a dict: rank (level, notes waiting; lower is more available), word
     ("ready", "busy", "stuck", "spent", ...), mark, shade, waiting, usage.
+    `snap`, when given (the chat screen's panel_scans snapshot), is where
+    the waiting count comes from.
     """
     usage = (read_json(DATA / "usage" / f"{seat}.json") or {}).get("data") or {}
-    waiting = len(pending(seat))
+    waiting = len(pending(seat)) if snap is None else len(snap["waiting"].get(seat, ()))
     mark, word, shade = activity_view(state, usage, now, waiting=waiting, marked=spent_mark(seat, now))
     # A seat that only checks on its own (Lumo) is not stuck, and not busy, once
     # that check is late: the row says idle until she calls again.
@@ -2893,7 +2994,7 @@ def context_split():
     return out
 
 
-def context_pie(split, width, step=None):
+def context_pie(split, width, step=None, busy=None):
     """The CONTEXT SPLIT lines: a text pie of live context, colour per seat.
 
     Drawn from characters, since the chat is a terminal: each dot is a cell
@@ -2901,14 +3002,16 @@ def context_pie(split, width, step=None):
     quarter of the tokens is a quarter of the disc. Biggest slice starts at
     12 o'clock. beside the disc, one legend row per seat, then one total row
     naming the seats in it (grok's ask). Reports the context now, not
-    lifetime session tokens. The disc breathes with the redraw clock
-    (pulse_step), dimmer and quieter than the bars, so it shimmers without
-    strobing. Returns [] when nobody reports a figure.
+    lifetime session tokens. The disc breathes with the clock (continuous
+    phase), dimmer and quieter than the bars -- and each wedge only
+    shimmers while that seat is actually working: `busy` is the set of
+    working seats, None means everything pulses (tests). Returns [] when
+    nobody reports a figure.
     """
     if not split:
         return []
     esc = "\033["
-    step = pulse_step() if step is None else step
+    fstep = float(step) if step is not None else time.time() / PULSE_EVERY
     total = sum(used for _, used in split)
     box = max(9, min(width - 2, 17))          # cells across the disc
     height = max(max(box // 2 + 1, len(split)), 5)  # chars are twice as tall as wide
@@ -2931,7 +3034,10 @@ def context_pie(split, width, step=None):
             for start, seat in reversed(wedges):
                 if frac >= start - 1e-9:
                     break
-            cells += f"{esc}{pulse_style(colour(seat), (i * 2 + j + step) % 8)}m·{esc}0m"
+            if busy is not None and seat not in busy:
+                cells += f"{esc}38;5;{colour(seat)}m·{esc}0m"  # idle: still, no shimmer
+            else:
+                cells += f"{esc}{breathe_style(colour(seat), i * 2 + j + fstep)}m·{esc}0m"
         disc.append(cells)
     legend = [f"{esc}38;5;{colour(seat)}m■{esc}0m {seat:8} {100 * used / total:4.1f}%  {esc}2m{short_tokens(used)}{esc}0m"
               for seat, used in split]
@@ -2945,7 +3051,8 @@ def context_pie(split, width, step=None):
     return lines
 
 
-PULSE_EVERY = 1.2  # seconds per shimmer step; the screen redraws every 1-2 s
+PULSE_EVERY = 0.5  # seconds per shimmer step (0-8 breathe cycle, so 4 s a wave);
+                   # animated frames redraw far faster now -- the phase is continuous
 
 
 def pulse_style(colour_code, phase):
@@ -2962,12 +3069,31 @@ def pulse_style(colour_code, phase):
     return f"38;5;{colour_code}"
 
 
+def breathe_style(colour_code, phase):
+    """pulse_style made continuous: `phase` may be a float on the 0-8 cycle.
+
+    A cosine on the same dim/normal/bold recipe, matching pulse_style at
+    every integer phase, so on the fast clock (up to 120 frames a second)
+    the brightness wave glides instead of jumping.
+    """
+    b = 0.5 + 0.5 * math.cos(math.tau * (float(phase) - 4) / 8)  # 0..1, peak at 4
+    if b <= 0.15:
+        return f"2;38;5;{colour_code}"   # shadow
+    if b >= 0.85:
+        return f"1;38;5;{colour_code}"   # highlight
+    return f"38;5;{colour_code}"
+
+
 def pulse_step():
-    """The current shimmer step: the redraw clock drives the pulsing."""
+    """The current shimmer step: the redraw clock drives the pulsing.
+
+    Kept for anything that wants the coarse integer phase; the bars
+    themselves now run on a continuous phase (time / PULSE_EVERY).
+    """
     return int(time.time() // PULSE_EVERY)
 
 
-def context_rows(split, width, step=None):
+def context_rows(split, width, step=None, busy=None):
     """One small bar per reporting seat, under the pie: the seat's colour.
 
     Each bar shows how full that seat's context window is (not its share of
@@ -2976,13 +3102,15 @@ def context_rows(split, width, step=None):
     model's nominal window (compaction pulls it back): the fill caps at
     full but the number stays honest. The bars pulse -- the owner wants
     them holographic: a brightness wave along the seat's colour and a white
-    glint sweeping left to right, foil rather than strobe. `step` freezes
-    the phase (tests); None means the redraw clock.
+    glint sweeping left to right, foil rather than strobe -- but only
+    while that seat is actually working (`busy`: the working seats, None
+    pulses everything, tests). Idle bars sit still in the seat's colour.
+    `step` freezes the phase (tests); None means the clock.
     """
     if not split:
         return []
     esc = "\033["
-    step = pulse_step() if step is None else step
+    fstep = float(step) if step is not None else time.time() / PULSE_EVERY
     bar_w = max(4, min(10, width - 15))
     lines = []
     for seat, _ in split:
@@ -2990,18 +3118,130 @@ def context_rows(split, width, step=None):
         pct = context_percent(d) or 0.0
         c = colour(seat)
         full = round(bar_w * min(pct, 100.0) / 100)
-        glint = (step * 2) % (bar_w + 4) - 2  # the white speck travels with time
+        anim = busy is None or seat in busy
+        glint = (fstep * 2) % (bar_w + 4) - 2  # the white speck travels with time
         cells = []
         for pos in range(bar_w):
             if pos >= full:
                 cells.append(f"{esc}0;38;5;238m░{esc}0m")  # the track stays still and dim
-            elif pos == glint:
+            elif not anim:
+                cells.append(f"{esc}38;5;{c}m█{esc}0m")    # idle: still, no glow
+            elif abs(pos - glint) <= 0.5:
                 cells.append(f"{esc}1;38;5;255m█{esc}0m")  # the foil's white glint
+            elif 0 < glint - pos <= 1.5:
+                cells.append(f"{esc}38;5;250m█{esc}0m")    # the glint's fading trail
             else:
-                cells.append(f"{esc}{pulse_style(c, (pos + step) % 8)}m█{esc}0m")
+                cells.append(f"{esc}{breathe_style(c, pos + fstep)}m█{esc}0m")
         lines.append(f"{esc}38;5;{c}m■{esc}0m {seat:8} {''.join(cells)} {pct:3.0f}%"
                      + (" over the window" if pct > 100 else ""))
     return lines
+
+
+def context_list(split):
+    """The CONTEXT block: one line per seat with a live figure, highest first.
+
+    The owner asked (02:43) for the agents categorised by type: a Context
+    list and a Usage list, each ordered by highest value, with more data
+    around the total context pool and how it is distributed. Each row shows
+    the seat's current context in tokens and its share of the pool; the
+    pool total sits in the header. Colours stay the key's (SEAT_COLOURS),
+    and nothing here animates: only bars and the pie pulse.
+    """
+    if not split:
+        return []
+    esc = "\\033["
+    total = sum(used for _, used in split)
+    lines = [f"\\033[1mCONTEXT\\033[0m \\033[2mpool {short_tokens(total)} tokens\\033[0m"]
+    for seat, used in sorted(split, key=lambda s: -s[1]):
+        lines.append(f"{esc}38;5;{colour(seat)}m■{esc}0m {seat:8} "
+                     f"{esc}2m{short_tokens(used):>6}{esc}0m {100 * used / total:4.1f}%")
+    return lines
+
+
+def usage_list():
+    """The PLAN USAGE block: one line per seat, its plan meter, highest first.
+
+    The other list the owner asked for (02:43). A seat's plan meter is the
+    tighter of the two figures it reports: the 5-hour window when it has
+    one, else the weekly (so the shared Grok Bot account shows its weekly).
+    Where a seat reports both, the higher percentage is shown and tagged
+    with which window it came from, because that is the one about to bite.
+    The percentage takes the bar's threshold hue, and the square stays the
+    seat's colour from the key. One line per seat; the grok-bot account is
+    shown once, as in the panel above it. Nothing animates.
+    """
+    rows, shown_account = [], False
+    for seat in tuple(AGENTS) + APP_SEATS:
+        record = read_json(DATA / "usage" / f"{seat}.json")
+        if not record:
+            continue
+        if record.get("source") == "grok-bot":
+            if shown_account:
+                continue
+            shown_account = True
+            seat, tag_seat = "grok-bot", "grok"
+        else:
+            tag_seat = seat
+        d = record.get("data", {}) or {}
+        best = None
+        for key, tag in (("five_hour", "5h"), ("seven_day", "wk")):
+            pct = dig(d, "rate_limits", key, "used_percentage")
+            if isinstance(pct, (int, float)) and (best is None or pct > best[0]):
+                best = (pct, tag)
+        if best is None:
+            continue
+        rows.append((best[0], seat, tag_seat, best[1]))
+    if not rows:
+        return []
+    esc = "\\033["
+    lines = ["\\033[1mPLAN USAGE\\033[0m \\033[2mhighest first\\033[0m"]
+    for pct, seat, tag_seat, tag in sorted(rows, key=lambda r: -r[0]):
+        shade = 78 if pct < 60 else 214 if pct < 85 else 196
+        cle = colour(tag_seat)
+        lines.append(f"{esc}38;5;{cle}m■{esc}0m {seat:8} {esc}38;5;{shade}m{pct:3.0f}%{esc}0m "
+                     f"{esc}2m· {tag}{esc}0m")
+    return lines
+
+
+PANEL_SCAN_TTL = 0.5  # seconds; the chat's fast clock must not hammer /proc
+
+_panel_scans = {"at": 0.0, "seats": {}, "waiting": {}}
+
+
+def panel_scans():
+    """A half-second cache of the scans the chat panels make.
+
+    load_seat() walks /proc whenever an agent process is gone (an away
+    seat) and pending() reads every inbox -- at up to 120 frames a second
+    (04:02) that's a scan storm. The chat panels read this snapshot
+    instead; the service, the hooks and anything taking notes keep
+    calling load_seat and pending live.
+    """
+    if time.time() - _panel_scans["at"] < PANEL_SCAN_TTL:
+        return _panel_scans
+    now, seats, waiting = time.time(), {}, {}
+    for seat in tuple(AGENTS) + APP_SEATS:
+        if seat in AGENTS:
+            seats[seat] = load_seat(seat)
+        else:
+            d = read_json(seat_file(seat), {}) or {}
+            d["state"] = app_seat_state(seat)
+            seats[seat] = d
+        waiting[seat] = pending(seat)
+    _panel_scans.update(at=now, seats=seats, waiting=waiting)
+    return _panel_scans
+
+
+def busy_seats(snap=None):
+    """The seats whose agent is working right now (state busy).
+
+    This is what lets the bars obey 04:02: only these shimmer. App seats
+    count when the app reports the bot busy (the shared Grok Bot account
+    serves them all, so the account row moves when any bot does).
+    """
+    if snap is None:
+        snap = panel_scans()
+    return {seat for seat, d in snap["seats"].items() if d.get("state") == "busy"}
 
 
 def usage_panel(width):
@@ -3009,7 +3249,14 @@ def usage_panel(width):
 
     Since #61 this is drawn on the LEFT of the chat (the owner's layout):
     the ready order moved to its own activity_panel() on the right, so
-    neither pushes the other off the screen. """
+    neither pushes the other off the screen. Under the pie sit the two
+    categorised lists the owner asked for (02:43): CONTEXT, one row per
+    reporting seat highest first with its share of the pool, and PLAN
+    USAGE, one row per seat with the tighter of its plan meters. Bars
+    shimmer only while that seat's agent is busy (04:02); idle bars are
+    still. Sets usage_panel.running for the redraw clock: true while any
+    bar has something to animate, so the screen can tick fast then.
+    """
     inner = width - 2
     bar_w = max(6, inner - 16)
     # A running total of the session costs the agents report themselves
@@ -3030,9 +3277,12 @@ def usage_panel(width):
         head += " " * gap + f"\033[1;38;5;220m{money}\033[0m"
     lines = [head, ""]  # where the figures come from is in the README, not on screen
     shown_account = False
+    snap = panel_scans()  # one shared half-second snapshot for every panel
+    running = busy_seats(snap)
+    app_running = any(seat in running for seat in APP_SEATS)
+    usage_panel.running = bool(running) and width > 2
     for seat in tuple(AGENTS) + APP_SEATS:
         record = read_json(DATA / "usage" / f"{seat}.json")
-        state = load_seat(seat) if seat in AGENTS else {"state": "app"}
         if not record:
             continue  # nothing known: leave it out rather than show an empty section
         if record.get("source") == "grok-bot":
@@ -3046,10 +3296,11 @@ def usage_panel(width):
         if record.get("source") == "grok-bot":
             title, model = "\033[1mGROK BOT ACCOUNT\033[0m", "all bots"
         lines.append(title + (f" \033[2m· {model}\033[0m" if model else ""))
+        anim = (record.get("source") == "grok-bot" and app_running) or seat in running
         pct = context_percent(d)
         size = dig(d, "context_window", "context_window_size")
         if pct is not None:
-            lines.append(f"  Context  {bar(pct, bar_w)} {pct:3.0f}%")
+            lines.append(f"  Context  {bar(pct, bar_w, animate=anim)} {pct:3.0f}%")
             used = dig(d, "context_window", "context_tokens")
             if used is None and isinstance(size, (int, float)):
                 used = size * pct / 100
@@ -3058,7 +3309,7 @@ def usage_panel(width):
         for label, key in (("5-hour", "five_hour"), ("Weekly", "seven_day")):
             used = dig(d, "rate_limits", key, "used_percentage")
             if isinstance(used, (int, float)):
-                lines.append(f"  {label:7}  {bar(used, bar_w)} {used:3.0f}%")
+                lines.append(f"  {label:7}  {bar(used, bar_w, animate=anim)} {used:3.0f}%")
                 reset = dig(d, "rate_limits", key, "resets_at")
                 if isinstance(reset, (int, float)):
                     lines.append(f"\033[2m           {100 - used:.0f}% left · resets {when(reset)}\033[0m")
@@ -3076,9 +3327,15 @@ def usage_panel(width):
         lines.append(f"\033[2m  updated {ago(time.time() - record.get('time', 0))}\033[0m")
         lines.append("")
     split = context_split()
-    pie = context_pie(split, inner)  # [] when nobody reports a context figure
+    pie = context_pie(split, inner, busy=running)  # [] when nobody reports a context figure
     if pie:
-        lines += pie + context_rows(split, inner) + [""]
+        lines += pie + context_rows(split, inner, busy=running) + [""]
+    ctx = context_list(split)  # the categorised lists the owner asked for (02:43)
+    if ctx:
+        lines += ctx + [""]
+    plans = usage_list()
+    if plans:
+        lines += plans + [""]
     return [fit(" " + line, width) for line in lines]
 
 
@@ -3097,11 +3354,12 @@ def activity_panel(width):
     bars only. Since #61 this column is its own on the right of the chat,
     so the ready order is visible instead of scrolling away under the pie.
     """
+    snap = panel_scans()  # one shared half-second snapshot for every panel
     lines = ["\033[1mACTIVITY\033[0m", ""]
     activity_panel.ticking = False
     rows = []
-    for order, (seat, st, since) in enumerate(current_states()):
-        a = availability(seat, st)
+    for order, (seat, st, since) in enumerate(current_states(snap)):
+        a = availability(seat, st, snap=snap)
         usage, waiting, mark, word, shade = a["usage"], a["waiting"], a["mark"], a["word"], a["shade"]
         if word == "spent":
             reset = spent_reset(usage, spent_mark(seat))
@@ -3110,7 +3368,7 @@ def activity_panel(width):
                 activity_panel.ticking = True  # seconds are shown only in the last hour
         elif seat in APP_SEATS and APP_PROCESS.get(seat, "grok-bot") != "grok-bot" and st != "not set up":
             activity_panel.ticking = True  # it polls rather than being woken, so show when it next looks
-            began = poll_countdown(load_seat(seat))
+            began = poll_countdown(snap["seats"].get(seat) or load_seat(seat))
         else:
             began = when(since) if since else ""  # static: "03:27" today, "Fri 18:00" this week, "Nov 12 18:00" further back
         squares = "■" * min(waiting, 5) + (f"+{waiting - 5}" if waiting > 5 else "")
@@ -3118,7 +3376,8 @@ def activity_panel(width):
         # A spent row is all grey, name and squares too, and has no line
         # under it: nothing it holds can start until the reset (the owner, 08:07-08:08).
         spent = word == "spent"
-        summary = "" if spent else task_summary(load_seat(seat).get("doing") if word == "busy" else "", pending(seat))
+        doing = (snap["seats"].get(seat) or load_seat(seat)).get("doing")
+        summary = "" if spent else task_summary(doing if word == "busy" else "", snap["waiting"].get(seat, ()))
         name_shade, square_shade = (shade, shade) if spent else (colour(seat), 33)
         rows.append((*a["rank"], order,
                      [f"  \033[38;5;{name_shade}m{seat.title():8}\033[0m "
@@ -3126,6 +3385,14 @@ def activity_panel(width):
                       + (f" \033[38;5;{square_shade}m{squares}\033[0m" if squares else "")]
                      + ([f"    \033[2m↳ {summary}\033[0m"] if summary else [])))
     lines += [line for row in sorted(rows) for line in row[-1]]
+    balancer = load_balancer()
+    board = [t for t in balancer.all_tasks() if t["state"] in balancer.TASK_ACTIVE] if balancer else []
+    if board:
+        lines += ["", "\033[1mTASKS\033[0m"]
+        for t in board[-6:]:
+            who = t.get("holder") or "open"
+            lines.append(f"  \033[38;5;{colour(who) if t.get('holder') else 245}m{t['id']:4} {who:7}\033[0m "
+                         f"\033[2m{'(private)' if t.get('private') else t['summary']}\033[0m")
     return [fit(" " + line, width) for line in lines]
 
 
@@ -3140,23 +3407,26 @@ def row_status(state, waiting):
     return STATE_MARKS.get(state, "◌"), STATE_COLOURS.get(state, 245), state
 
 
-def current_states():
+def current_states(snap=None):
     """(seat, state, since) for every seat shown on the chat screen.
 
     Terminal agents that are away are left out, except Claude and Grok;
-    hidden app seats are never shown.
+    hidden app seats are never shown. `snap`, when given, is the chat
+    screen's panel_scans snapshot (the fast clock must not re-scan); the
+    router and team_status keep the live reads.
     """
     out = []
     for seat in AGENTS:
-        st = load_seat(seat)
+        st = snap["seats"][seat] if snap is not None else load_seat(seat)
         if st["state"] == "away" and seat not in ("claude", "grok") and not seat_spent(seat):
             continue  # a spent seat stays shown, so its countdown can be seen
         out.append((seat, st["state"], st.get("since")))
     for seat in APP_SEATS:
         if seat in HIDDEN_SEATS:
             continue
-        since = (read_json(seat_file(seat), {}) or {}).get("since")
-        out.append((seat, app_seat_state(seat), since))
+        d = snap["seats"][seat] if snap is not None else read_json(seat_file(seat), {}) or {}
+        out.append((seat, d.get("state") if snap is not None else app_seat_state(seat),
+                    d.get("since")))
     return out
 
 
@@ -3205,6 +3475,65 @@ def fit_column(lines, height):
 
 class FreshCode(Exception):
     """Raised inside chat() to leave the screen cleanly before run_fresh()."""
+
+
+def deck_version(max_age=2.0):
+    """The deck's version, derived from the git checkout so it moves with
+    every change (the owner, 04:26): 'v<commits>·<short-hash>', '+' when
+    the deck script itself has uncommitted edits. Nothing is bumped by
+    hand -- every commit and every merge renumbers the screen.
+
+    Cached for `max_age` seconds, so the fast redraw clock (up to 120
+    frames a second, 04:02) doesn't fork git every frame. '' when git
+    can't tell (no repo, no git); the bar then just shows 'v·?'.
+    """
+    c = deck_version._c
+    if time.time() - c["at"] < max_age:
+        return c["v"]
+    v = ""
+    try:
+        def g(*args):
+            return subprocess.run(["git", "-C", str(PROGRAM.parent), *args],
+                                  capture_output=True, text=True, timeout=2)
+        count = g("rev-list", "--count", "HEAD").stdout.strip()
+        short = g("rev-parse", "--short", "HEAD").stdout.strip()
+        if count.isdigit() and short:
+            dirty = g("status", "--porcelain", "--", str(PROGRAM)).stdout.strip()
+            v = f"{count}·{short}{'+' if dirty else ''}"
+    except Exception:
+        v = ""  # a missing git or repo never takes the screen down
+    c.update(at=time.time(), v=v)
+    return v
+
+
+deck_version._c = {"at": 0.0, "v": ""}
+
+
+def deck_header(cols):
+    """The chat screen's top bar (the owner, 04:26): a full-width dim band
+    like the input line it sits over, 'comms-deck · live notes on
+    <machine>' on the left and the version on the right -- v<commits> and
+    the short hash from deck_version(), gold for the number so a change
+    catches the eye, dim for the hash. Too narrow for all of it, the
+    subtitle drops first, then the version."""
+    sub = f" · live notes on {MACHINE}"
+    ver = deck_version()
+    count, _, tail = ver.partition("·") if ver else ("", "", "")
+    tail = f" · {tail}" if tail else ""
+    v_plain = ("v" + count + tail) if count else "v·?"
+    if 1 + len("comms-deck") + len(sub) + 1 + len(v_plain) + 1 > cols:
+        sub = ""  # narrow: the machine's name goes first
+    if 1 + len("comms-deck") + len(sub) + 1 + len(v_plain) + 1 > cols:
+        v_plain = ""  # narrower still: just the name
+    gap = max(0, cols - (1 + len("comms-deck") + len(sub)) - len(v_plain) - 1)
+    out = "\033[48;5;234m\033[1;38;5;255m comms-deck"
+    out += ("\033[22;38;5;244m" + sub) if sub else ""
+    out += " " * gap
+    if v_plain:
+        out += "\033[22;38;5;220m" + v_plain[:1 + len(count)]
+        out += ("\033[2;38;5;244m" + v_plain[1 + len(count):]) if v_plain[1 + len(count):] else ""
+    out += " \033[0m"
+    return out
 
 
 def chat(history=200, hide_private=False):
@@ -3319,7 +3648,7 @@ def chat(history=200, hide_private=False):
                 changed = False
                 if layout != (cols, rows):  # first time, or the window was resized
                     layout, changed = (cols, rows), True
-                    shown = [f"\033[1mcomms-deck\033[0m \033[2m· live notes on {MACHINE}\033[0m", ""]
+                    shown = []  # (the name and version live in the fixed top bar now)
                     for r in records[-history:]:
                         if not (hide_private and r.get("private")):
                             shown += chat_lines(r, chat_w)
@@ -3339,15 +3668,35 @@ def chat(history=200, hide_private=False):
                     changed = True
                 if not typed and not in_paste and not pending_esc and fresh_code():
                     raise FreshCode  # nothing half typed: reopen on the new code (after the finally)
-                if changed or time.time() - last_draw >= (1 if getattr(activity_panel, "ticking", False) else 2):
-                    body = rows - (1 if tty else 0)  # the chat box is the last line
+                # The animation clock (04:02, tuned to devin's review): only
+                # the busy bars' shimmer runs the fast clock -- the loop
+                # wakes every ~4 ms and frames go out on a 120 fps cap
+                # (measured: ~1.4 ms to build a frame cached, so plenty of
+                # headroom; kitty syncs and drops what can't keep up). A
+                # ticking countdown (a spent reset, an app seat's next
+                # check) keeps the old 1 s cadence: it changes once a
+                # second, so 120 fps of it would be ~1 core of identical
+                # frames for up to an hour. The scans sit behind a
+                # half-second snapshot, so the fast clock doesn't hammer
+                # /proc and the inboxes. Quiet screens keep the old pace --
+                # 0.25 s polls, 1-2 s redraws.
+                animating = getattr(usage_panel, "running", False)
+                gap = 1 / 120 if animating else (1 if getattr(activity_panel, "ticking", False) else 2)
+                if changed or time.time() - last_draw >= gap:
+                    # A fixed top bar (the version, 04:26), the notes, then
+                    # the chat box as the last line.
+                    body = rows - (2 if tty else 1)  # top bar + (the chat box | just the bar)
                     left = shown[-body:]
                     left = [""] * (body - len(left)) + left
-                    usg = usage_panel(usage_w) if usage_w else []
+                    if usage_w:
+                        usg = usage_panel(usage_w)  # sets usage_panel.running for the clock
+                    else:
+                        usage_panel.running = False  # no usage column: don't let a stale True spin the clock
+                        usg = []
                     act = activity_panel(panel_w) if panel_w else []
                     usg = (fit_column(usg, body) + [""] * body)[:body]
                     right = (fit_column(act, body) + [""] * body)[:body]
-                    screen = ["\033[H"]
+                    screen = ["\033[H", deck_header(cols), "\n"]
                     for i in range(body):
                         row = (fit(usg[i], usage_w) + f" \033[38;5;238m│\033[0m ") if usage_w else ""
                         row += fit(left[i], chat_w)
@@ -3361,9 +3710,9 @@ def chat(history=200, hide_private=False):
                     last_draw = time.time()
                 if tty:
                     import select
-                    select.select([sys.stdin], [], [], 0.25)
+                    select.select([sys.stdin], [], [], 1 / 240 if animating else 0.25)
                 else:
-                    time.sleep(0.25)
+                    time.sleep(1 / 240 if animating else 0.25)
         finally:
             if saved_tty is not None:
                 import termios
@@ -3575,17 +3924,37 @@ def vibe_model_info(model):
         return model, None
 
 
+def vibe_reported_context(session):
+    """The context size Vibe's own status line shows ("ctx 17.4k/202k"), or None.
+
+    It is last_reported_context_tokens in the newest generation's
+    checkpoint.json. That file also holds the conversation, so only this one
+    number is taken out of it, by pattern, and nothing else is kept.
+    """
+    generations = sorted((session / "generations").glob("*/checkpoint.json"))
+    if not generations:
+        return None
+    try:
+        text = generations[-1].read_text(errors="replace")
+    except OSError:
+        return None
+    m = re.search(r'"last_reported_context_tokens"\s*:\s*(\d+)', text)
+    return int(m.group(1)) if m else None
+
+
 def vibe_usage_from_session():
     """Vibe's context use, from the files Vibe writes for its live session.
 
     The owner OK'd reading these (2026-11-25). Vibe keeps one folder per
-    session under ~/.vibe/logs/session/unified/. The live one is the folder
-    whose context-breakdown.json changed last: it holds the tokens now in
-    context (system, tools, skills, conversation), and meta.json names the
-    model. The window size comes from Vibe's model catalog. Vibe's free
-    models report no plan limit, so there's no 5-hour or weekly bar.
-    Returns (time, data) in the status-line shape, or None if Vibe isn't
-    running.
+    session under ~/.vibe/logs/session/unified/; the live one changed last.
+    The tokens are the figure Vibe's own status line shows
+    (vibe_reported_context). context-breakdown.json is only a fallback: it
+    can count far more than is really in context (it read 578k of a 262k
+    window on 2026-11-25, when Vibe's screen said 17.4k of 202k). The
+    window is the one Vibe's UI uses (ui_startup_config.json), else the
+    model catalog's. meta.json names the model. Vibe's free models report
+    no plan limit, so there's no 5-hour or weekly bar. Returns (time, data)
+    in the status-line shape, or None if Vibe isn't running.
     """
     if not any(proc_name(int(d.name)) == AGENTS["vibe"] for d in Path("/proc").iterdir() if d.name.isdigit()):
         return None
@@ -3598,9 +3967,17 @@ def vibe_usage_from_session():
         meta = json.loads((newest.parent / "meta.json").read_text())
     except (OSError, ValueError):
         return None
-    tokens = sum(v for v in breakdown.values() if isinstance(v, (int, float)))
+    reported = vibe_reported_context(newest.parent)
+    tokens = reported if reported is not None else sum(
+        v for v in breakdown.values() if isinstance(v, (int, float)))
     model = dig(meta, "config", "active_model") or dig(meta, "config", "model_name") or ""
     label, window = vibe_model_info(model) if model else ("", None)
+    try:  # the window Vibe's own status line divides by ("17.4k/202k")
+        ui = json.loads((HOME / ".vibe/ui_startup_config.json").read_text())
+        if ui.get("contextWindow") and str(ui.get("activeModelDisplayName") or "").startswith(label or "\0"):
+            window = ui["contextWindow"]
+    except (OSError, ValueError):
+        pass
     data = {"model": {"id": model, "display_name": label}, "context_window": {"context_tokens": tokens}}
     if isinstance(window, (int, float)) and window > 0:
         data["context_window"]["context_window_size"] = window
@@ -3649,6 +4026,71 @@ def context_percent(data):
     return None
 
 
+STALE_BUSY = 600  # a busy seat whose file hasn't changed this long, with notes waiting, is stale
+
+
+def status_json(now=None):
+    """Every seat, for programs (Chronophage): state, why it may be stuck, and ages.
+
+    Plain facts only; the watchdog decides what to do with them.
+    """
+    now = time.time() if now is None else now
+    seats = {}
+    for seat in tuple(AGENTS) + APP_SEATS:
+        s = load_seat(seat)
+        st = app_seat_state(seat) if seat in APP_SEATS else s["state"]
+        a = availability(seat, st, now)
+        notes = pending(seat)
+        oldest = min((path.stat().st_mtime for path, _ in notes), default=None)
+        seats[seat] = {
+            "kind": "app" if seat in APP_SEATS else "agent",
+            "state": st, "shown": a["word"], "rank": list(a["rank"]),
+            "waiting": len(notes),
+            "waiting_normal": sum(1 for _, r in notes if not r.get("quiet")),
+            "oldest_waiting_s": round(now - oldest) if oldest else 0,
+            "since_s": round(now - float(s.get("since") or now)),
+            "file_age_s": round(now - float(s.get("updated") or now)),
+            "can_wake": bool(s.get("kitty_socket") and s.get("kitty_window")) if seat in AGENTS else None,
+            "paused": int(s.get("auto") or 0) >= AUTO_LIMIT,
+            "held_by_draft": bool(s.get("held_by_draft")) or st == "draft in box",
+            "retry_at": float(s.get("app_retry_at") or 0) or None,
+            "spent_until": spent_reset(a["usage"], spent_mark(seat, now), now),
+            "hidden": seat in HIDDEN_SEATS,
+        }
+    return {"time": now, "machine": MACHINE, "seats": seats}
+
+
+def wake_seat(seat, stale=False):
+    """One wake attempt for `seat`, for a watchdog. Returns (done, reason).
+
+    With `stale`, a seat that has said busy for STALE_BUSY seconds without
+    its file changing, while notes wait, is treated as idle first: its Stop
+    hook never ran, so nothing else would ever deliver to it. The wake pastes
+    the notes and presses Enter; if the agent was in fact still working, that
+    lands in its turn, which is why the bar is 10 minutes with no change.
+    """
+    if seat not in AGENTS:
+        return False, "only terminal agents can be woken this way"
+    s = load_seat(seat)
+    if not pending(seat):
+        return False, "nothing waiting"
+    if seat_spent(seat):
+        return False, "out of usage until its reset"  # before any write: a spent seat's state is left as it is
+    if stale and s["state"] == "busy" and time.time() - float(s.get("updated") or 0) >= STALE_BUSY:
+        update_seat(seat, state="idle")
+        log(f"{seat}: busy with no change for {STALE_BUSY // 60} min while notes wait; treating as idle")
+    if try_wake(seat):
+        return True, "woken"
+    s = load_seat(seat)
+    reason = ("out of usage until its reset" if seat_spent(seat) else
+              "paused by the loop guard" if int(s.get("auto") or 0) >= AUTO_LIMIT else
+              "a draft is in its prompt" if s.get("held_by_draft") else
+              f"state is {s['state']}" if s["state"] != "idle" else
+              "no kitty window to type into" if not (s.get("kitty_socket") and s.get("kitty_window")) else
+              "its window is focused or unreadable")
+    return False, reason
+
+
 def status_text():
     """A short table of every agent seat."""
     rows = []
@@ -3661,6 +4103,116 @@ def status_text():
         rows.append(f"{seat:8} {app_seat_state(seat):14} {len(pending(seat))} waiting")
     hook_state = "Discord mirror: on" if WEBHOOK_FILE.exists() else "Discord mirror: off"
     return "\n".join(rows + [hook_state])
+
+
+def usage_report(days=7, now=None):
+    """A text report of this deck's usage, from its own logs.
+
+    `comms-deck usage [--days N]`: notes sent and received (log.jsonl), time
+    each seat spent in each state (activity.jsonl, this machine only), and
+    the plan-limit meters and spent marks (usage/, limits/). Plain text, no
+    agent needed: everything is already on disk; this only reads it back.
+    """
+    now = time.time() if now is None else now
+    since_epoch = now - days * 86400
+    since_text = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(since_epoch))
+    out = [f"comms-deck usage, last {days} day(s) (since {since_text[:16]})", ""]
+
+    # Notes, from log.jsonl.
+    msgs = []
+    try:
+        for line in (DATA / "log.jsonl").open():
+            try:
+                r = json.loads(line)
+            except ValueError:
+                continue
+            if r.get("kind") == "message" and str(r.get("time", "")) >= since_text:
+                msgs.append(r)
+    except OSError:
+        pass
+    if not msgs:
+        out.append("notes: none in the log for this period")
+    else:
+        per_day, by_from, to_seat, quiet, private = {}, {}, {}, 0, 0
+        for r in msgs:
+            day = str(r.get("time", ""))[:10]
+            per_day[day] = per_day.get(day, 0) + 1
+            by_from[r.get("from", "unknown")] = by_from.get(r.get("from", "unknown"), 0) + 1
+            for seat in str(r.get("to") or "").split("+"):
+                to_seat["(all) " if seat == "all" else seat] = to_seat.get("(all) " if seat == "all" else seat, 0) + 1
+            quiet += 1 if r.get("quiet") else 0
+            private += 1 if r.get("private") else 0
+        out.append(f"notes: {len(msgs)} sent ({quiet} quiet, {private} private)")
+        out.append("  by day:   " + "  ".join(f"{d}: {n}" for d, n in sorted(per_day.items())))
+        fmt = lambda counts: ", ".join(f"{k.strip()} {v}" for k, v in
+                                       sorted(counts.items(), key=lambda kv: -kv[1]) if v)
+        out.append("  sent by:  " + fmt(by_from))
+        out.append("  sent to:  " + fmt(to_seat))
+    out.append("")
+
+    # Time in state, from activity.jsonl (written by serve on this machine).
+    spans, last = {}, {}
+    by_program = {proc: seat for seat, proc in AGENTS.items() if proc != seat}
+    try:
+        for line in (DATA / "activity.jsonl").open():
+            try:
+                r = json.loads(line)
+            except ValueError:
+                continue
+            seat, state, t = r.get("seat"), r.get("state"), r.get("time")
+            seat = by_program.get(seat, seat)  # older records name a seat by its program (agy is gravity)
+            if not seat or state is None or not isinstance(t, (int, float)):
+                continue
+            if seat in last:
+                prev_state, prev_t = last[seat]
+                if prev_state != state:
+                    span = max(prev_t, since_epoch)
+                    if span < t:
+                        d = spans.setdefault(seat, {}).setdefault(prev_state, 0)
+                        spans[seat][prev_state] = d + (t - span)
+            last[seat] = (state, t)
+    except OSError:
+        pass
+    if not spans and not last:
+        out.append("activity: nothing recorded yet")
+    else:
+        out.append("activity (time in each state, hours):")
+        for seat in sorted(set(spans) | (set(last) if last else set())):
+            buckets = dict(spans.get(seat, {}))
+            current = last.get(seat)
+            if current and current[1] > since_epoch:
+                buckets[current[0]] = buckets.get(current[0], 0) + max(0.0, now - max(current[1], since_epoch))
+            bits = []
+            for state, seconds in sorted(buckets.items(), key=lambda kv: -kv[1]):
+                if seconds > 60:
+                    mark = " *" if current and current[0] == state else ""
+                    bits.append(f"{state} {seconds / 3600:.1f}h{mark}")
+            if bits:
+                out.append(f"  {seat:8} " + ", ".join(bits))
+            else:
+                out.append(f"  {seat:8} (less than a minute in each state)")
+    out.append("")
+
+    # Plan-limit meters and spent marks.
+    out.append("plan limits:")
+    rows = []
+    for seat in tuple(AGENTS) + APP_SEATS:
+        d = (read_json(DATA / "usage" / f"{seat}.json", {}) or {}).get("data") or {}
+        bits = []
+        for label, key in (("5-hour", "five_hour"), ("weekly", "seven_day")):
+            used = dig(d, "rate_limits", key, "used_percentage")
+            if isinstance(used, bool) or not isinstance(used, (int, float)):
+                continue
+            reset = dig(d, "rate_limits", key, "resets_at")
+            when_text = f", resets {when(reset, now)}" if isinstance(reset, (int, float)) else ""
+            bits.append(f"{label} {used:.0f}% used{when_text}")
+        marked = spent_mark(seat, now)
+        if marked is not None:
+            bits.append(f"spent until {when(marked, now)} ({countdown(marked, now)})")
+        if bits:
+            rows.append(f"  {seat:8} " + "; ".join(bits))
+    out.extend(rows if rows else ["  no meters reported and no spent marks"])
+    return "\n".join(out)
 
 
 # -----------------------------------------------------------------------------
@@ -3697,6 +4249,20 @@ MCP_TOOLS = [
     {"name": "team_status",
      "description": "Which agents are busy, idle or away, and how many notes wait for each.",
      "inputSchema": {"type": "object", "properties": {}}},
+    {"name": "tasks",
+     "description": "The task board: requests from the owner to several agents, each with one "
+                    "holder chosen by the deck. Don't start a task someone else holds.",
+     "inputSchema": {"type": "object", "properties": {
+         "all": {"type": "boolean", "description": "Include finished tasks."}}}},
+    {"name": "claim_task",
+     "description": "Take an open task (refused if another seat holds it).",
+     "inputSchema": {"type": "object", "required": ["id"], "properties": {"id": {"type": "string"}}}},
+    {"name": "release_task",
+     "description": "Give up a task you hold; the deck hands it to the next most available seat.",
+     "inputSchema": {"type": "object", "required": ["id"], "properties": {"id": {"type": "string"}}}},
+    {"name": "done_task",
+     "description": "Mark a task you hold as finished.",
+     "inputSchema": {"type": "object", "required": ["id"], "properties": {"id": {"type": "string"}}}},
 ]
 
 
@@ -3751,7 +4317,32 @@ def poll_countdown(state, now=None):
     return f"next check in {clock(left)}" if left >= 0 else f"check late {clock(-left)}"
 
 
+def mcp_only(seat):
+    """True for an app seat that reaches the deck only through MCP (Lumo): nothing can wake it."""
+    return seat in APP_SEATS and APP_PROCESS.get(seat, "grok-bot") != "grok-bot"
+
+
 def mcp_call(seat, name, args):
+    """Run one MCP tool. Returns (text, is_error).
+
+    A seat that can't be woken (mcp_only) gets its waiting notes with the
+    answer to any tool, not only read_messages: the same as a hook handing
+    Claude its notes at the end of a turn. Otherwise a seat that is busy
+    sending and setting status, but not reading, never sees its notes.
+    """
+    text, error = mcp_tool(seat, name, args)
+    if not error and name != "read_messages" and mcp_only(seat):
+        notes = take(seat)
+        if notes:
+            try:
+                note_mcp_call(seat, "read_messages")
+            except OSError:
+                pass
+            text += "\n\n---\nNotes that were waiting for you:\n\n" + render(notes, seat)
+    return text, error
+
+
+def mcp_tool(seat, name, args):
     """Run one MCP tool. Returns (text, is_error)."""
     try:
         note_mcp_call(seat, name)
@@ -3772,6 +4363,13 @@ def mcp_call(seat, name, args):
         return "Status set.", False
     if name == "team_status":
         return status_text(), False
+    if name in ("tasks", "claim_task", "release_task", "done_task"):
+        balancer = load_balancer()
+        if not balancer:
+            return "The load balancer isn't installed on this machine, so there are no tasks.", True
+        if name == "tasks":
+            return balancer.tasks_text(active_only=not args.get("all")), False
+        return balancer.task_action(seat, name.split("_")[0], str(args.get("id", "")).strip()), False
     return f"Unknown tool {name}", True
 
 
@@ -3948,6 +4546,13 @@ def install(yes):
                 old.symlink_to(new)
     step("move ~/.local/share/launchpad and ~/.config/launchpad to the comms-deck names", migrate)
 
+    def link_balancer():
+        repo = HOME / "load-balancer" / "load-balancer"
+        if repo.exists():
+            bin_dir.mkdir(parents=True, exist_ok=True)
+            link("load-balancer", repo)
+    step(f"link {bin_dir}/load-balancer to ~/load-balancer, if that repo is cloned (the task board)",
+         link_balancer)
     step(f"link {bin_dir}/comms-deck (and the old name, launchpad) and push-courier to this repo",
          lambda: (bin_dir.mkdir(parents=True, exist_ok=True), link("comms-deck", here / "comms-deck"),
                   link("launchpad", here / "comms-deck"), link("push-courier", here / "push-courier")))
@@ -4138,7 +4743,12 @@ def self_test():
     """Check the mailbox, hooks, loop guard and MCP server. Exit 1 on failure."""
     tmp = tempfile.mkdtemp(prefix="comms-deck-test-")
     os.environ["COMMS_DECK_NO_NOTIFY"] = "1"  # test notes to the owner must not pop up on the desktop
+    for name in ("KITTY_LISTEN_ON", "KITTY_WINDOW_ID"):
+        os.environ.pop(name, None)  # a test seat must never record, and so type into, a real kitty window
+    # The deck's checks test the deck alone: the load balancer (the task board)
+    # has its own `load-balancer self-test`, so it's switched off here.
     env = dict(os.environ, COMMS_DECK_HOME=f"{tmp}/data", COMMS_DECK_CONFIG=f"{tmp}/config",
+               COMMS_DECK_LOAD_BALANCER="/nonexistent-in-self-test",
                COMMS_DECK_AUTO_LIMIT="2")
     me = str(Path(__file__).resolve())
     failures = []
@@ -4188,6 +4798,40 @@ def self_test():
     run(["--from", "owner", "send", "grok", "from the owner"], "owner")
     r = run(["hook", "--source", "grok", "--event", "Stop"], "grok", "{}", {"GROK_HOOK_EVENT": "stop"})
     check("an owner note gets through a paused loop guard", "from the owner" in r.stdout, r.stdout)
+    now = time.time()
+    uhome = Path(tmp) / "usage-home"
+    (uhome / "usage").mkdir(parents=True)
+    (uhome / "limits").mkdir(parents=True)
+    (uhome / "log.jsonl").write_text("".join(json.dumps(r) + "\n" for r in [
+        {"kind": "message", "from": "claude", "to": "grok", "time": "2026-11-24 10:00:00", "text": "u1"},
+        {"kind": "message", "from": "grok", "to": "claude+vibe", "time": "2026-11-24 23:00:00", "text": "u2", "quiet": True},
+        {"kind": "message", "from": "grok", "to": "claude", "time": "2026-11-01 08:00:00", "text": "too old"},
+        {"kind": "commentary", "from": "claude", "time": "2026-11-24 11:00:00", "text": "not a note"},
+    ]))
+    (uhome / "activity.jsonl").write_text("".join(json.dumps(r) + "\n" for r in [
+        {"seat": "claude", "state": "busy", "time": 1795560000.0},
+        {"seat": "claude", "state": "idle", "time": 1795563600.0},
+    ]))
+    (uhome / "usage" / "claude.json").write_text(json.dumps(
+        {"data": {"rate_limits": {"five_hour": {"used_percentage": 42, "resets_at": now + 3600}}}}))
+    (uhome / "limits" / "grok.json").write_text(json.dumps({"resets_at": now + 7200, "set_by": "claude", "set_at": now}))
+    r = run(["usage"], "owner", extra={"COMMS_DECK_HOME": str(uhome)})
+    check("usage: notes counted, old rows and commentary excluded",
+          r.returncode == 0 and "notes: 2 sent (1 quiet, 0 private)" in r.stdout
+          and "2026-11-24: 2" in r.stdout
+          and "claude 1" in r.stdout and "vibe 1" in r.stdout
+          and "u1" not in r.stdout and "u2" not in r.stdout,  # note texts never leak into a metrics report
+          r.stdout + r.stderr)
+    check("usage: time in state and plan meters show",
+          "busy 1.0h" in r.stdout and "idle" in r.stdout and "*" in r.stdout
+          and "5-hour 42% used" in r.stdout
+          and "grok" in r.stdout and "spent until" in r.stdout, r.stdout + r.stderr)
+    empty_home = Path(tmp) / "usage-home-empty"
+    empty_home.mkdir()
+    r = run(["usage"], "owner", extra={"COMMS_DECK_HOME": str(empty_home)})
+    check("usage: an empty deck reports and doesn't crash",
+          r.returncode == 0 and "none in the log" in r.stdout and "no meters" in r.stdout,
+          r.stdout + r.stderr)
     r = run(["send", "all -grok", "minus grok"], "owner")
     in_grok = [json.load(open(p)) for p in Path(f"{tmp}/data/inbox/grok").glob("*.json")]
     in_claude = [json.load(open(p)) for p in Path(f"{tmp}/data/inbox/claude").glob("*.json")]
@@ -4462,8 +5106,8 @@ def self_test():
     check("Vibe's composer: the > line under its labelled rule", composer_text(vibe_screen) ==
           "Hello. Check the local directory", repr(composer_text(vibe_screen)))
     granted = grant_vibe_tools('theme = "ansi-dark"\n\n[tools.comms-deck_send_message]\npermission = "ask"\n')
-    check("vibe's five deck tools are allowed, a choice already made is kept, and twice is once",
-          granted.count("[tools.comms-deck_") == 5 and 'send_message]\npermission = "ask"' in granted
+    check("vibe's deck tools are allowed, a choice already made is kept, and twice is once",
+          granted.count("[tools.comms-deck_") == len(VIBE_ALLOWED_TOOLS) and 'send_message]\npermission = "ask"' in granted
           and grant_vibe_tools(granted) == granted, granted)
     check("Vibe's empty composer reads as empty",
           composer_text(vibe_screen.replace("Hello. Check the local directory", "")) == "",
@@ -4620,6 +5264,13 @@ def self_test():
         "assert fresh == [] and cur == 't1@3'",
         "idle = {'open': True, 'replying': False, 'composer': ''}",
         "assert x.app_delivery_allowed({'open':True,'replying':True,'composer':''}, False, {'auto':0}, 'alice') is False",
+        "x.APP_SEATS = tuple(set(x.APP_SEATS) | {'pollseat2'}); x.APP_PROCESS['pollseat2'] = 'some-app'",
+        "x.write_json(x.DATA / 'inbox' / 'pollseat2' / 'n1.json', {'id': 'n1', 'from': 'owner', 'to': 'pollseat2', 'text': 'please check X', 'time': '2026-11-24 07:00:00', 'quiet': False, 'private': False})",
+        "out, err = x.mcp_call('pollseat2', 'set_status', {'text': 'working'})",
+        "assert not err and 'Notes that were waiting for you' in out and 'please check X' in out and not x.pending('pollseat2')",
+        "assert 'send_message tool' in out and 'Reply here in this chat' not in out",
+        "out, err = x.mcp_call('pollseat2', 'set_status', {'text': 'again'}); assert 'Notes that were waiting' not in out",
+        "assert x.load_seat('pollseat2').get('polled_at')",
         "ch, st = x.draft_status({}, 'w', 1000.0); assert ch == {'app_draft': 'w', 'app_draft_since': 1000.0} and not st",
         "ch, st = x.draft_status({'app_draft': 'w', 'app_draft_since': 1000.0}, 'w', 1000.0 + x.DRAFT_STALE - 1); assert not ch and not st",
         "ch, st = x.draft_status({'app_draft': 'w', 'app_draft_since': 1000.0}, 'w', 1000.0 + x.DRAFT_STALE); assert st",
@@ -4720,6 +5371,8 @@ def self_test():
         "assert x.task_summary('', [('p', {'text': '@claude please fix https://x.y the chat layout', 'private': False})]) == 'please fix the chat layout'",
         "assert x.task_summary('', [('p', {'text': 'token stuff', 'private': True})]) == 'private note'",
         "assert x.task_summary('', []) == ''",
+        "j = x.status_json(); assert set(j['seats']) >= {'claude', 'grok'} and 'shown' in j['seats']['claude']",
+        "assert x.wake_seat('alice')[0] is False",
         "assert x.task_summary('<system-reminder> fixing the chat layout now', []) == 'fixing the chat layout now'",
         "assert x.task_summary('<system-reminder>', [('p', {'text': 'merge the PR', 'private': False})]) == 'merge the PR'",
         "assert x.describe('<system-reminder>\\nhook text\\n</system-reminder>\\nreview PR 36') == 'review PR 36'",
@@ -4755,6 +5408,12 @@ def self_test():
         "(x.DATA / 'inbox' / 'gravity' / 'g1.json').unlink()",
         "x.mark_spent('gravity', 'clear', 'claude')",
         "assert not x.seat_spent('gravity')",
+        "x.mark_spent('codex', '+1h', 'claude'); x.update_seat('codex', state='idle', kitty_socket='unix:/nonexistent', kitty_window='1')",
+        "x.write_json(x.DATA / 'inbox' / 'codex' / 'w1.json', {'from': 'owner', 'text': 'hi', 'time': '2026-11-24 07:00:00'})",
+        "assert x.try_wake('codex') is False and x.wake_seat('codex') == (False, 'out of usage until its reset')",
+        "x.update_seat('codex', state='busy'); x.write_json(x.DATA / 'seats' / 'codex.json', dict(x.load_seat('codex'), updated=1.0))",
+        "assert x.wake_seat('codex', stale=True) == (False, 'out of usage until its reset') and x.load_seat('codex')['state'] == 'busy'",
+        "x.mark_spent('codex', 'clear', 'claude'); (x.DATA / 'inbox' / 'codex' / 'w1.json').unlink()",
         "x.write_json(x.DATA / 'usage' / 'gravity.json', {'time': now, 'data': {'rate_limits': {'five_hour': full(x.time.time() + 600)}}})",
         "x.update_seat('gravity', state='away')",
         "assert x.seat_spent('gravity') and any(s == 'gravity' for s, _, _ in x.current_states())",
@@ -4796,6 +5455,11 @@ def self_test():
         "(vh / '.vibe/model_catalog_cache.json').write_text('{\"k\": [{\"id\": \"m-free\", \"label\": \"M Free\", \"max_context_length\": 40000}]}')",
         "_, vd = x.vibe_usage_from_session()",
         "assert vd['model']['display_name'] == 'M Free' and x.context_percent(vd) == 25.0, vd",
+        "g = sd / 'generations/0000000000000002'; g.mkdir(parents=True); (sd / 'generations/0000000000000001').mkdir()",
+        "(g / 'checkpoint.json').write_text('{\"compaction_count\": 2, \"last_reported_context_tokens\": 4000, \"turn\": {}}')",
+        "(vh / '.vibe/ui_startup_config.json').write_text('{\"activeModelDisplayName\": \"M Free[high]\", \"contextWindow\": 20000}')",
+        "_, vd = x.vibe_usage_from_session()",
+        "assert x.context_percent(vd) == 20.0, vd",  # Vibe's own figure and window win over the breakdown and catalog
         "x.AGENTS['vibe'] = 'no-such-program-xyz'; assert x.vibe_usage_from_session() is None",
         "x.HOME, x.AGENTS['vibe'] = real_home, real_vibe",
         # The context-split pie reads usage/<seat>.json only: counts, never text.
@@ -4832,16 +5496,43 @@ def self_test():
         "assert '38;5;255' in x.bar(50, 10, step=1), 'a glint sweeps the usage bars as well'",
         "assert '█' not in x.ANSI.sub('', x.bar(0, 8, step=0)), 'an empty bar draws an empty track, no glint'",
         "assert '38;5;196' in x.bar(95, 10, step=0), 'a full bar reads red, not amber'",
+        "bs0 = x.bar(50, 10, step=0, animate=False); bs5 = x.bar(50, 10, step=5, animate=False)",
+        "assert bs0 == bs5, 'an idle bar is still: no shimmer while the agent rests (04:02)'",
+        "assert '38;5;255' not in bs5 and '38;5;250' not in bs5, 'no glint, no trail on an idle bar'",
+        "assert '38;5;78' in bs0, 'an idle bar keeps the threshold hue'",
+        "assert x.breathe_style(208, 0.0) == '2;38;5;208' and x.breathe_style(208, 4.0) == '1;38;5;208', 'the continuous wave matches pulse_style at the integers'",
+        "assert x.context_rows(sp2, 40, step=0, busy=()) == x.context_rows(sp2, 40, step=3, busy=()), 'rows of idle seats do not move'",
+        "assert x.context_rows(sp2, 40, step=3, busy=None) == x.context_rows(sp2, 40, step=3), 'busy=None keeps the old animate-everything behaviour'",
+        "pidle = x.context_pie(sp, 40, step=0, busy=()); assert x.context_pie(sp, 40, step=5, busy=()) == pidle, 'an all-idle disc is still'",
+        "assert x.context_pie(sp, 40, step=0, busy=None) != x.context_pie(sp, 40, step=5, busy=None), 'the disc breathes when seats work'",
+        "dv0 = x.deck_version(0); dv1 = x.deck_version(0)",
+        "import re as _re",
+        "assert _re.match(r'^\\d+\\u00b7[0-9a-f]+\\+?$', dv0), 'the version is commits \\u00b7 hash (+dirty), from git: ' + repr(dv0)",
+        "assert dv0 == dv1, 'the cache holds between calls: ' + repr(dv0) + ' vs ' + repr(dv1)",
+        "head = x.deck_header(120); head_t = x.ANSI.sub('', head)",
+        "assert 'comms-deck' in head_t and ('v' + dv0.partition('\\u00b7')[0]) in head_t, 'the top bar carries the name and the version'",
+        "assert len(x.ANSI.sub('', head)) <= 120, 'the bar fits the width'",
         "up = x.usage_panel(40); up_t = ' '.join(x.ANSI.sub('', l) for l in up)",
         "ap = x.activity_panel(40); ap_t = ' '.join(x.ANSI.sub('', l) for l in ap)",
         "assert 'ACTIVITY' not in up_t and 'ACTIVITY' in ap_t, 'the panels split cleanly'",
         "assert 'USAGE' in up_t, up_t",  # usage keeps its column; the ready order keeps its ink
+        "cl = x.context_list(sp2); cl_t = ' '.join(x.ANSI.sub('', l) for l in cl)",
+        "assert cl_t.split().index('grok') < cl_t.split().index('gravity'), cl_t  # highest tokens first",
+        "assert 'pool' in cl_t and '90.0%' in cl_t, cl_t  # the pool total and each seat's share",
+        "assert x.context_list([]) == [], 'an empty split draws no CONTEXT block'",
+        "assert all(f'38;5;{x.colour(s)}' in ''.join(cl) for s, _ in sp2), 'the key keeps its hues'",
+        "pl2 = x.usage_list(); pl_t = ' '.join(x.ANSI.sub('', l) for l in pl2)",
+        "assert 'PLAN USAGE' in pl_t and 'codex' in pl_t and '40%' in pl_t, pl_t  # the 5-hour figure shows",
+        "assert pl_t.index('codex') < pl_t.index('gravity') if 'gravity' in pl_t else True, pl_t  # sorted highest first",
         "x.DATA = real_data",
         "col = ['USAGE', '', 'A', '  updated 1s ago', '', 'B', '  updated 2s ago', '', 'C']",
         "assert x.fit_column(col, 20) == col",  # fits: untouched
         "assert x.fit_column(col, 7) == ['USAGE', '', 'A', '', 'B', '', 'C']",  # footers go first
         "assert x.fit_column(col, 4) == ['USAGE', 'A', 'B', 'C']",  # then the spacers
         "assert x.fit_column(col, 2) == ['USAGE', 'A']",  # only then the bottom
+        "x._balancer = False; text, failed = x.mcp_call('claude', 'tasks', {})",
+        "assert failed and 'isn' in text and 'installed' in text, text",  # no load balancer: said plainly
+        "x._balancer = False",
         "assert x.poll_countdown({}, now) == \"hasn't checked yet\"",
         "assert x.poll_countdown({'polled_at': now - 18}, now) == 'next check in 0:42'",
         "assert x.poll_countdown({'polled_at': now - 125, 'poll_gap': 60}, now) == 'check late 1:05'",
@@ -4886,6 +5577,11 @@ def self_test():
     r = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True, timeout=30)
     check("a full plan limit is spent until its reset, and waiting notes are counted from the inbox",
           r.returncode == 0 and r.stdout.strip() == "ok", r.stdout + r.stderr)
+    layout = Path(__file__).resolve().parent / "desktop" / "scratchpad-layout"
+    r = subprocess.run([sys.executable, str(layout), "--self-test"], env=env,
+                       capture_output=True, text=True, timeout=30)
+    check("scratchpad cells tile flush, including Vibe and the shared bottom right",
+          r.returncode == 0 and "layout tiles ok" in r.stdout, r.stdout + r.stderr)
     body = Path(tmp) / "pr-body.txt"
     body.write_text("Written by: Grok\nReviewed by: Claude\n")
     r = run(["review-check", "--file", str(body)], "grok")
@@ -4970,7 +5666,10 @@ def main():
     p.add_argument("--peek", action="store_true", help="show without taking")
     p = sub.add_parser("note")
     p.add_argument("text", nargs="+")
-    sub.add_parser("status")
+    p = sub.add_parser("status")
+    p.add_argument("--json", action="store_true", help="every seat as JSON, for programs")
+    p = sub.add_parser("usage", help="notes, activity and plan limits for the deck, from its logs")
+    p.add_argument("--days", type=int, default=7)
     sub.add_parser("watch")
     p = sub.add_parser("chat")
     p.add_argument("--hide-private", action="store_true")
@@ -4986,6 +5685,9 @@ def main():
     p = sub.add_parser("install")
     p.add_argument("--yes", action="store_true")
     sub.add_parser("self-test")
+    p = sub.add_parser("wake", help="one wake attempt for a seat (for watchdogs)")
+    p.add_argument("seat")
+    p.add_argument("--stale", action="store_true", help="treat a long-unchanged busy seat as idle")
     p = sub.add_parser("spent", help="mark a seat spent until its limit resets (for agents with no meter)")
     p.add_argument("seat")
     p.add_argument("until", nargs="+", help="+166h, +90m, +2d, 06:20, 'YYYY-MM-DD HH:MM', or clear")
@@ -5017,7 +5719,9 @@ def main():
             add_note(me(), " ".join(args.text))
             print("added to the commentary")
         elif args.cmd == "status":
-            print(status_text())
+            print(json.dumps(status_json(), indent=1) if args.json else status_text())
+        elif args.cmd == "usage":
+            print(usage_report(max(1, args.days)))
         elif args.cmd == "watch":
             watch()
         elif args.cmd == "chat":
@@ -5045,6 +5749,10 @@ def main():
             install(args.yes)
         elif args.cmd == "self-test":
             sys.exit(self_test())
+        elif args.cmd == "wake":
+            done, reason = wake_seat(args.seat.lower(), args.stale)
+            print(json.dumps({"seat": args.seat.lower(), "woken": done, "reason": reason}))
+            sys.exit(0 if done else 3)
         elif args.cmd == "spent":
             print(mark_spent(args.seat.lower(), " ".join(args.until), me()))
         elif args.cmd == "review-check":
