@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- **The cost ledger, hardened (Vibe's review of #102).** A seat without
+  session ids now keys its generations by machine as well (`seat|machine|gen-N`).
+  Two machines' counters both start at 0, so a restored ledger can no longer
+  merge different sessions. A drop in cost opens a new session only when the
+  next reading is low too. One flaky low figure is held and then dropped
+  when the cost comes straight back, so the climb back isn't counted twice.
+  The docs say a pool's all-time figure is the sum of its seats', and that
+  only a machine wiped within the ten-minute push window loses anything.
+  By Claude.
 - **One Grok bot.** The owner (23:08): the Grok Bot app runs one bot now,
   so the second bot seat is gone from the code, the docs and the setup
   examples; the pool comments in the telemetry layer describe the bot seats

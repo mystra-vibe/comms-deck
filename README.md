@@ -223,7 +223,9 @@ service copies it to the private relay repo (`ledger/costs.json`) at most
 every ten minutes. At each pass it merges the two both ways, taking the
 higher figure per entry. On a reinstalled machine, cloning `private-relay`
 and starting the service brings the history back. It counts from the day
-the ledger began (the top bar says "since <date>"). Claude Code's figures
+the ledger began (the top bar says "since <date>"). A crash loses nothing,
+because every change is written to DATA at once. Only a machine wiped within
+ten minutes of its last push loses that tail. Claude Code's figures
 are estimates at API list prices, so the total says "est." while any are in
 it.
 
