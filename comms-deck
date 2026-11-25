@@ -3282,14 +3282,16 @@ def busy_seats(snap=None):
 
 
 def usage_panel(width):
-    """The usage column: context, limits and cost per seat, then the split.
+    """The usage column: context, limits and cost per seat, then the lists.
 
     Since #61 this is drawn on the LEFT of the chat (the owner's layout):
     the ready order moved to its own activity_panel() on the right, so
-    neither pushes the other off the screen. Under the pie sit the two
-    categorised lists the owner asked for (02:43): CONTEXT, one row per
-    reporting seat highest first with its share of the pool, and PLAN
-    USAGE, one row per seat with the tighter of its plan meters. Bars
+    neither pushes the other off the screen. The CONTEXT SPLIT pie and
+    bars moved to the right column too (the owner, 05:17: too tall for
+    the left); what stays here are the categorised lists the owner asked
+    for (02:43): CONTEXT, one row per reporting seat highest first with
+    its share of the pool, and PLAN USAGE, one row per seat with the
+    tighter of its plan meters. Bars
     shimmer only while that seat's agent is busy (04:02); idle bars are
     still. Sets usage_panel.running for the redraw clock: true while any
     bar has something to animate, so the screen can tick fast then.
@@ -3375,9 +3377,6 @@ def usage_panel(width):
         lines.append(f"\033[2m  updated {ago(time.time() - record.get('time', 0))}\033[0m")
         lines.append("")
     split = context_split()
-    pie = context_pie(split, inner, busy=running)  # [] when nobody reports a context figure
-    if pie:
-        lines += pie + context_rows(split, inner, busy=running) + [""]
     ctx = context_list(split)  # the categorised lists the owner asked for (02:43)
     if ctx:
         lines += ctx + [""]
@@ -3541,6 +3540,12 @@ def activity_panel(width):
             who = t.get("holder") or "open"
             lines.append(f"  \033[38;5;{colour(who) if t.get('holder') else 245}m{t['id']:4} {who:7}\033[0m "
                          f"\033[2m{'(private)' if t.get('private') else t['summary']}\033[0m")
+    # The context split lives on this column now (the owner, 05:17): the pie
+    # and bars were too tall for the usage column on the left.
+    split = context_split()
+    pie = context_pie(split, width - 2, busy=busy_seats(snap))  # [] when nobody reports a figure
+    if pie:
+        lines += [""] + pie + context_rows(split, width - 2, busy=busy_seats(snap)) + [""]
     return [fit(" " + line, width) for line in lines]
 
 

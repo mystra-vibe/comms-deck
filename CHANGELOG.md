@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- **The context split moves right.** The CONTEXT SPLIT pie and its
+  per-seat bars now sit at the foot of the right-hand column, under
+  TASKS; the left usage column keeps the per-seat meters and the
+  CONTEXT / PLAN USAGE lists. The pie and bars were too tall for the
+  left. By Devin, on the owner's ask.
 - **Devin's usage, on the panel.** The CLI exports OTLP metrics to the
   service's listener on 127.0.0.1:4318; `usage/devin.json` gets session
   input/output tokens, the most-used model and the raw counters (running
