@@ -3054,57 +3054,55 @@ def context_split():
 
 
 def context_pie(split, width, step=None, busy=None):
-    """The CONTEXT SPLIT lines: a text pie of live context, colour per seat.
+    """The CONTEXT SPLIT lines: a box of dots filled in each seat's colour.
 
-    Drawn from characters, since the chat is a terminal: each dot is a cell
-    whose distance and 'clock angle' from the centre pick its wedge, so a
-    quarter of the tokens is a quarter of the disc. Biggest slice starts at
-    12 o'clock. beside the disc, one legend row per seat, then one total row
-    naming the seats in it (grok's ask). Reports the context now, not
-    lifetime session tokens. The disc breathes with the clock (continuous
-    phase), dimmer and quieter than the bars -- and each wedge only
-    shimmers while that seat is actually working: `busy` is the set of
-    working seats, None means everything pulses (tests). Returns [] when
-    nobody reports a figure.
+    The owner (06:36): no pie, a box of dots that fill up with the right
+    colour and glow while in use. Every dot is an equal slice of the context
+    pool, so a seat with a quarter of the tokens fills a quarter of the box.
+    Seats fill in order, biggest first, left to right and row by row, so
+    each seat is one solid run of colour. A working seat's dots breathe
+    (`busy` is the set of working seats; None makes everything glow, for
+    tests). An idle seat's dots sit still in its colour. Under the box: one
+    legend row per seat, then the total. The name is kept so callers don't
+    change. Returns [] when nobody reports a figure.
     """
     if not split:
         return []
     esc = "\033["
     fstep = float(step) if step is not None else time.time() / PULSE_EVERY
     total = sum(used for _, used in split)
-    box = max(9, min(width - 2, 17))          # cells across the disc
-    height = max(max(box // 2 + 1, len(split)), 5)  # chars are twice as tall as wide
-    cx, cy = (box - 1) / 2, (height - 1) / 2
-    radius = min(cx, cy) + 0.25
-    acc = 0.0
-    wedges = []  # (clockwise fraction where the slice starts, seat)
-    for seat, used in sorted(split, key=lambda s: -s[1]):
-        wedges.append((acc / total, seat))
-        acc += used
-    disc = []
-    for i in range(height):
-        cells = ""
-        for j in range(box):
-            dx, dy = (j - cx) * 0.5, i - cy
-            if dx * dx + dy * dy > radius * radius:
-                cells += f"{esc}38;5;238m·{esc}0m"
-                continue
-            frac = (math.atan2(dx, -dy) / (2 * math.pi)) % 1.0  # 12 o'clock = 0, clockwise
-            for start, seat in reversed(wedges):
-                if frac >= start - 1e-9:
-                    break
+    cols = max(10, min(width - 2, 40))
+    rows = 4
+    cells = cols * rows
+    order = sorted(split, key=lambda s: -s[1])
+    # Largest remainder: the counts add up to every dot, and no reporting
+    # seat is left with none.
+    raw = [(seat, cells * used / total) for seat, used in order]
+    counts = {seat: max(1, int(share)) for seat, share in raw}
+    spare = cells - sum(counts.values())
+    for seat, share in sorted(raw, key=lambda r: -(r[1] - int(r[1]))):
+        if spare <= 0:
+            break
+        counts[seat] += 1
+        spare -= 1
+    while spare < 0:  # the minimum of one dot overshot: take from the biggest
+        big = max(counts, key=counts.get)
+        counts[big] -= 1
+        spare += 1
+    owners = [seat for seat, _ in order for _ in range(counts[seat])]
+    lines = [f"{esc}1mCONTEXT SPLIT{esc}0m", ""]
+    for r in range(rows):
+        row = ""
+        for c in range(cols):
+            seat = owners[r * cols + c]
             if busy is not None and seat not in busy:
-                cells += f"{esc}38;5;{colour(seat)}m·{esc}0m"  # idle: still, no shimmer
+                row += f"{esc}38;5;{colour(seat)}m●{esc}0m"   # idle: still
             else:
-                cells += f"{esc}{breathe_style(colour(seat), i * 2 + j + fstep)}m·{esc}0m"
-        disc.append(cells)
-    legend = [f"{esc}38;5;{colour(seat)}m■{esc}0m {seat:8} {100 * used / total:4.1f}%  {esc}2m{short_tokens(used)}{esc}0m"
+                row += f"{esc}{breathe_style(colour(seat), r * 2 + c + fstep)}m●{esc}0m"
+        lines.append(row)
+    lines.append("")
+    lines += [f"{esc}38;5;{colour(seat)}m■{esc}0m {seat:8} {100 * used / total:4.1f}%  {esc}2m{short_tokens(used)}{esc}0m"
               for seat, used in split]
-    lines = ["\033[1mCONTEXT SPLIT\033[0m", ""]
-    for i in range(max(len(disc), len(legend))):
-        left = disc[i] if i < len(disc) else " " * box
-        right = legend[i] if i < len(legend) else ""
-        lines.append(f"{left}  {right}".rstrip())
     lines.append(f"{esc}1mTotal{esc}0m {short_tokens(total)} across "
                  f"{esc}2m{' + '.join(seat for seat, _ in split)}{esc}0m")
     return lines
@@ -6204,6 +6202,13 @@ def self_test():
         "assert 'CONTEXT SPLIT' in pt and 'Total' in pt and 'claude + grok + gravity' in pt, pt",
         "assert '67.4%' in pt and '32768' not in pt and '32.8k' in pt and 'codex' not in pt, pt  # shares of the total; no-figure seat left out, not zero",
         "assert x.context_pie([], 40) == [], 'an empty deck draws nothing'",
+        # The box of dots (the owner, 06:36): every dot used, each seat's run sized by its share.
+        "bx = [x.ANSI.sub('', l) for l in pl[2:6]]",
+        "assert len(bx) == 4 and all(len(r) == 38 and set(r) == {'●'} for r in bx), bx",
+        "dots = ''.join(x.context_pie(sp, 40, busy=())[2:6]); n = {s: dots.count(f'[38;5;{x.colour(s)}m●') for s, _ in sp}",
+        "assert sum(n.values()) == 152 and n['claude'] == 102 and n['grok'] == 33 and n['gravity'] == 17, n",
+        "tiny = x.context_pie([['claude', 1e9], ['grok', 1.0]], 40, busy=())",
+        "assert f'[38;5;{x.colour(\"grok\")}m●' in ''.join(tiny), 'a reporting seat always gets at least one dot'",
         "(pc / 'usage' / 'claude.json').write_text('{\"time\": 1, \"data\": {\"cost\": {\"total_cost_usd\": \"no\"}}}')",
         "assert [s for s, _ in x.context_split()] == ['grok', 'gravity'], 'garbage data drops out too'",
         "x.write_json(pc / 'usage' / 'grok.json', {'time': 1, 'source': 'test', 'data': {'context_window': {'context_tokens': 294000, 'context_window_size': 262144}}})",
