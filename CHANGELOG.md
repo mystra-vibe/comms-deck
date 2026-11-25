@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- **telemetry(): one shape for every provider's usage.** The data layer
+  for the 03 redesign (the owner, 22:03: every provider, model, bot and
+  account, never an invented figure). One record per registered seat plus
+  any usage file whose seat isn't registered: provider, account, models,
+  availability, freshness, allocation windows, tokens/requests/sessions and
+  spend. A figure the provider doesn't report is None, never 0.
+  `telemetry_rows()` folds seats that share an account (the Grok Bot) into
+  one row with the freshest figures. By Claude.
 - **03 USAGE is usage only.** The owner (21:35): 06 CONTEXT SPLIT already
   covers context, so the usage column drops each seat's Context bar and
   the CONTEXT list. It shows each seat's 5-hour and weekly limits,

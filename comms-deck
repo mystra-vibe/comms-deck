@@ -3379,6 +3379,131 @@ def usage_list():
     return lines
 
 
+# -- Telemetry: one shape for every provider's usage ---------------------
+# The owner (22:03, relayed by Alice): 03 must cover every connected
+# provider, model, bot and account, with new ones appearing on their own,
+# and must never invent figures. telemetry() is the data layer the 03
+# renderer and `comms-deck usage` read; nothing below names a seat.
+#
+# A label for the company behind a usage file's source. It's only a label:
+# an unknown source falls back to the source name itself, and a seat with
+# no usage file at all still gets a record (connected, telemetry unavailable).
+PROVIDER_LABELS = {"claude": "Anthropic", "grok": "xAI", "grok-bot": "xAI",
+                   "devin-db": "Cognition", "devin-otel": "Cognition",
+                   "vibe-session": "Mistral", "gravity-hook": "Google",
+                   "codex": "OpenAI", "lumo": "Proton", "lumo-desktop": "Proton"}
+TELEMETRY_STALE = 6 * 3600  # seconds: an older update is shown as stale, not hidden
+
+
+def _num(v):
+    """v when it's a real number, else None (bools and strings aren't figures)."""
+    return v if isinstance(v, (int, float)) and not isinstance(v, bool) else None
+
+
+def telemetry_record(seat, record):
+    """One seat's usage file as the common record; see telemetry()."""
+    record = record or {}
+    d = record.get("data") or {}
+    source = record.get("source")
+    account = source if source == "grok-bot" else None  # one account shared by every bot
+    model = dig(d, "model", "display_name") or dig(d, "model", "id")
+    program = AGENTS.get(seat) or APP_PROCESS.get(seat)  # what the seat runs as: names a provider with no file yet
+    allocation = []
+    for key, rl in sorted((dig(d, "rate_limits") or {}).items()):
+        used = _num((rl or {}).get("used_percentage"))
+        if used is None:
+            continue
+        window = {"five_hour": "5h", "seven_day": "wk"}.get(key, key)
+        left = _num(rl.get("remaining_percentage"))
+        allocation.append({"window": window, "used_pct": float(used),
+                           "remaining_pct": float(left if left is not None else max(0.0, 100.0 - used)),
+                           "resets_at": _num(rl.get("resets_at"))})
+    cw = dig(d, "context_window") or {}
+    metrics = dig(d, "otel", "metrics") or {}
+    tokens = {
+        "input": _num(cw.get("session_input_tokens")) if _num(cw.get("session_input_tokens")) is not None
+        else _num(cw.get("total_input_tokens")),
+        "output": _num(cw.get("session_output_tokens")) if _num(cw.get("session_output_tokens")) is not None
+        else _num(cw.get("total_output_tokens")),
+        "cache_read": _num(dig(d, "devin", "cache_read_tokens")) if _num(dig(d, "devin", "cache_read_tokens")) is not None
+        else _num(dig(cw, "session_usage", "cache_read_input_tokens")),
+        "requests": _num(dig(d, "devin", "requests")),
+        "sessions": _num(metrics.get("devin.session.count")),
+        "active_s": _num(metrics.get("devin.active_time.total")),
+    }
+    cost = _num(dig(d, "cost", "total_cost_usd"))
+    # Claude Code prices the session at API list rates while the seat runs on
+    # a plan (it reports rate_limits), so that figure is an estimate. Nobody
+    # reports a confirmed bill or a running total across sessions yet.
+    kind = None if cost is None else ("estimate" if dig(d, "rate_limits") is not None or source == "claude" else "reported")
+    updated = _num(record.get("time"))
+    has = bool(allocation) or any(v is not None for v in tokens.values()) or cost is not None
+    return {
+        "seat": seat, "provider": PROVIDER_LABELS.get(source) or PROVIDER_LABELS.get(program)
+        or source or program or "unknown",
+        "account": account, "models": [model] if model else [],
+        "connected": seat in SEATS, "available": has, "source": source,
+        "updated": updated, "stale": updated is not None and time.time() - updated > TELEMETRY_STALE,
+        "allocation": allocation, "tokens": tokens,
+        "spend": {"session_usd": cost, "cumulative_usd": None, "kind": kind},
+        "raw": d,
+    }
+
+
+def telemetry():
+    """Every seat's usage in one shape, for 03 USAGE and `comms-deck usage`.
+
+    Seats come from the registry (SEATS: the built-in agents,
+    COMMS_DECK_SEATS and ~/.config/comms-deck/app-seats), plus any usage
+    file whose seat isn't registered, so a new integration shows up as soon
+    as it is registered or writes its first figure. Each record:
+
+      seat, provider, account (seats sharing one carry the same id), models,
+      connected, available (reports any usage figure at all), source,
+      updated (epoch of the last write) and stale,
+      allocation: [{window, used_pct, remaining_pct, resets_at}],
+      tokens: {input, output, cache_read, requests, sessions, active_s},
+      spend: {session_usd, cumulative_usd, kind: estimate|reported|None},
+      raw: the file's data, untouched.
+
+    A figure the provider doesn't report is None, never 0, and no
+    percentage is derived from token counts. Context isn't here: that's
+    06 CONTEXT SPLIT's (context_split()).
+    """
+    usage_dir = DATA / "usage"
+    seats = [s for s in SEATS if s != "owner"]
+    extra = sorted(p.stem for p in usage_dir.glob("*.json")) if usage_dir.is_dir() else []
+    seats += [s for s in extra if s not in seats]
+    return [telemetry_record(s, read_json(usage_dir / f"{s}.json")) for s in seats]
+
+
+def telemetry_rows(records=None):
+    """telemetry() with seats that share an account folded into one row.
+
+    The row is the account's freshest record (each bot writes the same
+    account's figures at its own moments, so an older copy is just older),
+    with "seats" listing every seat on it. A seat with no account is its
+    own row, seats == [seat].
+    """
+    rows, by_account = [], {}
+    for r in telemetry() if records is None else records:
+        key = r["account"]
+        if key is None:
+            rows.append(dict(r, seats=[r["seat"]]))
+            continue
+        held = by_account.get(key)
+        if held is None:
+            by_account[key] = dict(r, seats=[r["seat"]])
+            rows.append(by_account[key])
+            continue
+        seats = held["seats"] + [r["seat"]]
+        if (r["updated"] or 0) > (held["updated"] or 0):
+            held.clear()
+            held.update(r)
+        held["seats"] = seats
+    return rows
+
+
 PANEL_SCAN_TTL = 0.5  # seconds; the chat's fast clock must not hammer /proc
 
 _panel_scans = {"at": 0.0, "seats": {}, "waiting": {}}
@@ -6682,6 +6807,23 @@ def self_test():
         "sp3 = x.context_split(); assert 'devin' in [s for s, _ in sp3], sp3",
         "dr = [x.ANSI.sub('', l) for l in x.context_rows(sp3, 40) if 'devin' in l]",
         "assert len(dr) == 1 and 'window unknown' in dr[0] and '122.6k' in dr[0] and '%' not in dr[0], dr",
+        # telemetry(): every registered seat, one shape, None where a provider reports nothing
+        "tm = {r['seat']: r for r in x.telemetry()}",
+        "assert set(s for s in x.SEATS if s != 'owner') <= set(tm), 'every registered seat has a record'",
+        "assert tm['codex']['allocation'] == [{'window': '5h', 'used_pct': 40.0, 'remaining_pct': 60.0, 'resets_at': None}], tm['codex']",
+        "assert tm['claude']['available'] is False and tm['claude']['tokens']['input'] is None, 'context alone is not usage'",
+        "assert tm['claude']['spend'] == {'session_usd': None, 'cumulative_usd': None, 'kind': None}, 'no cost reported: None, not 0'",
+        "assert all(v is None for r in tm.values() if not r['available'] for v in r['tokens'].values()), 'unavailable never reads as zero'",
+        "x.write_json(pc / 'usage' / 'newbot.json', {'time': 5, 'source': 'acme', 'data': {'cost': {'total_cost_usd': 0.0}}})",
+        "tm = {r['seat']: r for r in x.telemetry()}",
+        "assert tm['newbot']['provider'] == 'acme' and tm['newbot']['connected'] is False, 'an unregistered usage file still shows'",
+        "assert tm['newbot']['available'] and tm['newbot']['spend']['session_usd'] == 0.0, 'a real zero stays a zero'",
+        "x.write_json(pc / 'usage' / 'grok.json', {'time': 9, 'source': 'grok', 'data': {'context_window': {'session_input_tokens': 7, 'session_output_tokens': 3}, 'cost': {'total_cost_usd': 0.5}}})",
+        "g = {r['seat']: r for r in x.telemetry()}['grok']",
+        "assert g['tokens']['input'] == 7 and g['tokens']['output'] == 3 and g['allocation'] == [] and g['spend']['kind'] == 'reported', g",
+        "acc = [dict(r, account='shared', updated=t, allocation=[{'window': 'wk', 'used_pct': p}]) for r, t, p in ((tm['codex'], 1, 10.0), (tm['claude'], 3, 90.0))]",
+        "rows = x.telemetry_rows(acc); assert len(rows) == 1 and rows[0]['seats'] == ['codex', 'claude'], rows",
+        "assert rows[0]['allocation'][0]['used_pct'] == 90.0, 'a shared account shows its freshest figures'",
         "x.DATA = real_data",
         # The top bar's notification queue mirrors into the deck's feed.
         "nd = x.Path(x.tempfile.mkdtemp()); real_nd, real_nq = x.DATA, x.NOTIFY_QUEUE",
