@@ -668,15 +668,37 @@ def send(sender, to, text, quiet=False, private=False):
             log(f"load-balancer couldn't make a task: {error}")
         if task:
             record["task"] = task["id"]
+    deliver(record, targets)
+    return record, warning
+
+
+def deliver(record, targets, enqueue=True):
+    """One delivery path, shared by send() (and, once #75 lands,
+    import_remote()): each target gets the note (an inbox file; the desktop
+    bell for the owner; nothing for a remote seat, whose mailbox is the git
+    copy), then the git queue, then the log, then the @deck actions.
+
+    `enqueue=False` is import_remote's case: the record came FROM the git
+    copy of the flight-log, so queueing it again would commit it back a
+    second time.
+
+    Written by: mystra (2026-11-25); the body is send()'s tail moved rather
+    than changed, with the `if enqueue` around queue_out — at the owner's
+    instruction, from the Wave-1 package on quantum-kittens (PR #7).
+    """
     for seat in targets:
         if seat == "owner":
-            notify(f"Note from {record['from']}", text)
+            notify(f"Note from {record['from']}", record["text"])
+        elif APP_PROCESS.get(seat) == "remote":
+            pass  # a remote seat takes its notes from the git copy; nothing here
+                  # would ever take it out of an inbox, so the screen's squares
+                  # must not count one that won't be read
         else:
             write_json(DATA / "inbox" / seat / f"{record['id']}.json", record)
-    queue_out(record)
+    if enqueue:
+        queue_out(record)
     append_log(record)
     queue_actions(record)
-    return record, warning
 
 
 def add_note(sender, text):
@@ -3287,14 +3309,16 @@ def busy_seats(snap=None):
 
 
 def usage_panel(width):
-    """The usage column: context, limits and cost per seat, then the split.
+    """The usage column: context, limits and cost per seat, then the lists.
 
     Since #61 this is drawn on the LEFT of the chat (the owner's layout):
     the ready order moved to its own activity_panel() on the right, so
-    neither pushes the other off the screen. Under the pie sit the two
-    categorised lists the owner asked for (02:43): CONTEXT, one row per
-    reporting seat highest first with its share of the pool, and PLAN
-    USAGE, one row per seat with the tighter of its plan meters. Bars
+    neither pushes the other off the screen. The CONTEXT SPLIT pie and
+    bars moved to the right column too (the owner, 05:17: too tall for
+    the left); what stays here are the categorised lists the owner asked
+    for (02:43): CONTEXT, one row per reporting seat highest first with
+    its share of the pool, and PLAN USAGE, one row per seat with the
+    tighter of its plan meters. Bars
     shimmer only while that seat's agent is busy (04:02); idle bars are
     still. Sets usage_panel.running for the redraw clock: true while any
     bar has something to animate, so the screen can tick fast then.
@@ -3380,9 +3404,6 @@ def usage_panel(width):
         lines.append(f"\033[2m  updated {ago(time.time() - record.get('time', 0))}\033[0m")
         lines.append("")
     split = context_split()
-    pie = context_pie(split, inner, busy=running)  # [] when nobody reports a context figure
-    if pie:
-        lines += pie + context_rows(split, inner, busy=running) + [""]
     ctx = context_list(split)  # the categorised lists the owner asked for (02:43)
     if ctx:
         lines += ctx + [""]
@@ -3546,6 +3567,12 @@ def activity_panel(width):
             who = t.get("holder") or "open"
             lines.append(f"  \033[38;5;{colour(who) if t.get('holder') else 245}m{t['id']:4} {who:7}\033[0m "
                          f"\033[2m{'(private)' if t.get('private') else t['summary']}\033[0m")
+    # The context split lives on this column now (the owner, 05:17): the pie
+    # and bars were too tall for the usage column on the left.
+    split = context_split()
+    pie = context_pie(split, width - 2, busy=busy_seats(snap))  # [] when nobody reports a figure
+    if pie:
+        lines += [""] + pie + context_rows(split, width - 2, busy=busy_seats(snap)) + [""]
     return [fit(" " + line, width) for line in lines]
 
 
@@ -6322,6 +6349,42 @@ def self_test():
     body.write_text("Reviewed by: Claude\n")
     r = run(["review-check", "--file", str(body)], "grok")
     check("a review with no author line fails", r.returncode != 0 and "no Written by" in r.stderr, r.stderr)
+    # cite-check: rule 4's gate beside review-check (docs/CITATION.md,
+    # Mystra's Wave-1 piece 3). Two independent gates; never one verdict.
+    body.write_text("Written by: grok\nReviewed by: claude\ncomms-deck\nREADME.md\n")
+    r = run(["cite-check", "--file", str(body)], "grok")
+    check("a cited PR passes cite-check", r.returncode == 0 and "grok" in r.stdout, r.stdout + r.stderr)
+    body.write_text("Reviewed by: claude\n")
+    r = run(["cite-check", "--file", str(body)], "grok")
+    check("a PR with no Written by fails cite-check",
+          r.returncode != 0 and "no Written by" in r.stderr, r.stderr)
+    body.write_text("Written by: grok\n")
+    r = run(["cite-check", "--file", str(body), "--strict"], "grok")
+    check("strict mode needs a PR number to diff the files",
+          r.returncode != 0 and "needs a PR number" in r.stderr, r.stderr)
+    # (the strict pass case is the stubbed cite_gap check below: files cited
+    # in the text, strict mode, no gh call)
+    code = "\n".join([
+        "import importlib.machinery as m, importlib.util as u",
+        f"l = m.SourceFileLoader('cd', {me!r}); s = u.spec_from_loader('cd', l)",
+        "x = u.module_from_spec(s); l.exec_module(x)",
+        # stub the fetch: strict mode compares against the PR's file list
+        "x.pr_files = lambda n: ['comms-deck', 'docs/README.md']",
+        "gap = x.cite_gap('Written by: grok\\nREADME.md\\n', 99)",
+        "assert gap and 'never cites' in gap and 'docs/README.md' in gap, gap",
+        "assert x.cite_gap('Written by: grok\\nPR touches comms-deck, docs/README.md.\\n', 99) is None, 'a sentence-ending period still cites'",
+        "assert x.cite_gap('Written by: grok\\nPR touches `comms-deck` and **docs/README.md**\\n', 99) is None, 'markdown-wrapped paths cite'",
+        "gap = x.cite_gap('Written by: grok\\ndocs/README.md.backup is a different file\\n', 99)",
+        "assert gap and 'docs/README.md' in gap, gap",
+        "gap = x.cite_gap('Reviewed by: claude\\n')",
+        "assert gap == 'no Written by line naming a seat', gap",
+        "assert x.cite_gap('Written by: grok\\nReviewed by: grok\\n') is None, 'cite-check never gates on review-check'",
+        "assert x.cite_gap('Written by: grok\\n') is None, 'plain mode has no file list'",
+        "print('ok')",
+    ])
+    r = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True, timeout=30)
+    check("strict cite-check refuses PRs whose text never cites the touched files",
+          r.returncode == 0 and r.stdout.strip() == "ok", r.stdout + r.stderr)
     shutil.rmtree(tmp, ignore_errors=True)
     print(f"\n{'all passed' if not failures else f'{len(failures)} failed'}")
     return 1 if failures else 0
@@ -6379,6 +6442,54 @@ def pr_review_text(number):
     return "\n".join(parts)
 
 
+def pr_files(number):
+    """The file paths a PR touches, from gh. Raises on failure. One
+    --name-only call; no content is fetched.
+
+    Written by: mystra (2026-11-25, Wave-1 piece 3).
+    """
+    result = subprocess.run(
+        ["gh", "pr", "diff", str(number), "--repo", "whyyyyyai/comms-deck", "--name-only"],
+        capture_output=True, text=True, timeout=30)
+    if result.returncode != 0:
+        raise RuntimeError((result.stderr or result.stdout or "gh pr diff failed").strip())
+    return [line for line in result.stdout.splitlines() if line.strip()]
+
+
+def cite_gap(text, number=None):
+    """None if the PR text carries the authorship citation rule 4 asks for
+    (docs/CITATION.md), otherwise a short reason.
+
+    Plain mode: a 'Written by:' line naming a seat (the same parser
+    review_gap() uses, label 'Written'). With `number` (--strict): every
+    file the PR touches must be named somewhere in the PR text -- the
+    body's citation list, a per-file 'Written by:' table, anything citable
+    -- so a PR that cannot say who wrote each file does not merge. Two
+    independent gates: cite_gap never reads review_gap's verdict and never
+    looks at CREDITS tables.
+
+    Written by: mystra (2026-11-25, Wave-1 piece 3).
+    """
+    writers = credited_seats(text, "Written")
+    if not writers:
+        return "no Written by line naming a seat"
+    if number:
+        # Markdown-emphasis and inline-code marks wouldn't stop a reader
+        # from seeing the path, so strip them before matching (claude's
+        # review of the first cut): `docs/CITATION.md` or **README.md**
+        # cite the file just as plainly as bare text.
+        plain = re.sub(r"`{1,3}([^`]*)`{1,3}", r"\1", text).replace("**", "")
+        # Whole-path match: docs/README.md is not cited by README.md. A
+        # sentence-ending period after the path still counts; a period that
+        # starts another path segment (docs/README.md.backup) does not.
+        cited = lambda path: re.search(r"(?<![\w./-])" + re.escape(path)
+                                       + r"(?=$|[\s,;:)]|\.(?![\w]))", plain) is not None
+        missing = [path for path in pr_files(number) if not cited(path)]
+        if missing:
+            return "files the PR touches that its text never cites: " + ", ".join(missing[:6])
+    return None
+
+
 def main():
     """The command line: send, read, the chat screen, the service, hooks and install."""
     parser = argparse.ArgumentParser(prog="comms-deck", description=__doc__.split("\n")[0])
@@ -6421,6 +6532,11 @@ def main():
     p = sub.add_parser("review-check")
     p.add_argument("number", nargs="?", type=int, help="pull request number on this repo")
     p.add_argument("--file", help="check this text instead of fetching the PR")
+    p = sub.add_parser("cite-check", help="fail unless the PR cites the seat that wrote it (docs/CITATION.md)")
+    p.add_argument("number", nargs="?", type=int, help="pull request number on this repo")
+    p.add_argument("--file", help="check this text instead of fetching the PR")
+    p.add_argument("--strict", action="store_true",
+                   help="also require every changed file to be cited in the PR text")
     args = parser.parse_args()
 
     def me():
@@ -6498,6 +6614,26 @@ def main():
             others = [s for s in credited_seats(text, "Reviewed")
                       if s not in credited_seats(text, "Written")]
             print("ok: reviewed by " + ", ".join(others))
+        elif args.cmd == "cite-check":
+            # What it checks is the PR's *text* (rule 4, docs/CITATION.md);
+            # commits' Co-Authored-By trailers are CI's job, not this verb's.
+            if args.strict and not args.number:
+                sys.exit("comms-deck: cite-check --strict needs a PR number to diff its files")
+            try:
+                if args.file:
+                    text = Path(args.file).read_text()
+                elif args.number:
+                    text = pr_review_text(args.number)
+                else:
+                    sys.exit("comms-deck: cite-check needs a PR number or --file")
+                gap = cite_gap(text, args.number if args.strict else None)  # may raise: gh fecthes the file list
+            except (OSError, RuntimeError, json.JSONDecodeError, subprocess.SubprocessError) as error:
+                sys.exit(f"comms-deck: {error}")
+            if gap:
+                who = f"PR #{args.number}" if args.number else f"file {args.file}"
+                sys.exit(f"comms-deck: {who}: {gap}")
+            print("ok: cited by " + ", ".join(credited_seats(text, "Written"))
+                  + (" (strict: every file cited)" if args.strict else ""))
     except ValueError as error:
         sys.exit(f"comms-deck: {error}")
     except KeyboardInterrupt:
