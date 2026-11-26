@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- **The mail screen's window rule (workspace 2).** For the mail client
+  (Devin builds the view): `comms-deck install` now also links a
+  `comms-deck-mail` launcher (kitty, class `comms-deck-mail`), adds its app
+  menu entry, and, for a Lua Hyprland config, a rule putting it fullscreen
+  on workspace 2 — Super+2 already goes there, so no new keybind (Claude).
+  `comms-deck mail` itself is still to come. By Vibe.
 - **Telemetry records can name provider, account and models.** A usage
   feed may now declare `data.provider`, `data.account`/`account_id` and
   `data.models`; the seat/source labels stay the fallback, so a remote
