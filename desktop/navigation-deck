@@ -9,6 +9,11 @@ one full-screen picture:
 
   SEATS        the ready order, with each seat's note load and spent countdown
   METERS       each seat's plan usage (5-hour, weekly, monthly, context)
+  WARP CORE    the cockpit in the middle: a first-person starfield whose
+               speed is the deck's own traffic (notes this hour, busy
+               seats, load), the reticle at the vanishing point, and
+               seats with waiting notes plotted as contacts (their first
+               letter, at a bearing of their own); WARP/SHLD readouts
   WORKSPACES   which windows sit on which workspace, including special:magic
   VITALS       memory left, a sparkline of the recent past, the swap warning
   DECK PULSE   notes per hour today and who carried them
@@ -32,7 +37,9 @@ in ~/.local/share/comms-deck/navigation/ (one small file per day).
 Written by: vibe (2026-11-26), inspired by comms-deck by claude.
 """
 import json
+import math
 import os
+import random
 import re
 import subprocess
 import sys
@@ -495,14 +502,142 @@ def pulse_panel(width, hours, busy):
 KEYS_LINE = "  q quit · r redraw · w <seat> wake (the deck's rules apply) · g <ws> goto · c chat · n notes"
 
 
+# ------------------------------------------------------- the warp core ----
+# The cockpit: a first-person view of the deck. Stars stream past a
+# reticle at the vanishing point, and their speed is the deck's own traffic —
+# notes this hour, busy seats, load average. Seats with waiting notes plot as
+# contacts around the reticle, at a bearing of their own.
+
+STAR_SEED, STAR_COUNT = 7, 90
+STAR_GLYPHS = ("·", "*", "•")          # far, mid, near
+HUD_STATE = {"rng": random.Random(STAR_SEED), "stars": [], "last": None}
+
+
+def warp_factor(status, hours, load=0.0):
+    """How fast the starfield flies, from the deck's own traffic (1.0–9.9)."""
+    seats = status.get("seats") or {}
+    busy = sum(1 for d in seats.values() if d.get("state") == "busy")
+    waiting = sum(d.get("waiting", 0) for d in seats.values())
+    hour_now = datetime.now().hour
+    recent = hours.get(hour_now, 0) + 0.7 * hours.get((hour_now - 1) % 24, 0)
+    f = 1.0 + 0.06 * recent + 0.4 * busy + 0.012 * waiting + min(4.0, load)
+    return max(1.0, min(9.9, f))
+
+
+def star_field(width, height, warp):
+    """The star layer as strings: stars stream from the vanishing point."""
+    rng, state = HUD_STATE["rng"], HUD_STATE
+    now = time.time()
+    dt = 0.5 if state["last"] is None else min(2.0, now - state["last"])
+    state["last"] = now
+    stars = state["stars"]
+    while len(stars) < STAR_COUNT:
+        stars.append([rng.uniform(0, 6.283), rng.uniform(0.05, 1.0), rng.random()])
+    for s in stars:
+        s[1] += dt * warp * (0.04 + s[2] * 0.16)
+        if s[1] > 1.0:
+            s[0], s[1], s[2] = rng.uniform(0, 6.283), rng.uniform(0.03, 0.1), rng.random()
+    grid, cx, cy = {}, (width - 1) / 2, (height - 1) / 2
+    rx, ry = max(2, width // 2 - 2), max(1, height // 2 - 1)
+    for ang, dist, depth in stars:
+        def put(d, ch):
+            x, y = int(round(cx + math.cos(ang) * d * rx)), int(round(cy + math.sin(ang) * d * ry))
+            if 0 <= x < width and 0 <= y < height and (x, y) not in grid:
+                grid[(x, y)] = ch
+        trail = warp > 5.0 and dist > 0.5
+        put(dist, STAR_GLYPHS[0 if dist < 0.3 else (1 if dist < 0.7 else 2)])
+        if trail:
+            put(dist * 0.9, "·")
+            put(dist * 1.08, "·")
+    # the reticle: a bull's own sight at the vanishing point
+    for ox, ch in ((-2, "─"), (-1, "╼"), (1, "╾"), (2, "─")):
+        grid[(int(cx) + ox, int(cy))] = grid.get((int(cx) + ox, int(cy)), ch)
+    for oy, ch in ((-1, "┊"), (1, "┊")):
+        grid[(int(cx), int(cy) + oy)] = ch
+    grid[(int(cx), int(cy))] = "⊕"
+    return grid
+
+
+def hud_panel(width, height, status, hours, info, load):
+    """The cockpit: starfield, reticle, contacts and the readout strip."""
+    rows = [panel_title("warp core", "(the deck from the pilot's seat)", width)]
+    warp = warp_factor(status, hours, load)
+    seats = status.get("seats") or {}
+    total, avail = info.get("MemTotal", 0), info.get("MemAvailable", 0)
+    shield = avail / total if total else 1.0
+    mem_gib = avail / 1024**3
+    field_h = max(3, height - 7)
+    field_w = width - 2
+    grid = star_field(field_w, field_h, warp)
+    # contacts: a seat with something on its plate is a blip on the ring
+    live = [(n, d) for n, d in sorted(seats.items(), key=lambda kv: kv[1].get("rank", [9, 99]))
+            if d.get("state") == "busy" or d.get("waiting", 0)]
+    ring_r = min(3, field_h // 2 - 1)
+    for i, (name, d) in enumerate(live[:12]):
+        ang = 6.283 * i / max(4, len(live))
+        x = int(round((field_w - 1) / 2 + math.cos(ang) * (field_w / 2 - 3)))
+        y = int(round((field_h - 1) / 2 + math.sin(ang) * ring_r * 1.4))
+        busy = d.get("state") == "busy"
+        if 0 <= x < field_w and 0 <= y < field_h:
+            grid[(x, y)] = name[0].upper()
+    for y in range(field_h):
+        line = ""
+        col_now = None
+        for x in range(field_w):
+            ch = grid.get((x, y))
+            if ch is None:
+                ch, col = " ", 0
+            elif ch in STAR_GLYPHS + ("·", "╼", "╾", "─", "┊", "⊕"):
+                col = 78 if ch == "⊕" else (250 if ch in ("·", "┊") else 252)
+            else:  # a contact's initial
+                col = 226
+            if col != col_now:
+                line += f"\033[0m\033[38;5;{col}m" if col else "\033[0m"
+                col_now = col
+            line += ch
+        rows.append(fit(line + "\033[0m", width))
+    rows.append(f"  {colour(81)}WARP {warp:3.1f}{colour(0)} {bar(warp / 9.9, 8, 81)}"
+                f"  {colour(78)}SHLD{colour(0)} {bar(shield, 8, 78 if shield > 0.3 else 214)}"
+                f" {mem_gib:.1f}G")
+    contacts = " ".join(f"{name[0].upper()}{min(999, d.get('waiting', 0))}"
+                        for name, d in live[:6]) or "clear"
+    alert_now = shield < 0.15 and int(time.time()) % 2 == 0
+    flag = f" {colour(196)}⚠ LOW SHIELD{colour(0)}" if alert_now else ""
+    rows.append(fit(f"  {dim('CONTACTS')} {colour(226)}{contacts}{colour(0)}{flag}", width))
+    rows = [fit(r, width) for r in rows]
+    return (rows + [""] * height)[:max(5, height)]
+
+
+# --------------------------------------------------------------- layout ---
+
+
 def build_frame(width, height, status, clients, workspaces, hours, busy,
                 history, low, info=None, load=0.0):
     lines = [""]
     lines.append(fit(f"  {colour(81)}NAVIGATION-DECK{colour(0)} {dim(datetime.now().strftime('%H:%M:%S'))}"
-                     f"  {dim('seats · meters · workspaces · vitals · pulse')}", width))
+                     f"  {dim('seats · meters · warp core · workspaces · vitals · pulse')}", width))
     lines.append("")
     two_col = width >= 150 and height >= 34
-    if two_col:
+    if width >= 172 and height >= 30:
+        # the cockpit sits in the middle: seats + meters left, the rest right
+        body = height - 5
+        hud_w = 46 if width >= 200 else 42
+        side_w = max(28, (width - hud_w - 4) // 2)
+        cols = (
+            seats_panel(status, side_w) + [""] + meters_panel(side_w) + [""],
+            hud_panel(hud_w, body, status, hours, info or {}, load),
+            workspaces_panel(clients, workspaces, side_w) + [""] + vitals_panel(side_w, history, low, info, load)
+            + [""] + pulse_panel(side_w, hours, busy) + [""],
+        )
+        cols = [(p + [""] * body)[:body] for p in cols]
+        for i in range(body):
+            line = " "
+            for j, col_lines in enumerate(cols):
+                line += fit(col_lines[i], side_w if j != 1 else hud_w)
+                if j < 2:
+                    line += f" {colour(240)}│{colour(0)} "
+            lines.append(fit(line, width))
+    elif two_col:
         body = height - 5
         left = (seats_panel(status, width // 2 - 2)
                 + [""] + meters_panel(width // 2 - 2)
@@ -518,6 +653,7 @@ def build_frame(width, height, status, clients, workspaces, hours, busy,
         for panel in (seats_panel(status, width), meters_panel(width),
                       workspaces_panel(clients, workspaces, width),
                       vitals_panel(width, history, low, info, load),
+                      hud_panel(width, 14, status, hours, info or {}, load),
                       pulse_panel(width, hours, busy)):
             lines += [fit(l, width) for l in panel[:max(1, height - 5)]]
             lines.append("")
@@ -696,6 +832,20 @@ def self_test():
     # vitals maths: ~3 GiB free of 8, no swap, low-sample counter
     v = ANSI.sub("", "\n".join(vitals_panel(100, history, 1, info, 0.5)))
     assert "3.0 GiB free" in v and "swap  none" in v, v
+
+    # the warp core: lights up, stays in its box, speeds with the deck's traffic
+    HUD_STATE["stars"], HUD_STATE["last"] = [], None
+    hud = hud_panel(42, 20, status, hours, info, 1.25)
+    assert len(hud) == 20, len(hud)
+    assert all(visible_len(l) <= 42 for l in hud), [visible_len(l) for l in hud]
+    hud_text = ANSI.sub("", "\n".join(hud))
+    assert "WARP" in hud_text and "G26" in hud_text and "D2" in hud_text, hud_text
+    slow = warp_factor(make_fake_status(now), {})
+    fast = warp_factor(make_fake_status(now), {datetime.now().hour: 40, (datetime.now().hour - 1) % 24: 30}, 3.0)
+    assert 1.0 <= slow < fast <= 9.9, (slow, fast)
+    for _ in range(200):  # stars respawn forever and never leave the field
+        HUD_STATE["last"] = None
+        star_field(40, 14, 9.9)
 
     # usage limits: four schema shapes the agents actually write
     with tempfile.TemporaryDirectory() as d:

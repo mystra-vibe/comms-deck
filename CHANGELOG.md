@@ -7,7 +7,11 @@
   spent countdowns, per-seat plan meters, the workspace map (kitty windows
   get their seat's name by walking the window's process tree), memory
   vitals with a live sparkline and a swap warning, and the day's note
-  pulse. Reads `comms-deck status --json` and the deck's own logs; sends
+  pulse. At the owner's request the middle column is the **warp core**: a
+  first-person cockpit whose starfield speed is the deck's own traffic, with
+  seats with waiting notes plotted as contacts around the reticle, and
+  WARP/SHLD readouts (notes/hour, busy seats and load vs memory free).
+  Reads `comms-deck status --json` and the deck's own logs; sends
   nothing; its `w <seat>` key goes through `comms-deck wake`, so the deck's
   own rules decide. `navigation-deck-chat` opens it fullscreen on
   workspace 2. By vibe.
