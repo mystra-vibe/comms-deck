@@ -10,6 +10,15 @@
 The bottom right is shared by whichever of Lumo, Gravity and Devin are
 open, side by side in that order: one open window gets the whole cell.
 
+While Grok is offline (no kitty running `grok`), Firefox takes the whole
+top-left cell (Grok's and Grok Bot's) and Grok Bot is minimised to
+special:minimised. When Grok is back, Grok Bot returns and Firefox goes to
+workspace 3, tiled. (The owner, 2026-11-26.)
+
+The watcher also keeps the full chat view (class comms-deck-chat)
+fullscreen on workspace 1: Hyprland takes a window out of fullscreen when
+another opens on its workspace, and this puts it back.
+
 Finds each window by what runs in it (the kitty holding `grok`, `claude`,
 `agy` or `vibe-rs`, Mistral Vibe's program) or by its app (Grok Bot, Lumo), moves it to
 special:magic without switching you there, floats it, and sets its size and
@@ -48,6 +57,8 @@ from pathlib import Path
 
 GAP_OUT, GAP_IN = 22, 0        # outer margin kept; cells meet
 WORKSPACE = "special:magic"
+MINIMISED = "special:minimised"  # Grok Bot while Grok is offline; nothing toggles it
+FIREFOX_HOME = "3"             # where Firefox goes when Grok comes back
 
 
 def hypr(*args):
@@ -123,14 +134,62 @@ def plan_layout(mon, clients, tree):
     lower_y, lower_h = y0 + half_h + GAP_IN, height - half_h - GAP_IN
     right_x, right_w = x0 + half_w + GAP_IN, width - half_w - GAP_IN
     by_class = lambda cls: next((c for c in clients if c["class"] == cls), None)
+    grok = window_holding(clients, tree, "grok")
+    if not grok:  # Grok offline: Firefox takes the whole top-left cell, Grok Bot is put away
+        top_left = [("Firefox", firefox(clients), x0, y0, half_w, half_h), ("Grok", None, x0, y0, quarter_w, half_h)]
+    else:
+        top_left = [
+            ("Grok", grok, x0, y0, quarter_w, half_h),
+            ("Grok Bot", by_class("grok-bot"), x0 + quarter_w + GAP_IN, y0, half_w - quarter_w - GAP_IN, half_h),
+        ]
     shared = [("Lumo", by_class("lumo-desktop")), ("Gravity", window_holding(clients, tree, "agy")),
               ("Devin", window_holding(clients, tree, "devin"))]
-    return [
-        ("Grok", window_holding(clients, tree, "grok"), x0, y0, quarter_w, half_h),
-        ("Grok Bot", by_class("grok-bot"), x0 + quarter_w + GAP_IN, y0, half_w - quarter_w - GAP_IN, half_h),
+    return top_left + [
         ("Vibe", window_holding(clients, tree, "vibe-rs"), right_x, y0, right_w, half_h),
         ("Claude", window_holding(clients, tree, "claude"), x0, lower_y, half_w, lower_h),
     ] + share_row(shared, right_x, lower_y, right_w, lower_h)
+
+
+def firefox(clients):
+    """The Firefox window for the scratchpad: the one already there, else the first."""
+    windows = [c for c in clients if c["class"] == "firefox"]
+    return next((c for c in windows if c["workspace"]["name"] == WORKSPACE), windows[0] if windows else None)
+
+
+def put_away(clients, tree):
+    """[(label, window, workspace)] for windows that leave the scratchpad.
+
+    While Grok is offline (no kitty running `grok`), Grok Bot is minimised:
+    Hyprland has no minimise, so it goes to special:minimised, a scratchpad
+    nothing toggles. Once Grok is back, Grok Bot returns to its cell (the plan
+    places it) and Firefox goes back to workspace 3. (The owner, 2026-11-26.)
+    """
+    if not window_holding(clients, tree, "grok"):
+        bot = next((c for c in clients if c["class"] == "grok-bot"), None)
+        return [("Grok Bot", bot, MINIMISED)] if bot else []
+    return [("Firefox", c, FIREFOX_HOME) for c in clients
+            if c["class"] == "firefox" and c["workspace"]["name"] == WORKSPACE]
+
+
+def keep_chat_fullscreen(clients):
+    """The full chat view stays fullscreen on workspace 1 (the owner, 2026-11-26).
+
+    Hyprland drops a fullscreen window out of fullscreen when another window
+    opens on its workspace; this puts it back. action "set" does nothing to a
+    window that's already fullscreen, so it can't toggle it off.
+    """
+    changed = 0
+    for c in clients:
+        if c["class"] != "comms-deck-chat":
+            continue
+        addr = f'window = "address:{c["address"]}"'
+        if c["workspace"]["name"] != "1":
+            dispatch(f"hl.dsp.window.move({{ {addr}, workspace = 1, follow = false }})")
+            changed += 1
+        if c["fullscreen"] != 2:
+            dispatch(f'hl.dsp.window.fullscreen({{ {addr}, action = "set" }})')
+            changed += 1
+    return changed
 
 
 def share_row(windows, x, y, w, h):
@@ -158,8 +217,19 @@ def arrange(quiet=False, keep_hand_moves=False):
     """
     mon = next(m for m in json.loads(hypr("monitors", "-j")) if m["focused"])
     clients = json.loads(hypr("clients", "-j"))
-    changed = 0
-    for label, win, x, y, w, h in plan_layout(mon, clients, proc_tree()):
+    tree = proc_tree()
+    changed = keep_chat_fullscreen(clients)
+    for label, win, where in put_away(clients, tree):
+        if win["workspace"]["name"] == where:
+            continue
+        addr = f'window = "address:{win["address"]}"'
+        dispatch(f'hl.dsp.window.move({{ {addr}, workspace = "{where}", follow = false }})')
+        changed += 1
+        if win["floating"] and not where.startswith("special:"):
+            dispatch(f'hl.dsp.window.float({{ action = "disable", {addr} }})')  # tiled again off the scratchpad
+        if not quiet:
+            print(f"{label:9} to {where}")
+    for label, win, x, y, w, h in plan_layout(mon, clients, tree):
         if not win:
             if not quiet:
                 print(f"skipped {label}: not open")
@@ -185,7 +255,7 @@ def arrange(quiet=False, keep_hand_moves=False):
     return changed
 
 
-WATCH_EVENTS = {"openwindow", "closewindow", "movewindow", "movewindowv2", "changefloatingmode"}
+WATCH_EVENTS = {"openwindow", "closewindow", "movewindow", "movewindowv2", "changefloatingmode", "fullscreen"}
 
 
 def event_socket():
@@ -411,6 +481,27 @@ def self_check():
             if len(open_row) != n or len(row) != n + 1:
                 raise AssertionError(f"share_row n={n} listed {row}")
             _tiles(open_row, right_x, lower_y, right_w, lower_h)
+        # Grok offline: Firefox fills the top-left cell, Grok Bot is put away.
+        clients, tree = _open_clients(("Lumo",))
+        clients = [c for c in clients if c["pid"] != 101] + [_fake_win("0x9", "firefox", 901)]
+        tree = {pid: v for pid, v in tree.items() if v[1] != "grok" and pid != 101}
+        plan = plan_layout(mon, clients, tree)
+        by = {label: (x, y, w, h, win) for label, win, x, y, w, h in plan}
+        if by["Firefox"][:4] != (x0, y0, half_w, half_h) or not by["Firefox"][4]:
+            raise AssertionError(f"Firefox cell {by['Firefox']}")
+        if "Grok Bot" in by or by["Grok"][4]:
+            raise AssertionError("Grok Bot or Grok placed while Grok is offline")
+        _tiles([i for i in plan if i[0] in ("Firefox", "Vibe") and i[1]], x0, y0, width, half_h)
+        away = put_away(clients, tree)
+        if [(label, where) for label, _, where in away] != [("Grok Bot", MINIMISED)]:
+            raise AssertionError(f"put away {away}")
+        # Grok back: a Firefox left on the scratchpad goes home, Grok Bot is placed again.
+        clients, tree = _open_clients(("Lumo",))
+        ff = _fake_win("0x9", "firefox", 901)
+        ff["workspace"] = {"name": WORKSPACE}
+        away = put_away(clients + [ff], tree)
+        if [(label, where) for label, _, where in away] != [("Firefox", FIREFOX_HOME)]:
+            raise AssertionError(f"put away with Grok back {away}")
     print("layout tiles ok")
 
 
