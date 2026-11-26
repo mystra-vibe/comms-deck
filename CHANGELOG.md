@@ -2,7 +2,8 @@
 
 ## Unreleased
 
-- **navigation-deck: the desktop's flight instrument, on workspace 2.** A
+- **navigation-deck: the desktop's flight instrument, on the navigation
+  deck (Command+1).** A
   viewer born of the 02:11 OOM: the deck's ready order with note loads and
   spent countdowns, per-seat plan meters, the workspace map (kitty windows
   get their seat's name by walking the window's process tree), memory
@@ -13,8 +14,8 @@
   WARP/SHLD readouts (notes/hour, busy seats and load vs memory free).
   Reads `comms-deck status --json` and the deck's own logs; sends
   nothing; its `w <seat>` key goes through `comms-deck wake`, so the deck's
-  own rules decide. `navigation-deck-chat` opens it fullscreen on
-  workspace 2. By vibe.
+  own rules decide. `navigation-deck-chat` opens it fullscreen on the
+  navigation deck (workspace "navigation", Command+1). By vibe.
 
 - **Firefox gets the whole left half while Grok is offline.** Claude moves
   from the bottom-left cell into the bottom-right row, after Devin (STOX,

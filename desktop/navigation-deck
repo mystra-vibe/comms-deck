@@ -814,11 +814,11 @@ def self_test():
     now = time.time()
     status = make_fake_status(now)
     clients = [
-        {"class": "comms-deck-chat", "fullscreen": True, "workspace": {"id": 1, "name": "1"}},
+        {"class": "comms-deck-chat", "fullscreen": True, "workspace": {"id": 1, "name": "comms"}},
         {"class": "kitty", "fullscreen": False, "workspace": {"id": 2147483645, "name": "special:magic"}},
-        {"class": "navigation-deck", "fullscreen": False, "workspace": {"id": 2, "name": "2"}},
+        {"class": "navigation-deck", "fullscreen": False, "workspace": {"id": 2, "name": "navigation"}},
     ]
-    workspaces = [{"id": 1, "name": "1"}, {"id": 2, "name": "2"},
+    workspaces = [{"id": 1, "name": "comms"}, {"id": 2, "name": "navigation"},
                   {"id": 2147483645, "name": "special:magic"}]
     info = {"MemTotal": 8 * 1024**3, "MemAvailable": 3 * 1024**3,
             "SwapTotal": 0, "SwapFree": 0}

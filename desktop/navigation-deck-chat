@@ -1,9 +1,10 @@
 #!/bin/sh
-# Open the navigation-deck in its own kitty window: fullscreen on workspace 2.
+# Open the navigation-deck in its own kitty window: fullscreen on the
+# navigation deck (workspace named "navigation", Command+1).
 # One copy per view. It reads the deck's public surfaces only; see the
 # navigation-deck docstring for what the screen shows.
-#   navigation-deck-chat        fullscreen on workspace 2
-#   navigation-deck-chat half   tiled on workspace 2, half the screen
+#   navigation-deck-chat        fullscreen on the navigation deck
+#   navigation-deck-chat half   tiled on the navigation deck, half the screen
 # Written by: vibe (2026-11-26)
 view=${1:-full}
 case "$view" in
@@ -25,10 +26,10 @@ done
 w="window = \"address:$addr\""
 if [ "$view" = full ]; then
     sleep 0.5
-    hyprctl dispatch "hl.dsp.window.move({ $w, workspace = 2, follow = false })" >/dev/null
+    hyprctl dispatch "hl.dsp.window.move({ $w, workspace = \"name:navigation\", follow = false })" >/dev/null
     hyprctl clients -j | grep "\"class\": \"$class\"" >/dev/null \
         && hyprctl dispatch "hl.dsp.window.fullscreen({ $w })" >/dev/null
 else
-    hyprctl dispatch "hl.dsp.window.move({ $w, workspace = 2, follow = false })" >/dev/null
+    hyprctl dispatch "hl.dsp.window.move({ $w, workspace = \"name:navigation\", follow = false })" >/dev/null
 fi
 wait
