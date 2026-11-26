@@ -757,8 +757,9 @@ def run_forever():
                             # a bare "workspace N" never reaches Hyprland. A
                             # number stays a number, a name gets name:.
                             ws = arg if arg.isdigit() else f"name:{arg}"
-                            subprocess.run(["hyprctl", "dispatch",
-                                            "hl.dsp.focus({ workspace = \"" + ws + "\" })"],
+                            expr = ("hl.dsp.focus({ workspace = " + ws + " })" if arg.isdigit()
+                                    else "hl.dsp.focus({ workspace = \"" + ws + "\" })")
+                            subprocess.run(["hyprctl", "dispatch", expr],
                                            capture_output=True)
                             prompting = ""
                         else:
