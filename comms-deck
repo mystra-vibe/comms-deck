@@ -5000,6 +5000,10 @@ def mail_send(settings, to, subject, body):
         smtp = smtplib.SMTP(settings["smtp"][0], settings["smtp"][1], timeout=20)
         try:
             host = settings["smtp"][0]
+            try:
+                smtp.ehlo()  # has_extn only sees features after EHLO
+            except smtplib.SMTPHeloError:
+                pass
             if smtp.has_extn("STARTTLS"):
                 smtp.starttls(context=mail_tls_context(host))
             elif not mail_loopback(host):
