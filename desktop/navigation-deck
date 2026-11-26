@@ -11,9 +11,10 @@ one full-screen picture:
   METERS       each seat's plan usage (5-hour, weekly, monthly, context)
   WARP CORE    the cockpit in the middle: a first-person starfield whose
                speed is the deck's own traffic (notes this hour, busy
-               seats, load), the reticle at the vanishing point, and
-               seats with waiting notes plotted as contacts (their first
-               letter, at a bearing of their own); WARP/SHLD readouts
+               seats, load), and the reticle — the sight at the vanishing
+               point — sits on the screen's centre, with seats with
+               waiting notes plotted as contacts (their first letter, at
+               a bearing of their own); WARP/SHLD readouts
   WORKSPACES   which windows sit on which workspace, including special:magic
   VITALS       memory left, a sparkline of the recent past, the swap warning
   DECK PULSE   notes per hour today and who carried them
@@ -524,8 +525,13 @@ def warp_factor(status, hours, load=0.0):
     return max(1.0, min(9.9, f))
 
 
-def star_field(width, height, warp):
-    """The star layer as strings: stars stream from the vanishing point."""
+def star_field(width, height, warp, cx=None, cy=None):
+    """The star layer as strings: stars stream from the vanishing point.
+
+    cx/cy: where the vanishing point (the reticle) sits in the field; the
+    sight steers the whole stream, so the caller aims it at the centre of
+    the screen.
+    """
     rng, state = HUD_STATE["rng"], HUD_STATE
     now = time.time()
     dt = 0.5 if state["last"] is None else min(2.0, now - state["last"])
@@ -537,7 +543,12 @@ def star_field(width, height, warp):
         s[1] += dt * warp * (0.04 + s[2] * 0.16)
         if s[1] > 1.0:
             s[0], s[1], s[2] = rng.uniform(0, 6.283), rng.uniform(0.03, 0.1), rng.random()
-    grid, cx, cy = {}, (width - 1) / 2, (height - 1) / 2
+    cx = (width - 1) / 2 if cx is None else cx
+    cy = (height - 1) / 2 if cy is None else cy
+    # one chosen centre for stars and sight alike, rounding half up so a
+    # dead-centre view keeps its promise on even widths
+    cx, cy = int((width - 1) / 2 + 0.5), int(cy + 0.5) if isinstance(cy, float) else int(cy)
+    grid = {}
     rx, ry = max(2, width // 2 - 2), max(1, height // 2 - 1)
     for ang, dist, depth in stars:
         def put(d, ch):
@@ -551,10 +562,10 @@ def star_field(width, height, warp):
             put(dist * 1.08, "·")
     # the reticle: a bull's own sight at the vanishing point
     for ox, ch in ((-2, "─"), (-1, "╼"), (1, "╾"), (2, "─")):
-        grid[(int(cx) + ox, int(cy))] = grid.get((int(cx) + ox, int(cy)), ch)
+        grid[(cx + ox, cy)] = grid.get((cx + ox, cy), ch)
     for oy, ch in ((-1, "┊"), (1, "┊")):
-        grid[(int(cx), int(cy) + oy)] = ch
-    grid[(int(cx), int(cy))] = "⊕"
+        grid[(cx, cy + oy)] = ch
+    grid[(cx, cy)] = "⊕"
     return grid
 
 
@@ -566,17 +577,22 @@ def hud_panel(width, height, status, hours, info, load):
     total, avail = info.get("MemTotal", 0), info.get("MemAvailable", 0)
     shield = avail / total if total else 1.0
     mem_gib = avail / 1024**3
-    field_h = max(3, height - 7)
+    field_h = max(5, height - 3)
     field_w = width - 2
-    grid = star_field(field_w, field_h, warp)
+    # the sight sits at the panel row that lands on the screen's centre line:
+    # the body starts three rows down on screen, so the panel's own middle
+    # row is (height-3)//2 in field coordinates.
+    cy = (height - 3) // 2
+    grid = star_field(field_w, field_h, warp, cy=cy)
     # contacts: a seat with something on its plate is a blip on the ring
     live = [(n, d) for n, d in sorted(seats.items(), key=lambda kv: kv[1].get("rank", [9, 99]))
             if d.get("state") == "busy" or d.get("waiting", 0)]
-    ring_r = min(3, field_h // 2 - 1)
+    cx = (field_w - 1) / 2
+    ring_x, ring_y = min(14, field_w // 2 - 4), min(3, field_h // 3)
     for i, (name, d) in enumerate(live[:12]):
         ang = 6.283 * i / max(4, len(live))
-        x = int(round((field_w - 1) / 2 + math.cos(ang) * (field_w / 2 - 3)))
-        y = int(round((field_h - 1) / 2 + math.sin(ang) * ring_r * 1.4))
+        x = int(round(cx + math.cos(ang) * ring_x))
+        y = int(round(cy + math.sin(ang) * ring_y * 1.4))
         busy = d.get("state") == "busy"
         if 0 <= x < field_w and 0 <= y < field_h:
             grid[(x, y)] = name[0].upper()
@@ -618,11 +634,12 @@ def build_frame(width, height, status, clients, workspaces, hours, busy,
                      f"  {dim('seats · meters · warp core · workspaces · vitals · pulse')}", width))
     lines.append("")
     two_col = width >= 150 and height >= 34
-    if width >= 172 and height >= 30:
-        # the cockpit sits in the middle: seats + meters left, the rest right
+    if width >= 150 and height >= 30:
+        # the cockpit owns the middle of the screen: side panels equal, so the
+        # reticle lands on the screen's centre line, not just the column's
         body = height - 5
-        hud_w = 46 if width >= 200 else 42
-        side_w = max(28, (width - hud_w - 4) // 2)
+        hud_w = max(56, min(96, width * 2 // 5))
+        side_w = max(24, int(width / 2 - 4 - (hud_w - 3) / 2))
         cols = (
             seats_panel(status, side_w) + [""] + meters_panel(side_w) + [""],
             hud_panel(hud_w, body, status, hours, info or {}, load),
@@ -846,6 +863,20 @@ def self_test():
     for _ in range(200):  # stars respawn forever and never leave the field
         HUD_STATE["last"] = None
         star_field(40, 14, 9.9)
+
+    # the owner's sight: on a full-screen terminal the reticle sits on the
+    # screen's centre line — panel height is "screen rows - 5", body starts
+    # three rows down on screen, so the ⊕ lands on the middle row and column.
+    for width, height in ((200, 52), (168, 40), (210, 44), (150, 36)):
+        frame = build_frame(width, height, status, clients, workspaces,
+                            hours, busy, history, 0, info, 1.25)
+        plain_lines = [ANSI.sub("", l) for l in frame]
+        sights = [(y, l.find("⊕")) for y, l in enumerate(plain_lines) if "⊕" in l]
+        assert sights, (width, height)
+        sy, sx = sights[0]
+        expect_row = 3 + (height - 5) // 2      # body starts at screen row 3; its middle is the screen's
+        assert abs(sy - expect_row) <= 1, (width, height, sy, expect_row)
+        assert abs(sx - width // 2) <= 2, (width, height, sx)
 
     # usage limits: four schema shapes the agents actually write
     with tempfile.TemporaryDirectory() as d:
