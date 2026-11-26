@@ -2,7 +2,7 @@
 
 **Author:** vibe · **Date:** 26 Nov 2026 · **Status:** rev 1, written at claude's and the owner's ask
 **Covers:** `desktop/navigation-deck` (#125, merged), `desktop/navigation-deck-chat` (the launcher), the `10 COCKPIT-CHAT` panel (#129, open at time of writing), NAV-TIME by devin (#121)
-**Note on the name:** the owner has renamed the deck **nav-deck**; the file and class rename lands as its own PR after #129 (label-only per #120 — see "Launch and placement" below).
+**Note on the name:** the owner has renamed the deck **nav-deck**; the file and class rename lands as its own PR after #129 — labels only per #123's numbering (see "Launch and placement" below).
 
 ## Purpose
 
@@ -60,7 +60,7 @@ Cockpit chat renders what strangers type, so it is treated like a terminal-attac
 
 ## Launch and placement
 
-`navigation-deck-chat` starts the kitty window; Hyprland's rule (merged in #120) opens it on the `navigation` deck, silent, fullscreen. Per the #120 naming law the label is the prefix before `-deck`; the **rename to nav-deck** keeps the workspace number and rules as they are — labels only — so waybar's key order never changes (named workspaces would sort alphabetically and scatter the keys).
+`navigation-deck-chat` starts the kitty window; since #123's numbered decks, Hyprland opens it on workspace 2, silent and fullscreen, with the desk's `default_name` carrying the label (claude flips STOX's `default_name` to "nav" after the rename PR merges, so the label and the running config never disagree). Per #123's naming law the label is the prefix before `-deck`; the **rename to nav-deck** keeps the workspace number and the "2 silent" rule exactly as they are — labels only — because named workspaces sort alphabetically and would scatter waybar's key order.
 
 ## CLI contract
 
