@@ -6160,15 +6160,15 @@ def install(yes):
                             '    match      = { class = "^comms-deck-mail$" },\n'
                             '    workspace  = "2 silent",\n    fullscreen = true,\n})\n')
             if "navigation-deck" not in lua_now:
-                lua_new += ('\n-- navigation-deck: the seats/usage/workspaces dashboard, fullscreen on 2.\n'
+                lua_new += ('\n-- navigation-deck: the seats, usage and workspaces dashboard, fullscreen on the navigation deck.\n'
                             'hl.window_rule({\n    name       = "navigation-deck",\n'
                             '    match      = { class = "^navigation-deck$" },\n'
-                            '    workspace  = "2 silent",\n    fullscreen = true,\n})\n')
+                            '    workspace  = "name:navigation silent",\n    fullscreen = true,\n})\n')
             if lua_new != lua_now:
                 lua.write_text(lua_new)
                 subprocess.run(["hyprctl", "reload"], capture_output=True)
     step("link the chat, mail and navigation-deck launchers, add app menu entries, "
-         "and the Hyprland rules for workspaces 1 and 2 (Lua config)", desktop)
+         "and the Hyprland rules for the comms, mail and navigation decks (Lua config)", desktop)
 
     def antigravity():
         if not (HOME / ".local/bin/agy").exists() and not shutil.which("agy"):
