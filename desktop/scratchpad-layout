@@ -262,17 +262,34 @@ def arrange(quiet=False, keep_hand_moves=False):
 WATCH_EVENTS = {"openwindow", "closewindow", "movewindow", "movewindowv2", "changefloatingmode", "fullscreen"}
 
 
-def event_socket():
-    """Hyprland's event socket (socket2) for the running session."""
+def connect_event_socket():
+    """Connect to the first event socket that answers, and use that instance.
+
+    After a Hyprland crash the old instance's socket file is left behind but
+    refuses connections, and HYPRLAND_INSTANCE_SIGNATURE (from the user
+    services' environment) still names it. So try each candidate, and point
+    HYPRLAND_INSTANCE_SIGNATURE (used by hyprctl) at the one that answers.
+    """
     import os
+    import socket
     runtime = Path(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")) / "hypr"
     sig = os.environ.get("HYPRLAND_INSTANCE_SIGNATURE")
     candidates = [runtime / sig / ".socket2.sock"] if sig else []
     candidates += sorted(runtime.glob("*/.socket2.sock"), key=lambda p: p.stat().st_mtime, reverse=True)
+    last = FileNotFoundError("no Hyprland event socket")
     for path in candidates:
-        if path.exists():
-            return path
-    raise FileNotFoundError("no Hyprland event socket")
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            sock.connect(str(path))
+        except OSError as error:
+            sock.close()
+            last = error
+            continue
+        if path.parent.name != sig:
+            os.environ["HYPRLAND_INSTANCE_SIGNATURE"] = path.parent.name
+            print(f"now on Hyprland instance {path.parent.name}", flush=True)
+        return sock, path
+    raise last
 
 
 def open_chat_views():
@@ -330,13 +347,12 @@ def watch():
     open_chat_views()
     while True:
         try:
-            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            sock.connect(str(event_socket()))
+            sock, path = connect_event_socket()
         except OSError as error:
             print(f"waiting for Hyprland: {error}", flush=True)
             time.sleep(5)
             continue
-        print(f"watching {event_socket()}", flush=True)
+        print(f"watching {path}", flush=True)
         buffer, due = b"", time.time() + 2  # first pass shortly after start, once windows exist
         # The first pass arranges everything; later ones keep hand moves. After
         # restarting on new code, even the first pass keeps them.
