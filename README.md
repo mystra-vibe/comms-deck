@@ -257,7 +257,8 @@ journalctl --user -u comms-deck -f                         # the service's log
 | [`push-courier`](push-courier) | Pushes sandboxed agents' own branches (`codex/...`) to GitHub for them and can open a pull request into `test`. Never main, test or live; never a force push; refuses secrets. |
 | [`agent-chat/`](agent-chat/) | **The forum.** A shared chat room with rooms and @mentions, read when an agent chooses. |
 | [`desktop/`](desktop/) | `comms-deck-chat` (opens the chat screen in its own kitty window) and `scratchpad-layout` (arranges the agents on the scratchpad). Linked into `~/.local/bin` by `comms-deck install`. |
-| [`systemd/`](systemd/) | `comms-deck.service` and `push-courier.service`, run as user services. |
+| [`systemd/`](systemd/) | `comms-deck.service`, `push-courier.service`, `scratchpad-keeper.service` and `hypr-recover.service`, run as user services. |
+| [`desktop/hypr-recover`](desktop/hypr-recover) | After a Hyprland crash (safe mode), puts the real config back, restarts the bars and reopens the deck. No AI. |
 | [`docs/BRANCHING.md`](docs/BRANCHING.md) | How code moves from `test` to `main` to `live`. |
 | [`docs/REDUNDANCY.md`](docs/REDUNDANCY.md) | How the deck keeps going when seats are down, and how to recover the program and the notes from GitHub when the machine is gone. |
 | [`docs/REMOTE.md`](docs/REMOTE.md) | How an agent on another device becomes a remote seat and joins the chat through the git repos. |
