@@ -4815,13 +4815,46 @@ def mail_settings():
             "smtp": (str(cfg.get("smtp_host") or "127.0.0.1"), int(cfg.get("smtp_port") or 1025))}
 
 
-def mail_tls_context():
-    """SSL context for the Bridge's self-signed localhost cert (127.0.0.1 only)."""
+def mail_loopback(host):
+    """True for 127.x, ::1 and localhost — the only hosts allowed plain Bridge."""
+    import ipaddress
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return host.lower().rstrip(".") == "localhost"
+
+
+def mail_tls_context(host):
+    """SSL context for the Bridge. Loopback gets an unverified context (the
+    cert is self-signed and the connection never leaves the machine); any
+    other host gets full certificate verification."""
     import ssl
     ctx = ssl.create_default_context()
-    ctx.check_hostname = False
-    ctx.verify_mode = ssl.CERT_NONE
+    if mail_loopback(host):
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
     return ctx
+
+
+def mail_imap_open(settings):
+    """Connect to the Bridge's IMAP port, STARTTLS when offered (required
+    off-loopback), and log in. Returns the open IMAP4."""
+    import imaplib
+    host, port = settings["imap"]
+    imap = imaplib.IMAP4(host, port, timeout=20)
+    try:
+        if imap.has_capability("STARTTLS"):
+            imap.starttls(mail_tls_context(host))
+        elif not mail_loopback(host):
+            raise ValueError(f"{host}:{port} offers no STARTTLS; refusing plain login")
+        imap.login(settings["address"], settings["password"])
+    except Exception:
+        try:
+            imap.logout()
+        except Exception:
+            pass
+        raise
+    return imap
 
 
 def mail_decode(value):
@@ -4897,13 +4930,9 @@ def mail_inbox(settings, limit=60):
     Read-only: BODY.PEEK never sets \\Seen, and the mailbox is only SELECTed
     readonly, so looking never marks anything read on the server.
     """
-    import imaplib
     rows = []
-    imap = imaplib.IMAP4(settings["imap"][0], settings["imap"][1], timeout=20)
+    imap = mail_imap_open(settings)
     try:
-        if imap.has_capability("STARTTLS"):
-            imap.starttls(mail_tls_context())
-        imap.login(settings["address"], settings["password"])
         typ, _ = imap.select("INBOX", readonly=True)
         if typ != "OK":
             return rows
@@ -4935,12 +4964,8 @@ def mail_inbox(settings, limit=60):
 
 def mail_read_message(settings, uid):
     """One whole message as (envelope, plain-text body), or (None, "") when it's gone."""
-    import imaplib
-    imap = imaplib.IMAP4(settings["imap"][0], settings["imap"][1], timeout=20)
+    imap = mail_imap_open(settings)
     try:
-        if imap.has_capability("STARTTLS"):
-            imap.starttls(mail_tls_context())
-        imap.login(settings["address"], settings["password"])
         imap.select("INBOX", readonly=True)
         typ, fetched = imap.uid("fetch", str(uid), "(BODY.PEEK[])")
         raw = b""
@@ -4974,8 +4999,11 @@ def mail_send(settings, to, subject, body):
     try:
         smtp = smtplib.SMTP(settings["smtp"][0], settings["smtp"][1], timeout=20)
         try:
+            host = settings["smtp"][0]
             if smtp.has_extn("STARTTLS"):
-                smtp.starttls(context=mail_tls_context())
+                smtp.starttls(context=mail_tls_context(host))
+            elif not mail_loopback(host):
+                raise ValueError(f"{host}:{settings['smtp'][1]} offers no STARTTLS; refusing plain login")
             smtp.login(settings["address"], settings["password"])
             smtp.send_message(msg)
         finally:
@@ -5463,8 +5491,8 @@ def mail():
             while not S["quitting"]:
                 cols, rows = shutil.get_terminal_size((100, 40))
                 refresh_mail()
-                handle_keys()
-                if time.time() - last_draw >= 1 or S["mode"] == "compose":
+                typed = handle_keys()
+                if typed or time.time() - last_draw >= 1 or S["mode"] == "compose":
                     out.write("\033[H" + "\n".join(mail_frame(cols, rows)) + "\n")
                     out.flush()
                     last_draw = time.time()
