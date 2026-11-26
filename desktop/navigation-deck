@@ -73,6 +73,17 @@ NAV_DIR = DATA / "navigation"
 OWNER_NAME = os.environ.get("NAVDECK_OWNER", "STOX")
 
 REFRESH_S = 1.0
+# Desktops are decks: numbered workspaces with names (STOX, 2026-11-26).
+# goto takes the label on the bar; "3" is the desktop on Super+3 (workspace 4).
+DESKS = {"comms": 1, "navigation": 2, "mail": 3,
+         **{str(k % 10): k + 1 for k in range(3, 11)}}
+
+
+def goto_target(label):
+    """The Lua workspace value for `goto <label>`."""
+    if label in DESKS:
+        return str(DESKS[label])
+    return '"name:' + label.replace("\\", "").replace('"', "") + '"'
 SPARK_POINTS = 100        # 5 s apart: the last ~8 minutes
 MEM_FLOOR_MIB = 512       # below this the vitals row shouts
 
@@ -815,11 +826,11 @@ KEYS_LINE = ("  q quit · r redraw · w <seat> wake (the deck's rules apply) · 
 
 def dispatch_workspace(arg):
     """Focus a workspace. The Lua config's dispatch wrapper speaks hl.dsp; a
-    bare "workspace N" never reaches Hyprland. A number stays a number, a
-    name gets name:. Shared by the g-goto prompt and the deck keys."""
-    ws = arg if arg.isdigit() else f"name:{arg}"
-    expr = ("hl.dsp.focus({ workspace = " + ws + " })" if arg.isdigit()
-            else "hl.dsp.focus({ workspace = \"" + ws + "\" })")
+    bare "workspace N" never reaches Hyprland. The deck labels resolve
+    through goto_target (claude's DESKS, #123): "goto comms" flies to
+    workspace 1, a plain number stays a number, any other name gets name:.
+    Shared by the g-goto prompt and the deck keys (`1 2)."""
+    expr = "hl.dsp.focus({ workspace = " + goto_target(arg) + " })"
     subprocess.Popen(["hyprctl", "dispatch", expr], stdout=subprocess.DEVNULL,
                      stderr=subprocess.DEVNULL)
 
@@ -1292,6 +1303,11 @@ def self_test():
     # fit() keeps exact visible width, colours intact
     long_line = "word " * 30 + colour(78) + "tail" + "\033[0m"
     assert visible_len(fit(long_line, 40)) == 40
+
+    # the flight keys: deck labels fly by number (claude's DESKS, #123)
+    assert goto_target("comms") == "1" and goto_target("navigation") == "2"
+    assert goto_target("mail") == "3" and goto_target("3") == "4" and goto_target("0") == "11"
+    assert goto_target("somename") == '"name:somename"'
 
     # vitals maths: ~3 GiB free of 8, no swap, low-sample counter
     v = ANSI.sub("", "\n".join(vitals_panel(100, history, 1, info, 0.5)))

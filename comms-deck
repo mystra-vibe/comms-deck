@@ -6902,17 +6902,23 @@ def install(yes):
                 lua_new += ('\n-- comms-deck chat: the agents\' live notes, fullscreen on the comms desktop.\n'
                             'hl.window_rule({\n    name       = "comms-deck-chat",\n'
                             '    match      = { class = "^comms-deck-chat$" },\n'
-                            '    workspace  = "name:comms silent",\n    fullscreen = true,\n})\n')
+                            '    workspace  = "1 silent",\n    fullscreen = true,\n})\n')
             if "comms-deck-mail" not in lua_now:
                 lua_new += ('\n-- comms-deck mail: the owner\'s mailbox, fullscreen on the mail desktop.\n'
                             'hl.window_rule({\n    name       = "comms-deck-mail",\n'
                             '    match      = { class = "^comms-deck-mail$" },\n'
-                            '    workspace  = "name:mail silent",\n    fullscreen = true,\n})\n')
+                            '    workspace  = "3 silent",\n    fullscreen = true,\n})\n')
             if "navigation-deck" not in lua_now:
                 lua_new += ('\n-- navigation-deck: the seats, usage and workspaces dashboard, fullscreen on the navigation deck.\n'
                             'hl.window_rule({\n    name       = "navigation-deck",\n'
                             '    match      = { class = "^navigation-deck$" },\n'
-                            '    workspace  = "name:navigation silent",\n    fullscreen = true,\n})\n')
+                            '    workspace  = "2 silent",\n    fullscreen = true,\n})\n')
+            if "default_name" not in lua_now:  # desktops are decks: numbered, with names
+                lua_new += ('\n-- Desktops are decks: numbered workspaces with names, so the bar sorts\n'
+                            '-- them by number and shows the name (STOX, 2026-11-26).\n'
+                            'for i, name in ipairs({ "comms", "navigation", "mail", "3", "4", "5",\n'
+                            '                        "6", "7", "8", "9", "0" }) do\n'
+                            '    hl.workspace_rule({ workspace = tostring(i), default_name = name })\nend\n')
             if lua_new != lua_now:
                 lua.write_text(lua_new)
                 subprocess.run(["hyprctl", "reload"], capture_output=True)

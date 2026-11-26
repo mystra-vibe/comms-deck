@@ -26,12 +26,12 @@ done
 w="window = \"address:$addr\""
 if [ "$view" = full ]; then
     sleep 0.5
-    hyprctl dispatch "hl.dsp.window.move({ $w, workspace = \"name:navigation\", follow = false })" >/dev/null
+    hyprctl dispatch "hl.dsp.window.move({ $w, workspace = 2, follow = false })" >/dev/null
     hyprctl clients -j | grep "\"class\": \"$class\"" >/dev/null \
         && hyprctl dispatch "hl.dsp.window.fullscreen({ $w, action = \"set\" })" >/dev/null
 # action = "set": the browser window rule already opens it fullscreen, and a
 # bare fullscreen here would toggle it straight off again.
 else
-    hyprctl dispatch "hl.dsp.window.move({ $w, workspace = \"name:navigation\", follow = false })" >/dev/null
+    hyprctl dispatch "hl.dsp.window.move({ $w, workspace = 2, follow = false })" >/dev/null
 fi
 wait
