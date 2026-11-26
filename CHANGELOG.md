@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- **The look's right column at half height.** With the chat on the top
+  half of the screen and a terminal below, 02 ACTIVITY was taller than the
+  column, so it was skipped and 06 with it, leaving the column blank. Short
+  of room, 02 now drops its `↳` lines (one row per seat); 06 shows when it
+  fits. By Claude.
+- **Gravity / Antigravity.** An easter egg from the owner: Gravity is named
+  Antigravity while it's online, in 01's crew labels and 02's rows. By Claude.
 - **The mail screen's window rule (workspace 2).** For the mail client
   (Devin builds the view): `comms-deck install` now also links a
   `comms-deck-mail` launcher (kitty, class `comms-deck-mail`), adds its app
