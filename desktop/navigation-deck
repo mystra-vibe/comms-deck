@@ -1147,6 +1147,13 @@ def run_forever():
 
     out = sys.stdout
     tty = sys.stdin.isatty()
+    # The cockpit runs on the deck's own one-second heartbeat (REFRESH_S):
+    # redraws happen at most once a second, plus a redraw on a keypress. The
+    # imported look's animation flags (usage_panel.running / look_crew.moving,
+    # which drive the CHAT at up to 120 fps) are deliberately never consulted
+    # here — the crew graph is drawn still and the stars fly per-second — so
+    # the cockpit can never claim the 240 Hz loop the chat can (claude's
+    # caution, 2026-11-26: this 8 GB box runs both decks at once).
     saved = termios.tcgetattr(sys.stdin) if tty else None
     if tty:
         tty_mod.setcbreak(sys.stdin)
@@ -1303,6 +1310,26 @@ def self_test():
     for _ in range(200):  # stars respawn forever and never leave the field
         HUD_STATE["last"] = None
         star_field(40, 14, 9.9)
+
+    # the cockpit dress draws with comms-deck's own look functions (claude's):
+    # the import is load-bearing, so render each shared builder once here —
+    # when comms-deck's functions change shape, this test catches it, not the
+    # pilot's screen. Read-only; the fake record feeds the text paths.
+    if CD:
+        recs = [{"kind": "message", "id": "probe-1", "from": "vibe", "to": "all", "private": False,
+                 "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "text": "probe"}]
+        snap = {"seats": {}}
+        probe = lambda ok, what: (_ for _ in ()).throw(AssertionError(what)) if not ok else None
+        probe(CD.look_frame("01", "CREW", "", "", 208, 40, 8, ["probe"]), "look_frame")
+        probe(CD.look_crew(20, 8, recs, snap, set(), {}, time.time()), "look_crew")
+        probe(CD.look_activity_parts(CD.activity_panel(52)), "activity_panel")
+        probe(CD.usage_panel(50), "usage_panel")
+        probe(CD.look_ticker(120, recs, time.time()) is not None, "look_ticker")
+        probe(CD.context_split() is not None, "context_split")
+        tail_plain = ANSI.sub("", "\n".join(event_tail_panel(60, 8, now, recs)))
+        assert "vibe → all" in tail_plain, tail_plain
+    else:
+        raise AssertionError("comms-deck did not import — the cockpit dress has no frames to draw")
 
     # the owner's sight: on a full-screen terminal the reticle sits on the
     # screen's centre line — panel height is "screen rows - 5", body starts
