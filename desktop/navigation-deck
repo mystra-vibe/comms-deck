@@ -35,6 +35,24 @@ in ~/.local/share/comms-deck/navigation/ (one small file per day).
     navigation-deck --once --plain   no colours (for pipes and tests)
     navigation-deck --self-test  render a fake home tree; assert; touch nothing real
 
+On a wide screen the deck is drawn in the comms-deck look (claude's
+framework, imported from the installed script, not copied): numbered
+panels under a strip and over a ticker —
+
+  01 CREW · 02 ACTIVITY   the left column, fed by comms-deck's own builders
+  04 WARP CORE            the cockpit in the centre: the starfield and the
+                          reticle, which still sits on the screen's exact
+                          centre; 05 EVENT TAIL sits under it (the cockpit's
+                          log: seat state flips and the newest notes)
+  03 USAGE · 06 WORKSPACES · 07 VITALS · 08 NAV-TIME · 09 DECK PULSE
+                          the right column (07 carries the stream status
+                          row: obs/ffmpeg seen on the box)
+  the ticker + keys       notes scroll along the bottom; c chat, n notes,
+                          m mail, ` comms, 2 mail deck, 1 back here.
+
+On a narrow screen (under the look's 150 columns) the deck keeps the old
+plain panels, so nothing is lost on a small window.
+
 Written by: vibe (2026-11-26), inspired by comms-deck by claude.
 NAV-TIME panel by devin (2026-11-26).
 """
@@ -79,6 +97,87 @@ STATE_STYLE = {
 
 ANSI = re.compile(r"\033\[[0-9;?]*[ -/]*[@-~]")
 BLOCKS = " ▁▂▃▄▅▆▇█"
+
+
+# --------------------------------------------------- comms-deck link ------
+# The deck look is comms-deck's own (claude, the owner, 2026-11-25), and the
+# owner asked for exactly that dress (2026-11-26): numbered panels, corner
+# brackets, the strip and the ticker. The deck imports the installed script
+# as a module — read-only, main-guarded — so the two decks can never drift
+# apart in style, and 01/02 draw with comms-deck's own builders. If the
+# import fails the deck falls back to its own plain panels (look=None).
+
+def load_comms_deck():
+    """The installed comms-deck script as a module, or None."""
+    import importlib.util
+    from importlib.machinery import SourceFileLoader
+    seen = []
+    for cand in (Path(__file__).resolve().parent.parent / "comms-deck",
+                 HOME / ".local" / "bin" / "comms-deck"):
+        if not cand.exists() or str(cand) in seen:
+            continue
+        seen.append(str(cand))
+        try:
+            loader = SourceFileLoader("comms_deck", str(cand))
+            spec = importlib.util.spec_from_loader("comms_deck", loader)
+            mod = importlib.util.module_from_spec(spec)
+            loader.exec_module(mod)
+            return mod
+        except Exception:
+            continue
+    return None
+
+
+CD = load_comms_deck()
+LOOK_MIN_COLS = CD.LOOK_MIN_COLS if CD else 0
+
+
+def load_records(tail_bytes=256 << 10):
+    """The newest records of log.jsonl, read from the tail only: the chart
+    room chat loads the whole file once; a screen redrawing every second
+    just needs the recent end (the crew graph keeps its own 30 minutes)."""
+    path = DATA / "log.jsonl"
+    try:
+        size = path.stat().st_size
+        with open(path, "rb") as f:
+            f.seek(max(0, size - tail_bytes))
+            blob = f.read().decode(errors="replace")
+    except OSError:
+        return []
+    out = []
+    for line in blob.splitlines():
+        try:
+            out.append(json.loads(line))
+        except ValueError:
+            continue
+    return out[-400:]
+
+
+STREAM_PROCS = ("obs", "ffmpeg")
+_stream_cache = {"t": 0.0, "found": ()}
+
+
+def stream_state():
+    """Streaming processes on this box (obs, ffmpeg), cached 5 s — the
+    VITALS panel's stream row reads this."""
+    now = time.time()
+    if now - _stream_cache["t"] < 5:
+        return _stream_cache["found"]
+    found = []
+    try:
+        for p in Path("/proc").glob("[0-9]*"):
+            try:
+                cmd = (p / "cmdline").read_bytes().split(b"\0")
+            except OSError:
+                continue
+            if cmd and cmd[0] and os.path.basename(cmd[0].decode(errors="replace")) in STREAM_PROCS:
+                found.append(os.path.basename(cmd[0].decode(errors="replace")))
+                if len(found) >= 4:
+                    break
+    except OSError:
+        pass
+    _stream_cache.update(t=now, found=tuple(sorted(found)))
+    return _stream_cache["found"]
 
 
 def visible_len(s):
@@ -488,6 +587,11 @@ def vitals_panel(width, history, low, info=None, load=0.0):
         rows.append(f"  swap  {bar((swap_total - swap_free) / max(1, swap_total), 10)}")
     lows = f"{colour(214)}{low}{colour(0)}" if low else f"{colour(78)}0{colour(0)}"
     rows.append(f"  {dim('load')} {load:.2f}   {dim('below-512-MiB samples in two days:')} {lows}")
+    streams = stream_state()
+    if streams:
+        rows.append(f"  {dim('stream')} {colour(78)}{' · '.join(streams)}{colour(0)} {dim('up')}")
+    else:
+        rows.append(f"  {dim('stream')} {colour(240)}idle{colour(0)} {dim('(obs/ffmpeg on the box)')}")
     return rows
 
 
@@ -509,6 +613,59 @@ def pulse_panel(width, hours, busy):
         top = sorted(busy.items(), key=lambda kv: -kv[1])[:4]
         rows.append("  " + dim("busy today: ") + ",  ".join(
             f"{colour(81)}{s}{colour(0)}{dim(' ' + human_dur(t))}" for s, t in top))
+    return rows
+
+
+# ------------------------------------------------------- event tail -------
+# The cockpit's log (the owner's "more live log"): seat state flips from
+# activity.jsonl and the newest notes from log.jsonl, newest last. Devin's
+# nav-time reads the same files for ages; this is the events themselves.
+
+def activity_events(limit=40):
+    """The newest seat-state records of activity.jsonl (tail read only)."""
+    path = DATA / "activity.jsonl"
+    out = []
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            f.seek(max(0, f.tell() - (64 << 10)))
+            for line in f.read().decode(errors="replace").splitlines():
+                try:
+                    out.append(json.loads(line))
+                except ValueError:
+                    continue
+    except OSError:
+        pass
+    return out[-limit:]
+
+
+def event_tail_panel(width, height, now, records=None, live=None):
+    """05 EVENT TAIL's body: 'HH:MM  event' lines, newest last. Both decks'
+    public logs feed it: what seats are doing (activity.jsonl) and what they
+    said (log.jsonl, text redacted like the chat's ticker)."""
+    rows = []
+    evs = []
+    for rec in (records or [])[-60:]:
+        if rec.get("kind") != "message":
+            continue
+        t = CD.record_stamp(rec) if CD else 0.0
+        to = "all" if rec.get("to") == "all" else str(rec.get("to", "?"))
+        text = "(private)" if rec.get("private") else CD.redact(" ".join(str(rec.get("text", "")).split()))
+        evs.append((t, f"{colour(CD.colour(rec.get('from', 'vibe'))) if CD else ''}{rec.get('from', '?')}"
+                       f"{colour(0) if CD else ''} → {to}: {text}"))
+    for act in activity_events(height):
+        t = float(act.get("time") or 0)
+        doing = " ".join(str(act.get("doing", "")).split())
+        suffix = f"{colour(241)}{dim('· ' + doing[:max(0, width - 22)])}" if doing else ""
+        evs.append((t, f"{colour(CD.colour(act.get('seat', '?'))) if CD else ''}{act.get('seat', '?')}"
+                       f"{colour(0) if CD else ''} {act.get('state', '?')} {suffix}{colour(0) if CD else ''}"))
+    evs = [(t, s) for t, s in evs if t]
+    evs.sort(key=lambda e: e[0])
+    for t, s in evs[-max(1, height - 1):]:
+        stamp = datetime.fromtimestamp(t).strftime("%H:%M")
+        rows.append(fit(f"  {dim(stamp)}  {s}", width))
+    if not rows:
+        rows.append(dim("  the decks are quiet"))
     return rows
 
 
@@ -663,7 +820,19 @@ def nav_time_panel(width, timing):
     return rows
 
 
-KEYS_LINE = "  q quit · r redraw · w <seat> wake (the deck's rules apply) · g <ws> goto · c chat · n notes"
+KEYS_LINE = ("  q quit · r redraw · w <seat> wake (the deck's rules apply) · g <ws> goto · c chat · n notes"
+             " · m mail · ` comms · 1 here · 2 mail deck")
+
+
+def dispatch_workspace(arg):
+    """Focus a workspace. The Lua config's dispatch wrapper speaks hl.dsp; a
+    bare "workspace N" never reaches Hyprland. The deck labels resolve
+    through goto_target (claude's DESKS, #123): "goto comms" flies to
+    workspace 1, a plain number stays a number, any other name gets name:.
+    Shared by the g-goto prompt and the deck keys (`1 2)."""
+    expr = "hl.dsp.focus({ workspace = " + goto_target(arg) + " })"
+    subprocess.Popen(["hyprctl", "dispatch", expr], stdout=subprocess.DEVNULL,
+                     stderr=subprocess.DEVNULL)
 
 
 # ------------------------------------------------------- the warp core ----
@@ -732,20 +901,16 @@ def star_field(width, height, warp, cx=None, cy=None):
     return grid
 
 
-def hud_panel(width, height, status, hours, info, load):
-    """The cockpit: starfield, reticle, contacts and the readout strip."""
-    rows = [panel_title("warp core", "(the deck from the pilot's seat)", width)]
+def warp_canvas(fit_w, field_w, field_h, status, hours, info, load, cy):
+    """The moving cockpit as strings: field rows (the starfield, the sight
+    already plotted at row `cy`, contacts on the ring) plus the two readout
+    rows. Shared by the 04 frame (the look) and the narrow hud_panel."""
+    rows = []
     warp = warp_factor(status, hours, load)
     seats = status.get("seats") or {}
     total, avail = info.get("MemTotal", 0), info.get("MemAvailable", 0)
     shield = avail / total if total else 1.0
     mem_gib = avail / 1024**3
-    field_h = max(5, height - 3)
-    field_w = width - 2
-    # the sight sits at the panel row that lands on the screen's centre line:
-    # the body starts three rows down on screen, so the panel's own middle
-    # row is (height-3)//2 in field coordinates.
-    cy = (height - 3) // 2
     grid = star_field(field_w, field_h, warp, cy=cy)
     # contacts: a seat with something on its plate is a blip on the ring
     live = [(n, d) for n, d in sorted(seats.items(), key=lambda kv: kv[1].get("rank", [9, 99]))
@@ -756,7 +921,6 @@ def hud_panel(width, height, status, hours, info, load):
         ang = 6.283 * i / max(4, len(live))
         x = int(round(cx + math.cos(ang) * ring_x))
         y = int(round(cy + math.sin(ang) * ring_y * 1.4))
-        busy = d.get("state") == "busy"
         if 0 <= x < field_w and 0 <= y < field_h:
             grid[(x, y)] = name[0].upper()
     for y in range(field_h):
@@ -774,7 +938,7 @@ def hud_panel(width, height, status, hours, info, load):
                 line += f"\033[0m\033[38;5;{col}m" if col else "\033[0m"
                 col_now = col
             line += ch
-        rows.append(fit(line + "\033[0m", width))
+        rows.append(fit(line + "\033[0m", fit_w))
     rows.append(f"  {colour(81)}WARP {warp:3.1f}{colour(0)} {bar(warp / 9.9, 8, 81)}"
                 f"  {colour(78)}SHLD{colour(0)} {bar(shield, 8, 78 if shield > 0.3 else 214)}"
                 f" {mem_gib:.1f}G")
@@ -782,7 +946,16 @@ def hud_panel(width, height, status, hours, info, load):
                         for name, d in live[:6]) or "clear"
     alert_now = shield < 0.15 and int(time.time()) % 2 == 0
     flag = f" {colour(196)}⚠ LOW SHIELD{colour(0)}" if alert_now else ""
-    rows.append(fit(f"  {dim('CONTACTS')} {colour(226)}{contacts}{colour(0)}{flag}", width))
+    rows.append(fit(f"  {dim('CONTACTS')} {colour(226)}{contacts}{colour(0)}{flag}", fit_w))
+    return rows
+
+
+def hud_panel(width, height, status, hours, info, load):
+    """The cockpit, narrow-dress: title, then the shared canvas."""
+    field_h = max(5, height - 3)
+    rows = [panel_title("warp core", "(the deck from the pilot's seat)", width)]
+    rows += warp_canvas(width, width - 2, field_h, status, hours, info, load,
+                        (height - 3) // 2)
     rows = [fit(r, width) for r in rows]
     return (rows + [""] * height)[:max(5, height)]
 
@@ -790,13 +963,123 @@ def hud_panel(width, height, status, hours, info, load):
 # --------------------------------------------------------------- layout ---
 
 
+def nav_header(cols, records, status, info, hours, load, now):
+    """The cockpit strip, three rows, in the chat look's own style: badge,
+    title, and the live cells on the right (clock, warp, crew, memory)."""
+    esc = "\033["
+    badge = f"{esc}48;5;81;38;5;232;1m  NA    {esc}0m"
+    badge2 = f"{esc}48;5;81;38;5;232m  flight deck  {esc}0m"
+    machine = (status.get("machine") or "this box").upper()
+    seats = status.get("seats") or {}
+    working = sum(1 for d in seats.values() if d.get("state") == "busy")
+    waiting = sum(d.get("waiting", 0) for d in seats.values())
+    total, avail = info.get("MemTotal", 0), info.get("MemAvailable", 0)
+    warp = warp_factor(status, hours, load)
+    cells = [f"{now.strftime('%H:%M:%S')}", f"WARP {warp:3.1f}",
+             f"{working}/{len(seats)} WORKING", f"{waiting} WAITING",
+             f"{avail / 1024**3:.1f} G FREE" if total else "MEM ?"]
+    left = [
+        f"{badge}  {esc}1;38;5;255mNAVIGATION-DECK{esc}0m  {esc}2mFLIGHT DECK · LIVE ON {machine}{esc}0m",
+        f"{badge2}  {esc}2mcrew · warp core · tail · usage · vitals{esc}0m",
+        ""]
+    out = []
+    for i, l in enumerate(left):
+        right = cells[i] if i < len(cells) and i < 2 else ""
+        line = l + " " * max(1, cols - visible_len(l) - visible_len(right)) + right if right else l
+        out.append(fit(line, cols))
+    return out
+
+
+def cockpit_frame(width, height, status, clients, workspaces, hours, busy,
+                  history, low, info, load, timing, records, now):
+    """The wide dress: the comms-deck look, drawn with comms-deck's own
+    frames. 01 CREW + 02 ACTIVITY on the left (the owner kept both), the
+    warp core as 04 in the centre with 05 EVENT TAIL under it, usage and
+    the instruments in the right column. The reticle sits on the screen's
+    exact centre: the strip is 3 rows, 04's content starts 3 rows into its
+    frame (border, head, blank), so the sight goes at rows//2 - 6."""
+    frame = lambda *a, **k: CD.look_frame(*a, **k)
+    tag = CD.look_tag
+    esc = "\033["
+    lw, cw, rw = CD.look_widths(width)
+    body_h = height - 5                      # the strip (3), the keys, the ticker
+    snap = CD.panel_scans()
+    working = CD.busy_seats(snap)
+    split = CD.context_split()
+    warp = warp_factor(status, hours, load)
+    now_t = time.time()                      # the framework speaks epoch
+
+    # -- left: 01 CREW, 02 ACTIVITY (comms-deck's own builders)
+    activity = CD.activity_panel(lw - 4)
+    parts = CD.look_activity_parts(activity)
+    crew_h = max(10, int(body_h * 0.45))     # chat's own share for 01
+    room = body_h - crew_h - 4
+    if len(parts["activity"]) > room:        # 02 sheds the ↳ lines, like the chat
+        parts["activity"] = [l for l in parts["activity"]
+                             if not CD.ANSI.sub("", l).lstrip().startswith("↳")][:max(room, 0)]
+    left = CD.look_stack([
+        (crew_h, lambda w, h: frame(
+            "01", "CREW", "who talks to whom", tag(bool(working), f"{len(working)} WORKING"),
+            CD.LOOK_ACCENT["crew"], w, h, CD.look_crew(w - 4, h - 4, records or [], snap, working, split, now_t))),
+        (None, lambda w, h: frame(
+            "02", "ACTIVITY", "ready order", tag(bool(working)), CD.LOOK_ACCENT["activity"], w, h,
+            parts["activity"][:h - 4])),
+    ], lw, body_h)
+
+    # -- centre: 04 WARP CORE with 05 EVENT TAIL in the log bay under it
+    tail_h = max(6, min(12, body_h // 5))
+    tail_body = event_tail_panel(max(30, cw - 4), tail_h - 4, now, records)
+
+    def warp_maker(w, h):
+        field_h = max(3, h - 6)              # frame: border, head, blank, then canvas (field + 2 readouts)
+        cy = max(0, height // 2 - 6)         # ⊕ on the screen's centre line (header 3 + frame 3)
+        return frame("04", "WARP CORE", "the pilot's seat", f"WARP {warp:3.1f}",
+                     81, w, h,
+                     warp_canvas(w - 4, w - 4, field_h, status, hours, info, load, cy))
+
+    def tail_maker(w, h):
+        return frame("05", "EVENT TAIL", "the cockpit's log", f"{esc}38;5;42m● LIVE{esc}0m",
+                     252, w, h, tail_body[:h - 4] if tail_body else [""])
+
+    centre = CD.look_stack([(body_h - tail_h, warp_maker), (None, tail_maker)], cw, body_h)
+
+    # -- right: 03 USAGE, then the instruments
+    usage = CD.usage_panel(rw - 4)[2:]
+    ws_body = workspaces_panel(clients, workspaces, rw - 4)[1:]
+    vit_body = vitals_panel(rw - 4, history, low, info, load)[1:]
+    nt_body = nav_time_panel(rw - 4, timing)[1:]
+    pulse_body = pulse_panel(rw - 4, hours, busy)[1:]
+    right = CD.look_stack([
+        (min(len(usage) + 4, max(10, body_h // 3)), lambda w, h: frame(
+            "03", "USAGE", f"sorted by {CD.usage_sort()}" if CD.usage_sort() != "provider" else "allocation · spend",
+            "", CD.LOOK_ACCENT["usage"], w, h, CD.fit_column(usage, h - 4))),
+        (min(max(6, len(ws_body) + 4), max(8, body_h // 4)), lambda w, h: frame(
+            "06", "WORKSPACES", "hyprctl clients", "", 252, w, h, ws_body[:h - 4])),
+        (min(max(7, len(vit_body) + 4), max(9, body_h // 4)), lambda w, h: frame(
+            "07", "VITALS", "no swap: watch the spike", "", CD.LOOK_ACCENT["split"], w, h, vit_body[:h - 4])),
+        (None, lambda w, h: frame(
+            "08", "NAV-TIME", "are the two decks in step", "", 225, w, h, nt_body[:h - 4])),
+        (None, lambda w, h: frame(
+            "09", "DECK PULSE", "how hard the notes flew", "", 141, w, h, pulse_body[:h - 4])),
+    ], rw, body_h)
+
+    body = [fit(left[i], lw) + fit(centre[i], cw) + fit(right[i], rw) for i in range(body_h)]
+    return (nav_header(width, records, status, info, hours, load, now)
+            + body
+            + [f"\033[48;5;234m{fit(KEYS_LINE, width)}\033[0m"]
+            + [CD.look_ticker(width, records or [], now_t)])
+
+
 def build_frame(width, height, status, clients, workspaces, hours, busy,
-                history, low, info=None, load=0.0, timing=None):
+                history, low, info=None, load=0.0, timing=None, records=None):
+    if CD and width >= LOOK_MIN_COLS and height >= 30:
+        return cockpit_frame(width, height, status, clients, workspaces, hours, busy,
+                             history, low, info or {}, load, timing, records or [],
+                             datetime.now())
     lines = [""]
     lines.append(fit(f"  {colour(81)}NAVIGATION-DECK{colour(0)} {dim(datetime.now().strftime('%H:%M:%S'))}"
                      f"  {dim('seats · meters · warp core · workspaces · vitals · nav-time · pulse')}", width))
     lines.append("")
-    two_col = width >= 150 and height >= 34
     if width >= 150 and height >= 30:
         # the cockpit owns the middle of the screen: side panels equal, so the
         # reticle lands on the screen's centre line, not just the column's
@@ -817,19 +1100,6 @@ def build_frame(width, height, status, clients, workspaces, hours, busy,
                 if j < 2:
                     line += f" {colour(240)}│{colour(0)} "
             lines.append(fit(line, width))
-    elif two_col:
-        body = height - 5
-        left = (seats_panel(status, width // 2 - 2)
-                + [""] + meters_panel(width // 2 - 2)
-                + [""] + workspaces_panel(clients, workspaces, width // 2 - 2))
-        right = (vitals_panel(width // 2 - 2, history, low, info, load)
-                 + [""] + nav_time_panel(width // 2 - 2, timing)
-                 + [""] + pulse_panel(width // 2 - 2, hours, busy))
-        left = (left + [""] * body)[:body]
-        right = (right + [""] * body)[:body]
-        for i in range(body):
-            lines.append(fit(fit(left[i], width // 2 - 2) + f" {colour(240)}│{colour(0)} "
-                             + right[i], width))
     else:
         for panel in (seats_panel(status, width), meters_panel(width),
                       workspaces_panel(clients, workspaces, width),
@@ -858,14 +1128,15 @@ def collect(record=False):
     return {"status": status, "clients": clients, "workspaces": workspaces,
             "hours": read_hours(day_start), "busy": busy_minutes(day_start),
             "history": history, "low": low, "info": info, "load": load,
-            "timing": timing_surfaces(status, now)}
+            "timing": timing_surfaces(status, now),
+            "records": load_records() if CD else []}
 
 
 def frame_from(data, width, height):
     return build_frame(width, height, data["status"], data["clients"],
                        data["workspaces"], data["hours"], data["busy"],
                        data["history"], data["low"], data["info"], data["load"],
-                       data.get("timing"))
+                       data.get("timing"), data.get("records"))
 
 
 def plain_frame(frame):
@@ -887,6 +1158,13 @@ def run_forever():
 
     out = sys.stdout
     tty = sys.stdin.isatty()
+    # The cockpit runs on the deck's own one-second heartbeat (REFRESH_S):
+    # redraws happen at most once a second, plus a redraw on a keypress. The
+    # imported look's animation flags (usage_panel.running / look_crew.moving,
+    # which drive the CHAT at up to 120 fps) are deliberately never consulted
+    # here — the crew graph is drawn still and the stars fly per-second — so
+    # the cockpit can never claim the 240 Hz loop the chat can (claude's
+    # caution, 2026-11-26: this 8 GB box runs both decks at once).
     saved = termios.tcgetattr(sys.stdin) if tty else None
     if tty:
         tty_mod.setcbreak(sys.stdin)
@@ -920,12 +1198,7 @@ def run_forever():
                             prompting = ""
                             force = True
                         elif cmd == "goto" and arg:
-                            # the Lua config's dispatch wrapper speaks hl.dsp;
-                            # a bare "workspace N" never reaches Hyprland. A
-                            # number stays a number, a name gets name:.
-                            expr = "hl.dsp.focus({ workspace = " + goto_target(arg) + " })"
-                            subprocess.run(["hyprctl", "dispatch", expr],
-                                           capture_output=True)
+                            dispatch_workspace(arg)
                             prompting = ""
                         else:
                             prompting = ""
@@ -952,6 +1225,14 @@ def run_forever():
                     subprocess.Popen(["comms-deck-chat"], start_new_session=True)
                 elif ch == "n":
                     subprocess.Popen(["comms-deck-chat", "half"], start_new_session=True)
+                elif ch == "m":
+                    subprocess.Popen(["comms-deck-mail"], start_new_session=True)
+                elif ch == "`":
+                    dispatch_workspace("comms")     # the decks, as STOX named them
+                elif ch == "2":
+                    dispatch_workspace("mail")
+                elif ch == "1":
+                    dispatch_workspace("navigation")
             time.sleep(0.1)
     finally:
         if saved is not None:
@@ -1006,6 +1287,12 @@ def self_test():
         text = "\n".join(ANSI.sub("", l) for l in frame)
         for needle in ("claude", "grok", "devin", "NAVIGATION-DECK", "special:magic"):
             assert needle in text, (needle, width)
+        if width >= LOOK_MIN_COLS and LOOK_MIN_COLS:      # the cockpit dress:
+            for needle in ("01", "CREW", "02", "ACTIVITY", "04", "WARP CORE",
+                           "05", "EVENT TAIL", "USAGE", "VITALS", "NAV-TIME"):
+                assert needle in text, (needle, width)
+        else:
+            assert "seats · meters" in text, width        # the plain dress
 
     # the deck's ready order: by rank, not by name
     order = [n for n, _ in sorted(status["seats"].items(), key=lambda kv: kv[1]["rank"])]
@@ -1016,6 +1303,11 @@ def self_test():
     # fit() keeps exact visible width, colours intact
     long_line = "word " * 30 + colour(78) + "tail" + "\033[0m"
     assert visible_len(fit(long_line, 40)) == 40
+
+    # the flight keys: deck labels fly by number (claude's DESKS, #123)
+    assert goto_target("comms") == "1" and goto_target("navigation") == "2"
+    assert goto_target("mail") == "3" and goto_target("3") == "4" and goto_target("0") == "11"
+    assert goto_target("somename") == '"name:somename"'
 
     # vitals maths: ~3 GiB free of 8, no swap, low-sample counter
     v = ANSI.sub("", "\n".join(vitals_panel(100, history, 1, info, 0.5)))
@@ -1034,6 +1326,26 @@ def self_test():
     for _ in range(200):  # stars respawn forever and never leave the field
         HUD_STATE["last"] = None
         star_field(40, 14, 9.9)
+
+    # the cockpit dress draws with comms-deck's own look functions (claude's):
+    # the import is load-bearing, so render each shared builder once here —
+    # when comms-deck's functions change shape, this test catches it, not the
+    # pilot's screen. Read-only; the fake record feeds the text paths.
+    if CD:
+        recs = [{"kind": "message", "id": "probe-1", "from": "vibe", "to": "all", "private": False,
+                 "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "text": "probe"}]
+        snap = {"seats": {}}
+        probe = lambda ok, what: (_ for _ in ()).throw(AssertionError(what)) if not ok else None
+        probe(CD.look_frame("01", "CREW", "", "", 208, 40, 8, ["probe"]), "look_frame")
+        probe(CD.look_crew(20, 8, recs, snap, set(), {}, time.time()), "look_crew")
+        probe(CD.look_activity_parts(CD.activity_panel(52)), "activity_panel")
+        probe(CD.usage_panel(50), "usage_panel")
+        probe(CD.look_ticker(120, recs, time.time()) is not None, "look_ticker")
+        probe(CD.context_split() is not None, "context_split")
+        tail_plain = ANSI.sub("", "\n".join(event_tail_panel(60, 8, now, recs)))
+        assert "vibe → all" in tail_plain, tail_plain
+    else:
+        raise AssertionError("comms-deck did not import — the cockpit dress has no frames to draw")
 
     # the owner's sight: on a full-screen terminal the reticle sits on the
     # screen's centre line — panel height is "screen rows - 5", body starts
