@@ -2683,13 +2683,84 @@ def do_actions():
     do_actions.recent = recent
 
 
+LIVE_BRANCH = "test"   # the live tree (~/comms-deck) runs this branch; nothing else
+LIVE_GUARD_EVERY = 10  # seconds between checks
+
+
+def live_tree_verdict(branch, dirty, pushed):
+    """What to do about the live tree: "ok", "restore" or "alert".
+
+    On 2026-11-26 an agent checked out its own branch in ~/comms-deck twice,
+    and every service ran unreviewed code until someone noticed. The tree
+    goes back on LIVE_BRANCH by itself only when nothing can be lost: no
+    uncommitted change to a tracked file, and the commit is on a remote
+    branch. Otherwise STOX and the crew are told, and nothing is touched.
+    """
+    if branch == LIVE_BRANCH:
+        return "ok"
+    return "restore" if (not dirty and pushed) else "alert"
+
+
+def guard_live_tree(state):
+    """Keep the live tree on LIVE_BRANCH (see live_tree_verdict). `state`
+    remembers what was last reported, so one slip makes one note."""
+    tree = PROGRAM.parent
+    if tree != HOME / "comms-deck" or not (tree / ".git").exists():
+        return  # a worktree or a copy: not the live tree
+
+    def git(*args):
+        return subprocess.run(["git", "-C", str(tree), *args], capture_output=True,
+                              text=True, timeout=20)
+
+    branch = git("rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
+    if not branch or branch == LIVE_BRANCH:
+        state.pop("reported", None)
+        return
+    head = git("rev-parse", "--short", "HEAD").stdout.strip()
+    dirty = bool(git("status", "--porcelain", "--untracked-files=no").stdout.strip())
+    pushed = bool(git("branch", "-r", "--contains", "HEAD").stdout.strip())
+    verdict = live_tree_verdict(branch, dirty, pushed)
+    if verdict == "restore":
+        r = git("checkout", "-q", LIVE_BRANCH)
+        if r.returncode == 0:
+            log(f"the live tree was on {branch} ({head}); put it back on {LIVE_BRANCH}")
+            text = (f"The live comms-deck (~/comms-deck) was switched to {branch} ({head}), so "
+                    f"every service was running unreviewed code. Its work is safe on GitHub, so "
+                    f"I've put the live tree back on {LIVE_BRANCH}. Agents: work in a git "
+                    f"worktree, never in ~/comms-deck.")
+            send("comms-deck", "owner", text)
+            send("comms-deck", "all", text, quiet=True)
+            state.pop("reported", None)
+            return
+        verdict = "alert"
+    key = (branch, head, dirty, pushed)
+    if state.get("reported") == key:
+        return
+    state["reported"] = key
+    why = ("it has uncommitted changes" if dirty else "its commit isn't pushed anywhere")
+    log(f"the live tree is on {branch} ({head}), not {LIVE_BRANCH}; {why}, so left as it is")
+    text = (f"The live comms-deck (~/comms-deck) is on {branch} ({head}), not {LIVE_BRANCH}, so "
+            f"every service is running unreviewed code. I haven't switched it back because {why}. "
+            f"Whoever did this: commit and push your work, move it to a worktree, then put "
+            f"~/comms-deck back on {LIVE_BRANCH}.")
+    send("comms-deck", "owner", text)
+    send("comms-deck", "all", text, quiet=True)
+
+
 def serve():
     """Run forever: wake agents, drive Grok Bot seats, refresh usage, copy records, mirror to Discord."""
     log(f"comms-deck serving on {MACHINE}; data in {DATA}")
     threading.Thread(target=otel_serve, daemon=True).start()
     last_sync, discord_wait_until, last_usage = 0.0, 0.0, 0.0
     notify_pos = 0
+    live_guard, last_live_check = {}, 0.0
     while True:
+        if time.time() - last_live_check >= LIVE_GUARD_EVERY:
+            last_live_check = time.time()
+            try:
+                guard_live_tree(live_guard)
+            except Exception as error:  # the guard must never stop the service
+                log(f"live tree check failed: {error}")
         if fresh_code():
             log("the program changed on disk; restarting the service on the new code")
             run_fresh()
@@ -7065,6 +7136,15 @@ def self_test():
         if not ok:
             failures.append(name)
             print("     " + detail.strip().replace("\n", "\n     "))
+
+    # The live tree goes back on test by itself only when nothing can be lost.
+    check("live tree on test: left alone", live_tree_verdict("test", True, False) == "ok")
+    check("live tree on a pushed, clean branch: restored",
+          live_tree_verdict("devin/x", False, True) == "restore")
+    check("live tree with uncommitted changes: alert only",
+          live_tree_verdict("devin/x", True, True) == "alert")
+    check("live tree on an unpushed commit: alert only",
+          live_tree_verdict("devin/x", False, False) == "alert")
 
     r = run(["send", "grok", "hello grok"], "claude")
     check("send", r.returncode == 0, r.stderr)
