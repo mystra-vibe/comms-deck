@@ -669,6 +669,48 @@ def event_tail_panel(width, height, now, records=None, live=None):
     return rows
 
 
+# --------------------------------------------------- twitch chat ----------
+# The world comms in: devin's twitch-chat daemon (#128) appends what the
+# channel says to twitch-chat.jsonl; this panel is the deck's window on it,
+# newest last like the event tail. Reading a file is all the piping either
+# side needs — that's the whole comms-deck contract.
+
+TWITCH_CHAT = DATA / "twitch-chat.jsonl"
+
+def twitch_chat_panel(width, height, now, lines=None):
+    """10 COCKPIT-CHAT's body: 'HH:MM  user: what was said', newest last.
+    `lines` are pre-parsed records (the self-test's fake feed), else the
+    file is tail-read (32 KiB is minutes of chat)."""
+    if lines is None:
+        rows_txt = []
+        try:
+            with open(TWITCH_CHAT, "rb") as f:
+                f.seek(0, os.SEEK_END)
+                f.seek(max(0, f.tell() - (32 << 10)))
+                rows_txt = f.read().decode(errors="replace").splitlines()
+        except OSError:
+            pass
+        lines = []
+        for line in rows_txt:
+            try:
+                lines.append(json.loads(line))
+            except ValueError:
+                continue
+    out = []
+    for rec in lines[-max(1, height - 1):]:
+        user = str(rec.get("user", "?"))
+        text = " ".join(str(rec.get("text", "")).split())[:max(8, width - 14)]
+        badges = str(rec.get("badges", ""))
+        chip = ("◆" if "broadcaster" in badges else
+                "＋" if "moderator" in badges else " ")
+        ch = 208 if "broadcaster" in badges else (86 if "moderator" in badges else 99)
+        stamp = datetime.fromtimestamp(float(rec.get("time") or now)).strftime("%H:%M")
+        out.append(fit(f"  {dim(stamp)} {colour(ch)}{chip} {user}{colour(0)} {text}", width))
+    if not out:
+        return [dim("  no twitch chat — twitch-chat idle or the channel is quiet")]
+    return out
+
+
 # ------------------------------------------------------------- nav-time ---
 # Are the two decks in step? Every surface is asked "when did you last
 # speak?" — the status CLI (fresh each call), the two jsonl logs (their
@@ -1049,6 +1091,10 @@ def cockpit_frame(width, height, status, clients, workspaces, hours, busy,
     vit_body = vitals_panel(rw - 4, history, low, info, load)[1:]
     nt_body = nav_time_panel(rw - 4, timing)[1:]
     pulse_body = pulse_panel(rw - 4, hours, busy)[1:]
+    tc_body = twitch_chat_panel(rw - 4, 8, now)
+    streaming = bool(stream_state())
+    CHAT_TAG = (f"{esc}38;5;42m● LIVE{esc}0m" if streaming
+                else f"{esc}2m○ idle{esc}0m")
     right = CD.look_stack([
         (min(len(usage) + 4, max(10, body_h // 3)), lambda w, h: frame(
             "03", "USAGE", f"sorted by {CD.usage_sort()}" if CD.usage_sort() != "provider" else "allocation · spend",
@@ -1057,6 +1103,8 @@ def cockpit_frame(width, height, status, clients, workspaces, hours, busy,
             "06", "WORKSPACES", "hyprctl clients", "", 252, w, h, ws_body[:h - 4])),
         (min(max(7, len(vit_body) + 4), max(9, body_h // 4)), lambda w, h: frame(
             "07", "VITALS", "no swap: watch the spike", "", CD.LOOK_ACCENT["split"], w, h, vit_body[:h - 4])),
+        (None, lambda w, h: frame(
+            "10", "COCKPIT-CHAT", "what the channel says", CHAT_TAG, 99, w, h, tc_body[:h - 4])),
         (None, lambda w, h: frame(
             "08", "NAV-TIME", "are the two decks in step", "", 225, w, h, nt_body[:h - 4])),
         (None, lambda w, h: frame(
@@ -1289,7 +1337,8 @@ def self_test():
             assert needle in text, (needle, width)
         if width >= LOOK_MIN_COLS and LOOK_MIN_COLS:      # the cockpit dress:
             for needle in ("01", "CREW", "02", "ACTIVITY", "04", "WARP CORE",
-                           "05", "EVENT TAIL", "USAGE", "VITALS", "NAV-TIME"):
+                           "05", "EVENT TAIL", "USAGE", "VITALS", "NAV-TIME",
+                           "COCKPIT-CHAT"):
                 assert needle in text, (needle, width)
         else:
             assert "seats · meters" in text, width        # the plain dress
@@ -1346,6 +1395,20 @@ def self_test():
         assert "vibe → all" in tail_plain, tail_plain
     else:
         raise AssertionError("comms-deck did not import — the cockpit dress has no frames to draw")
+
+    # 10 COCKPIT-CHAT: devin's daemon feeds a jsonl; the panel renders it
+    # newest last, marks the broadcaster and the mods, and goes quiet politely
+    fake_chat = [
+        {"time": now - 60, "user": "lurker_7", "text": "what deck is this", "badges": ""},
+        {"time": now - 30, "user": "some_mod", "text": "the navigation one", "badges": "moderator/1"},
+        {"time": now - 5, "user": "STOX", "text": "welcome aboard", "badges": "broadcaster/1"},
+    ]
+    tc = twitch_chat_panel(56, 8, now, lines=fake_chat)
+    tc_plain = ANSI.sub("", "\n".join(tc))
+    assert "lurker_7" in tc_plain and "some_mod" in tc_plain and "STOX" in tc_plain, tc_plain
+    assert tc_plain.index("lurker_7") < tc_plain.index("STOX"), "chat must read newest last"
+    empty = ANSI.sub("", "\n".join(twitch_chat_panel(56, 8, now, lines=[])))
+    assert "no twitch chat" in empty, empty
 
     # the owner's sight: on a full-screen terminal the reticle sits on the
     # screen's centre line — panel height is "screen rows - 5", body starts
