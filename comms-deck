@@ -256,14 +256,17 @@ for _line in (_app_file.read_text().splitlines() if _app_file.exists() else []):
             HIDDEN_SEATS.add(_name.strip())
 APP_SEATS = tuple(APP_PROCESS)
 SEATS = tuple(AGENTS) + APP_SEATS + ("owner",)
-# The owner's chosen name (2026-11-26: "You may all call me, STOX"). The seat
+# The owner's chosen name (2026-11-26: "You may all call me, STOX"; renamed
+# to Y at the owner's request the same day). The seat
 # id stays "owner" in files and logs; screens, notes and Discord show this,
-# and "stox" is accepted wherever a seat is named.
-OWNER_NAME = "STOX"
+# and "y" (or the owner's older name, "stox") is accepted wherever a seat is
+# named.
+OWNER_NAME = "Y"
+OWNER_ALIASES = ("y", "stox")   # lowercase tokens that name the owner
 
 
 def shown_name(seat):
-    """How a seat is named on screens and in notes: the owner is STOX."""
+    """How a seat is named on screens and in notes: the owner is Y."""
     return OWNER_NAME if seat == "owner" else seat.title()
 
 # The repos the notes are copied to. A missing clone just means no copy.
@@ -651,7 +654,8 @@ def send(sender, to, text, quiet=False, private=False):
         token = token.strip().lstrip("@")
         if not token:
             continue
-        token = re.sub(rf"^(-?){OWNER_NAME.lower()}$", r"\1owner", token)  # STOX is the owner
+        token = re.sub(rf"^(-?)({'|'.join(map(re.escape, OWNER_ALIASES))})$",
+                       r"\1owner", token)  # Y (or the older stox) is the owner
         (excludes if token.startswith("-") else names).append(token.lstrip("-"))
     names = list(dict.fromkeys(names))
     excludes = list(dict.fromkeys(excludes))
@@ -7513,7 +7517,7 @@ def self_test():
         "assert 'Reply here in this chat' in out and 'Your reply goes to grok' in out, out",
         "assert 'send_message' not in out, out",
         "owner_note = x.render([{'from': 'owner', 'to': 'alice', 'time': '2026-11-24 02:50:00', 'text': 'hi'}], 'alice')",
-        "assert 'Your reply goes to STOX' in owner_note, owner_note",
+        "assert 'Your reply goes to Y' in owner_note, owner_note",
         "print('ok')",
     ])
     r = subprocess.run([sys.executable, "-c", code],
@@ -7689,7 +7693,7 @@ def self_test():
         "two = [{'from':'owner','to':'alice','time':'2026-11-24 07:00:00','text':'hi'},"
         " {'from':'gravity','to':'all','time':'2026-11-24 07:00:00','text':'yo'}]",
         "x.APP_SEATS = tuple(set(x.APP_SEATS) | {'alice'})",
-        "assert 'Your reply goes to STOX' in x.render(two, 'alice')",
+        "assert 'Your reply goes to Y' in x.render(two, 'alice')",
         "assert x.app_delivery_allowed({'open':True,'replying':False,'composer':'draft'}, False, {'auto':0}, 'alice') is False",
         "assert x.app_delivery_allowed(idle, True, {'auto':0}, 'alice') is False",
         "assert x.app_delivery_allowed(idle, False, {'auto':2}, 'alice') is False",
@@ -8373,11 +8377,13 @@ def self_test():
         "assert '02  ACTIVITY' in half and '\u21b3' not in half, half",
         # easter egg: Gravity offline, Antigravity online
         "assert x.seat_title('gravity') == 'Gravity' and x.seat_title('gravity', True) == 'Antigravity' and x.seat_title('grok', True) == 'Grok'",
-        # the owner's name: STOX on screens and in notes, "stox" accepted as a seat
-        "assert x.shown_name('owner') == 'STOX' and x.shown_name('grok') == 'Grok'",
-        "rs, _ = x.send('claude', 'STOX', 'hello stox'); assert rs['to'] == 'owner', rs",
-        "rs, _ = x.send('claude', 'all -stox -grok', 'everyone'); assert 'owner' not in rs['to'], rs",
-        "assert '( STOX )' in plain and '( YOU )' not in plain",
+        # the owner's name: Y on screens and in notes, "y" and the older
+        # "stox" both accepted as the seat
+        "assert x.shown_name('owner') == 'Y' and x.shown_name('grok') == 'Grok'",
+        "rs, _ = x.send('claude', 'Y', 'hello stox'); assert rs['to'] == 'owner', rs",
+        "rs, _ = x.send('claude', 'stox', 'old name still works'); assert rs['to'] == 'owner', rs",
+        "rs, _ = x.send('claude', 'all -y -stox -grok', 'everyone'); assert 'owner' not in rs['to'], rs",
+        "assert '( Y )' in plain and '( STOX )' not in plain",
         "tick = x.ANSI.sub('', x.look_ticker(400, recs, 0))",
         "assert '(private)' in tick and 'secret plan' not in tick and 'public hello' in tick, tick",
         "print('look ok')",

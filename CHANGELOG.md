@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- **The owner's name is Y.** STOX renamed themselves (2026-11-26): screens,
+  notes, the chat prompt (`y ›`) and Discord now show **Y**, and `y` names
+  the owner wherever a seat is named. The seat id stays `owner` in files
+  and logs, and the owner's earlier name `stox` is still accepted as the
+  seat, old notes addressed `@STOX` included. Self-test asserts both
+  spellings and that `( Y )` sits in the crew panel. By vibe.
+
 - **navigation-deck is now nav-deck.** STOX renamed the deck (2026-11-26):
   the program, launcher and kitty class become `nav-deck` / `nav-deck-chat`
   (+ `nav-deck-half`), the desk label becomes **nav** (workspace 2 stays 2 —

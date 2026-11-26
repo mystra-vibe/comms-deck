@@ -659,10 +659,17 @@ def event_tail_panel(width, height, now, records=None, live=None):
         suffix = f"{colour(241)}{dim('· ' + doing[:max(0, width - 22)])}" if doing else ""
         evs.append((t, f"{colour(CD.colour(act.get('seat', '?'))) if CD else ''}{act.get('seat', '?')}"
                        f"{colour(0) if CD else ''} {act.get('state', '?')} {suffix}{colour(0) if CD else ''}"))
-    evs = [(t, s) for t, s in evs if t]
+    # a nan or boundless time is truthy but undrawable: isfinite drops it
+    # before the sort (nan poisons sorting, inf floats to the end), and the
+    # stamp guard keeps a surviving impossible time from taking the frame
+    # down — the same lesson #129's cockpit chat learned about fromtimestamp.
+    evs = [(t, s) for t, s in evs if t and math.isfinite(t)]
     evs.sort(key=lambda e: e[0])
     for t, s in evs[-max(1, height - 1):]:
-        stamp = datetime.fromtimestamp(t).strftime("%H:%M")
+        try:
+            stamp = datetime.fromtimestamp(t).strftime("%H:%M")
+        except (TypeError, ValueError, OverflowError, OSError):
+            continue
         rows.append(fit(f"  {dim(stamp)}  {s}", width))
     if not rows:
         rows.append(dim("  the decks are quiet"))
@@ -1423,6 +1430,15 @@ def self_test():
         probe(CD.context_split() is not None, "context_split")
         tail_plain = ANSI.sub("", "\n".join(event_tail_panel(60, 8, now, recs)))
         assert "vibe → all" in tail_plain, tail_plain
+        # nan/1e30 through the event tail must drop the line, not the frame
+        # (the event-tail twin of #129's cockpit-chat stamp guard)
+        hostile = recs + [
+            {"kind": "message", "time": float("nan"), "from": "vibe", "text": "nan event"},
+            {"kind": "message", "time": 1e30, "from": "vibe", "text": "1e30 event"},
+        ]
+        kept = event_tail_panel(60, 8, now, hostile)
+        assert kept is not None and len(kept) >= 1, kept
+        assert not re.search(r"nan event|1e30 event", ANSI.sub("", "\n".join(kept))), kept
     else:
         raise AssertionError("comms-deck did not import — the cockpit dress has no frames to draw")
 
