@@ -2995,6 +2995,12 @@ AVAILABILITY = {"ready": 0, "busy": 1, "stuck": 3, "draft in box": 3,
                 "spent": 7}  # idle until its limit resets: always the bottom (the owner, 07:23)
 
 
+def seat_title(seat, online=False):
+    """A seat's display name. Easter egg (the owner, 2026-11-26): Gravity is
+    Gravity while offline and Antigravity while it's online."""
+    return "Antigravity" if seat == "gravity" and online else seat.title()
+
+
 def availability(seat, state, now=None, snap=None):
     """How available `seat` is, as the ACTIVITY panel shows it and the router uses it.
 
@@ -4082,7 +4088,7 @@ def activity_panel(width):
         summary = "" if spent else task_summary(doing if word == "busy" else "", snap["waiting"].get(seat, ()))
         name_shade, square_shade = (shade, shade) if spent else (colour(seat), 33)
         rows.append((*a["rank"], order,
-                     [f"  \033[38;5;{name_shade}m{seat.title():8}\033[0m "
+                     [f"  \033[38;5;{name_shade}m{seat_title(seat, word in ('busy', 'ready', 'stuck')):8}\033[0m "
                       f"\033[38;5;{shade}m{state_text}\033[0m"
                       + (f" \033[38;5;{square_shade}m{squares}\033[0m" if squares else "")]
                      + ([f"    \033[2m↳ {summary}\033[0m"] if summary else [])))
@@ -4374,7 +4380,7 @@ def look_crew(cols, rows, records, snap, busy, split, now):
                  breathe_style(colour(s), k + phase) if on else f"38;5;{colour(s)}")
         state = (snap["seats"].get(s) or {}).get("state", "")
         dim = state in ("away", "not set up", "no chat yet")
-        label(cx, min(h - 1, cy + spread + 5), f"[{s}{' ●' if on else ''}]",
+        label(cx, min(h - 1, cy + spread + 5), f"[{seat_title(s, not dim).lower()}{' ●' if on else ''}]",
               "2;38;5;244" if dim else f"1;38;5;{colour(s)}")
     label(*pos["owner"], "( YOU )", "1;38;5;255")
     out = []
@@ -4508,6 +4514,15 @@ def look_screen(cols, body_h, shown, records, now):
             "07", "ALERTS", "desktop notifications", "", LOOK_ACCENT["alerts"], w, h, alerts)))
     centre = look_stack(centre_panels, cw, body_h)
     parts = look_activity_parts(activity_panel(rw - 4))
+    # Half-height look (chat on the top half, a terminal below): 02 at full
+    # length doesn't fit, and look_stack would skip it -- and 06 with it --
+    # leaving the column blank. Short of room, 02 drops the "↳ last note"
+    # lines (one row per seat) and is cut to the column; 06 shows if it fits.
+    # (The owner, 2026-11-26: "add something to the righthand column".)
+    room = body_h - 4 - (len(parts["tasks"]) + 4 if parts["tasks"] else 0)
+    if len(parts["activity"]) > room:
+        parts["activity"] = [l for l in parts["activity"]
+                             if not ANSI.sub("", l).lstrip().startswith("↳")][:max(room, 0)]
     right_panels = [(len(parts["activity"]) + 4, lambda w, h: look_frame(
         "02", "ACTIVITY", "ready order", look_tag(bool(busy)), LOOK_ACCENT["activity"], w, h, parts["activity"]))]
     if parts["tasks"]:
@@ -7484,6 +7499,11 @@ def self_test():
         "plain = '\\n'.join(x.ANSI.sub('', l) for l in x.look_screen(200, 40, shown, recs, time.time()))",
         "assert 'sorted by spend' in plain, 'the look shows the /sort choice in 03\\'s frame'",
         "assert x.set_sort('provider') is None and 'sorted by' not in '\\n'.join(x.look_screen(200, 40, shown, recs, time.time()))",
+        # half-height look (a terminal below the chat): 02 still shows, one row a seat
+        "half = '\\n'.join(x.ANSI.sub('', l) for l in x.look_screen(200, 7, shown, recs, time.time()))",
+        "assert '02  ACTIVITY' in half and '\u21b3' not in half, half",
+        # easter egg: Gravity offline, Antigravity online
+        "assert x.seat_title('gravity') == 'Gravity' and x.seat_title('gravity', True) == 'Antigravity' and x.seat_title('grok', True) == 'Grok'",
         "tick = x.ANSI.sub('', x.look_ticker(400, recs, 0))",
         "assert '(private)' in tick and 'secret plan' not in tick and 'public hello' in tick, tick",
         "print('look ok')",
