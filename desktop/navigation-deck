@@ -36,6 +36,7 @@ in ~/.local/share/comms-deck/navigation/ (one small file per day).
     navigation-deck --self-test  render a fake home tree; assert; touch nothing real
 
 Written by: vibe (2026-11-26), inspired by comms-deck by claude.
+NAV-TIME panel by devin (2026-11-26).
 """
 import json
 import math
@@ -500,6 +501,157 @@ def pulse_panel(width, hours, busy):
     return rows
 
 
+# ------------------------------------------------------------- nav-time ---
+# Are the two decks in step? Every surface is asked "when did you last
+# speak?" — the status CLI (fresh each call), the two jsonl logs (their
+# last record's own timestamp, plus the file's write lag), the usage
+# statuslines, and the inboxes. Note latency is measured where a note
+# lands: inbox file mtime minus the note's own timestamp, so a sender
+# whose clock runs fast or slow shows up as skew, not silence.
+
+
+def parse_event_time(t):
+    """A deck timestamp as epoch: 'YYYY-MM-DD HH:MM:SS' string or epoch number."""
+    if isinstance(t, str):
+        try:
+            return datetime.strptime(t, "%Y-%m-%d %H:%M:%S").timestamp()
+        except ValueError:
+            return 0.0
+    return float(t) if isinstance(t, (int, float)) else 0.0
+
+
+def tail_json(path, size=1 << 16):
+    """The last JSON record in a .jsonl file, read from the tail only."""
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            end = f.tell()
+            f.seek(max(0, end - size))
+            lines = f.read().decode(errors="replace").splitlines()
+        for line in reversed(lines):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                return json.loads(line)
+            except ValueError:
+                continue
+    except OSError:
+        pass
+    return None
+
+
+def mtime(path):
+    try:
+        return os.path.getmtime(path)
+    except OSError:
+        return 0.0
+
+
+def timing_surfaces(status=None, now=None):
+    """Freshness and latency for every deck surface the panels read.
+
+    surfaces: [{name, ts, age, detail}] — ts is the newest event's own
+    timestamp (epoch), age = now - ts (None when the surface never spoke).
+    latency: note->inbox lags in seconds for the newest inbox files
+    (negative means the sender's clock runs ahead of this machine's).
+    """
+    now = now or time.time()
+    out = {"now": now, "surfaces": [], "latency": [],
+           "waiting": 0, "oldest_waiting_s": 0}
+
+    def add(name, ts, detail=""):
+        out["surfaces"].append({"name": name, "ts": ts or 0.0,
+                                "age": (now - ts) if ts else None,
+                                "detail": detail})
+
+    status = status or {}
+    st = status.get("time")
+    add("status", st, "cli round-trip")
+    for seat, d in (status.get("seats") or {}).items():
+        out["waiting"] += d.get("waiting", 0)
+        out["oldest_waiting_s"] = max(out["oldest_waiting_s"],
+                                     d.get("oldest_waiting_s") or 0)
+
+    for label, path in (("log.jsonl", DATA / "log.jsonl"),
+                        ("activity.jsonl", DATA / "activity.jsonl")):
+        rec = tail_json(path)
+        ts = parse_event_time(rec.get("time")) if rec else 0.0
+        lag = mtime(path) - ts if ts else None
+        add(label, ts, f"write lag {human_dur(max(0.0, lag))}" if lag is not None else "")
+
+    newest_usage = 0.0
+    try:
+        for p in (DATA / "usage").glob("*.json"):
+            try:
+                newest_usage = max(newest_usage, float(json.loads(p.read_text()).get("time") or 0))
+            except (ValueError, OSError):
+                continue
+    except OSError:
+        pass
+    add("usage/*.json", newest_usage, "newest statusline")
+
+    inbox = DATA / "inbox"
+    files = []
+    try:
+        for seat_dir in inbox.iterdir():
+            if seat_dir.is_dir():
+                files += list(seat_dir.glob("*.json"))
+    except OSError:
+        pass
+    stamped = []
+    for f in files:
+        try:
+            stamped.append((f.stat().st_mtime, f))
+        except OSError:
+            continue
+    stamped.sort(key=lambda x: -x[0])
+    newest_inbox = stamped[0][0] if stamped else 0.0
+    add("inbox", newest_inbox, "newest note landed")
+    for mt, f in stamped[:12]:
+        try:
+            note = json.loads(f.read_text())
+        except (ValueError, OSError):
+            continue
+        ts = parse_event_time(note.get("time"))
+        if ts:
+            out["latency"].append(mt - ts)
+    return out
+
+
+def nav_time_panel(width, timing):
+    """The NAV-TIME panel: per-surface freshness, note latency, stall warn."""
+    rows = [panel_title("nav-time", "(are the two decks in step)", width)]
+    if not timing:
+        return rows + [dim("  no timing data")]
+    for s in timing["surfaces"]:
+        age = s["age"]
+        if age is None:
+            shown, col = "never", 245
+        elif age < 60:
+            shown, col = human_dur(age), 78
+        elif age < 600:
+            shown, col = human_dur(age), 226
+        else:
+            shown, col = human_dur(age), 214
+        rows.append(fit(f"  {colour(245)}{s['name']:<14}{colour(0)}"
+                        f"{colour(col)}{shown:>7}{colour(0)}  {dim(s['detail'])}", width))
+    lat = sorted(timing.get("latency") or [])
+    if lat:
+        med, mx, mn = lat[len(lat) // 2], lat[-1], lat[0]
+        lcol = 78 if mx < 5 else (226 if mx < 30 else 214)
+        skew = f"  {colour(214)}min {human_dur(mn)}{colour(0)}" if mn < -1 else ""
+        rows.append(fit(f"  {dim('note→inbox'.ljust(14))}{colour(lcol)}"
+                        f"med {human_dur(med)}  max {human_dur(mx)}{colour(0)}{skew}"
+                        f"  {dim('last ' + str(len(lat)) + ' notes')}", width))
+    waiting, oldest = timing.get("waiting", 0), timing.get("oldest_waiting_s", 0)
+    log_age = next((s["age"] for s in timing["surfaces"] if s["name"] == "log.jsonl"), None)
+    if waiting and log_age is not None and log_age > max(60, oldest):
+        rows.append(fit(f"  {colour(214)}⚠ {waiting} notes waiting but the log has been "
+                        f"silent {human_dur(log_age)}{colour(0)}", width))
+    return rows
+
+
 KEYS_LINE = "  q quit · r redraw · w <seat> wake (the deck's rules apply) · g <ws> goto · c chat · n notes"
 
 
@@ -628,10 +780,10 @@ def hud_panel(width, height, status, hours, info, load):
 
 
 def build_frame(width, height, status, clients, workspaces, hours, busy,
-                history, low, info=None, load=0.0):
+                history, low, info=None, load=0.0, timing=None):
     lines = [""]
     lines.append(fit(f"  {colour(81)}NAVIGATION-DECK{colour(0)} {dim(datetime.now().strftime('%H:%M:%S'))}"
-                     f"  {dim('seats · meters · warp core · workspaces · vitals · pulse')}", width))
+                     f"  {dim('seats · meters · warp core · workspaces · vitals · nav-time · pulse')}", width))
     lines.append("")
     two_col = width >= 150 and height >= 34
     if width >= 150 and height >= 30:
@@ -644,7 +796,7 @@ def build_frame(width, height, status, clients, workspaces, hours, busy,
             seats_panel(status, side_w) + [""] + meters_panel(side_w) + [""],
             hud_panel(hud_w, body, status, hours, info or {}, load),
             workspaces_panel(clients, workspaces, side_w) + [""] + vitals_panel(side_w, history, low, info, load)
-            + [""] + pulse_panel(side_w, hours, busy) + [""],
+            + [""] + nav_time_panel(side_w, timing) + [""] + pulse_panel(side_w, hours, busy) + [""],
         )
         cols = [(p + [""] * body)[:body] for p in cols]
         for i in range(body):
@@ -660,6 +812,7 @@ def build_frame(width, height, status, clients, workspaces, hours, busy,
                 + [""] + meters_panel(width // 2 - 2)
                 + [""] + workspaces_panel(clients, workspaces, width // 2 - 2))
         right = (vitals_panel(width // 2 - 2, history, low, info, load)
+                 + [""] + nav_time_panel(width // 2 - 2, timing)
                  + [""] + pulse_panel(width // 2 - 2, hours, busy))
         left = (left + [""] * body)[:body]
         right = (right + [""] * body)[:body]
@@ -671,6 +824,7 @@ def build_frame(width, height, status, clients, workspaces, hours, busy,
                       workspaces_panel(clients, workspaces, width),
                       vitals_panel(width, history, low, info, load),
                       hud_panel(width, 14, status, hours, info or {}, load),
+                      nav_time_panel(width, timing),
                       pulse_panel(width, hours, busy)):
             lines += [fit(l, width) for l in panel[:max(1, height - 5)]]
             lines.append("")
@@ -692,13 +846,15 @@ def collect(record=False):
     day_start = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
     return {"status": status, "clients": clients, "workspaces": workspaces,
             "hours": read_hours(day_start), "busy": busy_minutes(day_start),
-            "history": history, "low": low, "info": info, "load": load}
+            "history": history, "low": low, "info": info, "load": load,
+            "timing": timing_surfaces(status, now)}
 
 
 def frame_from(data, width, height):
     return build_frame(width, height, data["status"], data["clients"],
                        data["workspaces"], data["hours"], data["busy"],
-                       data["history"], data["low"], data["info"], data["load"])
+                       data["history"], data["low"], data["info"], data["load"],
+                       data.get("timing"))
 
 
 def plain_frame(frame):
@@ -943,6 +1099,44 @@ def self_test():
             globals()["DATA"] = global_old
 
     assert visible_len(fit("x\u0301" * 0 + "abcd", 2)) == 2  # combined chars: precomposed only, fits
+    # nav-time: surface freshness, note latency, stall warning
+    with tempfile.TemporaryDirectory() as d:
+        d = Path(d)
+        (d / "log.jsonl").write_text(
+            json.dumps({"time": "2026-11-26 03:00:00", "from": "claude"}) + "\n")
+        (d / "activity.jsonl").write_text(json.dumps({"time": now - 4}) + "\n")
+        (d / "usage").mkdir()
+        (d / "usage" / "devin.json").write_text(json.dumps({"time": now - 30}))
+        seat_dir = d / "inbox" / "devin"
+        seat_dir.mkdir(parents=True)
+        note_ts = datetime(2026, 11, 26, 3, 0, 0).timestamp()
+        nf = seat_dir / "n1.json"
+        nf.write_text(json.dumps({"time": "2026-11-26 03:00:00", "from": "vibe", "to": "devin"}))
+        os.utime(nf, (note_ts + 2.5, note_ts + 2.5))  # landed 2.5 s after its stamp
+        global_old = globals()["DATA"]
+        globals()["DATA"] = d
+        try:
+            tm = timing_surfaces({"time": now, "seats": {"devin": {"waiting": 0}}}, now)
+            surf = {s["name"]: s for s in tm["surfaces"]}
+            assert surf["status"]["age"] is not None and surf["status"]["age"] < 1
+            assert surf["log.jsonl"]["age"] is not None and surf["log.jsonl"]["age"] > 0
+            assert "write lag" in surf["log.jsonl"]["detail"]
+            assert abs(tm["latency"][0] - 2.5) < 0.2, tm["latency"]
+            panel = ANSI.sub("", "\n".join(nav_time_panel(120, tm)))
+            assert "nav-time" in panel and "log.jsonl" in panel and "note" in panel
+            assert "⚠" not in panel  # nothing waiting: no stall warning
+            stalled = dict(tm, waiting=5, oldest_waiting_s=30)
+            stalled["surfaces"] = [dict(s, age=7200 if s["name"] == "log.jsonl" else s["age"])
+                                  for s in tm["surfaces"]]
+            assert "⚠" in ANSI.sub("", "\n".join(nav_time_panel(120, stalled)))
+        finally:
+            globals()["DATA"] = global_old
+
+    # parse_event_time accepts both deck timestamp shapes
+    assert parse_event_time("2026-11-26 03:00:00") == datetime(2026, 11, 26, 3, 0, 0).timestamp()
+    assert parse_event_time(1700000000.0) == 1700000000.0
+    assert parse_event_time("garbage") == 0.0 and parse_event_time(None) == 0.0
+
     print("navigation-deck self-test: ok")
 
 
