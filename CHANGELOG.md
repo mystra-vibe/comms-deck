@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- **02 and 03 swap places in the look.** 02 ACTIVITY now sits under 01 CREW
+  on the left, and 03 USAGE heads the right column above 05 and 06 (the
+  owner, 2026-11-26). 03 takes the rows it needs; 06 gets the rest. By
+  Claude.
 - **The chat stays fullscreen on workspace 1; Firefox in for an offline
   Grok.** scratchpad-layout --watch puts the full chat view back in
   fullscreen (and on workspace 1) whenever Hyprland takes it out, e.g. when
