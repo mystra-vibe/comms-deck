@@ -678,6 +678,15 @@ def event_tail_panel(width, height, now, records=None, live=None):
 TWITCH_CHAT = DATA / "twitch-chat.jsonl"
 TWITCH_STATUS = TWITCH_CHAT.with_suffix(".status.json")
 
+# Viewer text goes raw into STOX's kitty, so nothing control-bearing gets
+# through: strip every C0/C1/DEL/escape-class character from whatever a
+# channel says (claude's review on #129 — a viewer must not be able to
+# repaint the screen, retitle the window, or write the clipboard via OSC 52).
+BAD_CHARS = re.compile(r"[\x00-\x1f\x7f\x80-\x9f\u00ad\u200b-\u200f\u2028\u2029\u202a-\u202e\u2060-\u206f\ufeff\ufff9-\ufffb]")
+
+def scrub(s):
+    return BAD_CHARS.sub("", str(s))
+
 def twitch_chat_state():
     """What the reader says about itself (devin's #128 status file):
     live / connecting / auth-failed / config, else an empty dict."""
@@ -702,18 +711,25 @@ def twitch_chat_panel(width, height, now, lines=None):
         lines = []
         for line in rows_txt:
             try:
-                lines.append(json.loads(line))
+                rec = json.loads(line)
             except ValueError:
                 continue
+            lines.append(rec)
+    recs = [r for r in lines if isinstance(r, dict)]
     out = []
-    for rec in lines[-max(1, height - 1):]:
-        user = str(rec.get("user", "?"))
-        text = " ".join(str(rec.get("text", "")).split())[:max(8, width - 14)]
-        badges = str(rec.get("badges", ""))
+    for rec in recs[-max(1, height - 1):]:
+        user = scrub(rec.get("user", "?"))[:32] or "?"
+        # a bad time must never take down the frame: fall back to now
+        try:
+            ts = float(rec.get("time"))
+        except (TypeError, ValueError):
+            ts = now
+        text = scrub(" ".join(str(rec.get("text", "")).split()))[:max(8, width - 14)]
+        badges = scrub(rec.get("badges", ""))
         chip = ("◆" if "broadcaster" in badges else
                 "＋" if "moderator" in badges else " ")
         ch = 208 if "broadcaster" in badges else (86 if "moderator" in badges else 99)
-        stamp = datetime.fromtimestamp(float(rec.get("time") or now)).strftime("%H:%M")
+        stamp = datetime.fromtimestamp(ts).strftime("%H:%M")
         out.append(fit(f"  {dim(stamp)} {colour(ch)}{chip} {user}{colour(0)} {text}", width))
     if not out:
         return [dim("  no twitch chat — twitch-chat idle or the channel is quiet")]
@@ -1421,6 +1437,27 @@ def self_test():
     assert tc_plain.index("lurker_7") < tc_plain.index("STOX"), "chat must read newest last"
     empty = ANSI.sub("", "\n".join(twitch_chat_panel(56, 8, now, lines=[])))
     assert "no twitch chat" in empty, empty
+
+    # a viewer must not reach STOX's terminal (claude's review, #129): every
+    # control-bearing character arrives scrubbed — ESC, OSC 52 clipboard
+    # writes, C1, BEL, zero-widths — and a hostile record can't kill the frame
+    evil = [
+        {"time": now, "user": "\x1b]52;c;aGVsbG8=\x07e Vi EW", "text": "hi\x1b[2J\x1b]0;pwned\x07\x9b there", "badges": "broadcaster/1"},
+        "not a dict",
+        42,
+        {"time": "giraffe", "user": "still", "text": "renders fine", "badges": ""},  # bad time falls back
+        {"user": "noshoes"},                                          # no time at all
+    ]
+    tx = "\n".join(twitch_chat_panel(56, 8, now, lines=evil))
+    # the panel's own SGR codes are the only escapes allowed: strip them and
+    # nothing control-bearing may remain (scrubbed leftovers like "]52;" or
+    # "[2J" are inert visible text — no ESC, no terminator, no function)
+    bare = re.sub(r"\033\[[0-9;]*m", "", tx)
+    assert "\x1b" not in bare and "\x9b" not in bare and "\x07" not in bare, bare
+    assert not re.search(r"\x1b\][^\x07]*\x07", tx) and "\x1b[2J" not in tx, tx
+    t_plain = ANSI.sub("", tx)
+    assert "e Vi" in t_plain and " there" in t_plain and "renders fine" in t_plain, t_plain
+    assert scrub("\x1b]52\x07abc\u200bf") == "]52abcf"   # controls gone, letters stay
 
     # the owner's sight: on a full-screen terminal the reticle sits on the
     # screen's centre line — panel height is "screen rows - 5", body starts
