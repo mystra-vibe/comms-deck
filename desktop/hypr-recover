@@ -103,7 +103,10 @@ def swap_in_link(recovery, target):
 def same_command(cmd, argv):
     """True if argv runs cmd: same arguments, program matched by its name,
     so /usr/bin/waybar counts as waybar (systemd-run starts it that way)."""
-    want = shlex.split(cmd)
+    try:
+        want = shlex.split(cmd)
+    except ValueError:  # unbalanced quotes; compare it as one word
+        want = [cmd]
     return (len(argv) == len(want) and bool(want)
             and os.path.basename(argv[0]) == os.path.basename(want[0])
             and argv[1:] == want[1:])
@@ -210,6 +213,7 @@ hl.exec_cmd("outside-the-block")
     assert same_command(text, ["/usr/bin/wl-paste", "--type", "text", "--watch", "cliphist", "store"])
     assert not same_command(image, ["/usr/bin/wl-paste", "--type", "text", "--watch", "cliphist", "store"])
     assert not same_command("bar", ["/usr/bin/waybar"])
+    assert not same_command("say it's", ["/usr/bin/say", "it's"])  # no crash
     with tempfile.TemporaryDirectory() as fake:
         (Path(fake) / "42").mkdir()
         (Path(fake) / "42" / "cmdline").write_bytes(b"/usr/bin/nwg-dock-hyprland\0-d\0")
