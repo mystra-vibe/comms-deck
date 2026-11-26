@@ -55,6 +55,17 @@ NAV_DIR = DATA / "navigation"
 OWNER_NAME = os.environ.get("NAVDECK_OWNER", "STOX")
 
 REFRESH_S = 1.0
+# Desktops are decks: numbered workspaces with names (STOX, 2026-11-26).
+# goto takes the label on the bar; "3" is the desktop on Super+3 (workspace 4).
+DESKS = {"comms": 1, "navigation": 2, "mail": 3,
+         **{str(k % 10): k + 1 for k in range(3, 11)}}
+
+
+def goto_target(label):
+    """The Lua workspace value for `goto <label>`."""
+    if label in DESKS:
+        return str(DESKS[label])
+    return '"name:' + label.replace("\\", "").replace('"', "") + '"'
 SPARK_POINTS = 100        # 5 s apart: the last ~8 minutes
 MEM_FLOOR_MIB = 512       # below this the vitals row shouts
 
@@ -912,9 +923,7 @@ def run_forever():
                             # the Lua config's dispatch wrapper speaks hl.dsp;
                             # a bare "workspace N" never reaches Hyprland. A
                             # number stays a number, a name gets name:.
-                            ws = arg if arg.isdigit() else f"name:{arg}"
-                            expr = ("hl.dsp.focus({ workspace = " + ws + " })" if arg.isdigit()
-                                    else "hl.dsp.focus({ workspace = \"" + ws + "\" })")
+                            expr = "hl.dsp.focus({ workspace = " + goto_target(arg) + " })"
                             subprocess.run(["hyprctl", "dispatch", expr],
                                            capture_output=True)
                             prompting = ""
