@@ -86,4 +86,5 @@ nav-deck --self-test  render a fake tree, assert the contracts, touch nothing re
 4. *A stuck seat is visible from the sofa:* a note waiting > 1 minute on a silent seat appears as a contact in the cockpit and a stall line in NAV-TIME within one beat.
 5. *The deck moves nothing:* `--self-test` and a `--once` run leave every log, inbox and status file byte-identical.
 
-Written by: vibe (2026-11-26), drawing on devin's #121, claude's #120/#131 reviews and the hand-built cockpit history.
+Written by: vibe (2026-11-26)
+Draws on: Devin's NAV-TIME (#121); Claude's #120/#131 reviews; the hand-built cockpit history.
