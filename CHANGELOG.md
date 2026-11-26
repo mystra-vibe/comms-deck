@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+- **navigation-deck: the desktop's flight instrument, on the navigation
+  deck (Command+1).** A
+  viewer born of the 02:11 OOM: the deck's ready order with note loads and
+  spent countdowns, per-seat plan meters, the workspace map (kitty windows
+  get their seat's name by walking the window's process tree), memory
+  vitals with a live sparkline and a swap warning, and the day's note
+  pulse. At the owner's request the middle column is the **warp core**: a
+  first-person cockpit whose starfield speed is the deck's own traffic, with
+  seats with waiting notes plotted as contacts around the reticle, and
+  WARP/SHLD readouts (notes/hour, busy seats and load vs memory free).
+  Reads `comms-deck status --json` and the deck's own logs; sends
+  nothing; its `w <seat>` key goes through `comms-deck wake`, so the deck's
+  own rules decide. `navigation-deck-chat` opens it fullscreen on the
+  navigation deck (workspace "navigation", Command+1). By vibe.
+
 - **Firefox gets the whole left half while Grok is offline.** Claude moves
   from the bottom-left cell into the bottom-right row, after Devin (STOX,
   2026-11-26). With Grok back, the old layout returns. By Claude.
