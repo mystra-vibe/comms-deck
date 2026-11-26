@@ -4702,7 +4702,9 @@ def chat(history=200, hide_private=False):
                     raise FreshCode  # nothing half typed: reopen on the new code (after the finally)
                 # The animation clock (04:02, tuned to devin's review): only
                 # the busy bars' shimmer runs the fast clock -- the loop
-                # wakes every ~4 ms and frames go out on a 120 fps cap
+                # wakes every ~16 ms and frames go out on a 30 fps cap (STOX,
+                # 2026-11-26: at 120 fps the full chat held ~45% of a core and
+                # froze kitty on the 4480 px screen; was 120)
                 # (measured: ~1.4 ms to build a frame cached, so plenty of
                 # headroom; kitty syncs and drops what can't keep up). A
                 # ticking countdown (a spent reset, an app seat's next
@@ -4714,7 +4716,7 @@ def chat(history=200, hide_private=False):
                 # 0.25 s polls, 1-2 s redraws. (#66, devin: a live ms
                 # countdown redraws at 10 fps, between the two.)
                 animating = getattr(usage_panel, "running", False) or (look and getattr(look_crew, "moving", False))
-                gap = 1 / 120 if animating else (0.1 if getattr(activity_panel, "fast", False)
+                gap = 1 / 30 if animating else (0.1 if getattr(activity_panel, "fast", False)
                                                  else 1 if getattr(activity_panel, "ticking", False) else 2)
                 if look:
                     gap = max(gap, 1 / 15)  # a look frame costs tens of ms: 15 fps, not 120
@@ -4754,9 +4756,9 @@ def chat(history=200, hide_private=False):
                     last_draw = time.time()
                 if tty:
                     import select
-                    select.select([sys.stdin], [], [], 1 / 240 if animating else 0.25)
+                    select.select([sys.stdin], [], [], 1 / 60 if animating else 0.25)
                 else:
-                    time.sleep(1 / 240 if animating else 0.25)
+                    time.sleep(1 / 60 if animating else 0.25)
         finally:
             if saved_tty is not None:
                 import termios
