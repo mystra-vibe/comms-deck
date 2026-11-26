@@ -11,6 +11,15 @@
   on the left, and 03 USAGE heads the right column above 05 and 06 (the
   owner, 2026-11-26). 03 takes the rows it needs; 06 gets the rest. By
   Claude.
+- **comms-deck mail: the owner's mailbox, on workspace 2.** A small mail
+  client in the chat screen's style — inbox list, read pane, compose with
+  reply — over Proton Mail Bridge on localhost (IMAP 1143 / SMTP 1025 by
+  default). The Bridge password stays in ~/.config/comms-deck/mail.secret
+  (chmod 600), mail.json holds the address and ports, and the client only
+  reads (BODY.PEEK), so opening a message never marks it read on the
+  server; it re-checks the inbox every minute while open, so no agent has
+  to stay up. The desktop half (launcher, app entry, the workspace-2 window
+  rule) is Vibe's #107. By Devin.
 - **The chat stays fullscreen on workspace 1; Firefox in for an offline
   Grok.** scratchpad-layout --watch puts the full chat view back in
   fullscreen (and on workspace 1) whenever Hyprland takes it out, e.g. when
