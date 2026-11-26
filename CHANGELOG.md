@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- **The chat stays fullscreen on workspace 1; Firefox in for an offline
+  Grok.** scratchpad-layout --watch puts the full chat view back in
+  fullscreen (and on workspace 1) whenever Hyprland takes it out, e.g. when
+  another window opens there. While Grok is offline, Firefox fills the
+  scratchpad's top-left cell and Grok Bot is minimised (special:minimised);
+  when Grok is back, Grok Bot returns and Firefox goes to workspace 3. By
+  Claude.
 - **The look's right column at half height.** With the chat on the top
   half of the screen and a terminal below, 02 ACTIVITY was taller than the
   column, so it was skipped and 06 with it, leaving the column blank. Short
