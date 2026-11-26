@@ -6125,7 +6125,8 @@ def install(yes):
         """The chat and mail screens' launchers, the scratchpad layout, app
         menu entries, and (for a Lua Hyprland config) the rules that put the
         chat screen fullscreen on workspace 1 and the mail screen on 2."""
-        for name in ("comms-deck-chat", "comms-deck-mail", "scratchpad-layout"):
+        for name in ("comms-deck-chat", "comms-deck-mail", "scratchpad-layout",
+                     "navigation-deck", "navigation-deck-chat"):
             link(name, here / "desktop" / name)
         apps = HOME / ".local/share/applications"
         apps.mkdir(parents=True, exist_ok=True)
@@ -6139,6 +6140,11 @@ def install(yes):
             "Comment=The owner's mailbox over Proton Mail Bridge\n"
             f"Exec={bin_dir / 'comms-deck-mail'}\nIcon=utilities-terminal\nTerminal=false\n"
             "Categories=Network;Office;\n")
+        (apps / "navigation-deck.desktop").write_text(
+            "[Desktop Entry]\nType=Application\nName=navigation-deck\n"
+            "Comment=Live dashboard of the seats, usage, workspaces and machine vitals\n"
+            f"Exec={bin_dir / 'navigation-deck-chat'}\nIcon=utilities-terminal\nTerminal=false\n"
+            "Categories=Utility;\n")
         lua = HOME / ".config/hypr/hyprland.lua"
         if lua.exists():
             lua_now = lua.read_text()
@@ -6153,10 +6159,15 @@ def install(yes):
                             'hl.window_rule({\n    name       = "comms-deck-mail",\n'
                             '    match      = { class = "^comms-deck-mail$" },\n'
                             '    workspace  = "2 silent",\n    fullscreen = true,\n})\n')
+            if "navigation-deck" not in lua_now:
+                lua_new += ('\n-- navigation-deck: the seats/usage/workspaces dashboard, fullscreen on 2.\n'
+                            'hl.window_rule({\n    name       = "navigation-deck",\n'
+                            '    match      = { class = "^navigation-deck$" },\n'
+                            '    workspace  = "2 silent",\n    fullscreen = true,\n})\n')
             if lua_new != lua_now:
                 lua.write_text(lua_new)
                 subprocess.run(["hyprctl", "reload"], capture_output=True)
-    step("link the chat and mail screen launchers and scratchpad-layout, add app menu entries, "
+    step("link the chat, mail and navigation-deck launchers, add app menu entries, "
          "and the Hyprland rules for workspaces 1 and 2 (Lua config)", desktop)
 
     def antigravity():
