@@ -4766,6 +4766,755 @@ def chat(history=200, hide_private=False):
             out.flush()
 
 
+# -----------------------------------------------------------------------------
+# SECTION 9b: mail - a small email client for the owner's Proton account
+# -----------------------------------------------------------------------------
+#
+# The owner reads and sends mail from the window on workspace 2 (Super+2),
+# next to the chat screen on 1. It talks to Proton Mail Bridge on localhost
+# (IMAP 127.0.0.1:1143, SMTP 127.0.0.1:1025 unless mail.json says otherwise):
+# Bridge is the only door Proton opens to outside programs, and the owner
+# signs in to it themselves. The Bridge password is the first line of
+# ~/.config/comms-deck/mail.secret (chmod 600); the address and ports are in
+# mail.json next to it ("password" there works too). Neither is ever logged
+# or sent anywhere, and the client only reads the mailbox (BODY.PEEK), so
+# opening a message never marks it read on the server.
+#
+# The sync is its own: the screen re-checks the inbox every minute while
+# it's open, so no agent has to stay up for mail to arrive.
+
+MAIL_POLL = 60  # seconds between inbox checks while the screen is open
+ESC_GRACE = 0.05  # a lone Esc sits this long waiting for a split sequence
+MAIL_KEYS = {"\033[A": "up", "\033[B": "down", "\033[C": "right", "\033[D": "left",
+             "\033[H": "home", "\033[F": "end", "\033[1~": "home", "\033[4~": "end",
+             "\033[3~": "delete", "\033[5~": "pgup", "\033[6~": "pgdn",
+             "\033OA": "up", "\033OB": "down", "\033OC": "right", "\033OD": "left",
+             "\033OH": "home", "\033OF": "end"}
+
+
+def mail_settings():
+    """The mail client's setup, or None when it isn't configured yet.
+
+    mail.json: {"address": "...", "imap_host": ..., "imap_port": ...,
+    "smtp_host": ..., "smtp_port": ...}. mail.secret: the Bridge password,
+    one line. Nothing here is ever logged or sent anywhere.
+    """
+    cfg = read_json(CONFIG / "mail.json", None)
+    if not isinstance(cfg, dict) or not cfg.get("address"):
+        return None
+    secret = CONFIG / "mail.secret"
+    password = ""
+    if secret.exists():
+        lines = secret.read_text().splitlines()
+        password = lines[0].strip() if lines else ""
+    password = password or str(cfg.get("password") or "")
+    if not password:
+        return None
+    return {"address": str(cfg["address"]), "password": password,
+            "imap": (str(cfg.get("imap_host") or "127.0.0.1"), int(cfg.get("imap_port") or 1143)),
+            "smtp": (str(cfg.get("smtp_host") or "127.0.0.1"), int(cfg.get("smtp_port") or 1025))}
+
+
+def mail_loopback(host):
+    """True for 127.x, ::1 and localhost — the only hosts allowed plain Bridge."""
+    import ipaddress
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return host.lower().rstrip(".") == "localhost"
+
+
+def mail_tls_context(host):
+    """SSL context for the Bridge. Loopback gets an unverified context (the
+    cert is self-signed and the connection never leaves the machine); any
+    other host gets full certificate verification."""
+    import ssl
+    ctx = ssl.create_default_context()
+    if mail_loopback(host):
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+    return ctx
+
+
+def mail_imap_open(settings):
+    """Connect to the Bridge's IMAP port, STARTTLS when offered (required
+    off-loopback), and log in. Returns the open IMAP4."""
+    import imaplib
+    host, port = settings["imap"]
+    imap = imaplib.IMAP4(host, port, timeout=20)
+    try:
+        if imap.has_capability("STARTTLS"):
+            imap.starttls(mail_tls_context(host))
+        elif not mail_loopback(host):
+            raise ValueError(f"{host}:{port} offers no STARTTLS; refusing plain login")
+        imap.login(settings["address"], settings["password"])
+    except Exception:
+        try:
+            imap.logout()
+        except Exception:
+            pass
+        raise
+    return imap
+
+
+def mail_decode(value):
+    """A header value as plain text (encoded words decoded)."""
+    import email.header
+    try:
+        return str(email.header.make_header(email.header.decode_header(value or "")))
+    except Exception:
+        return value or ""
+
+
+def mail_stamp(date_text):
+    """A Date header as a unix timestamp, or 0 when it can't be read."""
+    import email.utils
+    try:
+        return email.utils.parsedate_to_datetime(date_text).timestamp()
+    except (TypeError, ValueError, OverflowError):
+        return 0.0
+
+
+def mail_envelope(raw):
+    """One inbox row from a message's headers (or a whole raw message)."""
+    import email.utils
+    msg = email.message_from_bytes(raw)
+    name, addr = email.utils.parseaddr(mail_decode(msg.get("From", "")))
+    date = mail_decode(msg.get("Date", ""))
+    stamp = mail_stamp(date)
+    return {"from": name or addr, "addr": addr,
+            "subject": mail_decode(msg.get("Subject", "")) or "(no subject)",
+            "date": date, "stamp": stamp,
+            "when": time.strftime("%d %b %H:%M", time.localtime(stamp)) if stamp else ""}
+
+
+def mail_body_text(raw):
+    """The readable text of a raw RFC822 message: text/plain preferred, HTML stripped."""
+    import email
+    import html as html_mod
+    msg = email.message_from_bytes(raw)
+    plain, rich = [], []
+    for part in msg.walk():
+        if part.get_content_maintype() == "multipart" or part.get_content_disposition() == "attachment":
+            continue
+        if part.get_content_type() == "text/plain":
+            plain.append(part)
+        elif part.get_content_type() == "text/html":
+            rich.append(part)
+
+    def body_of(part):
+        raw_part = part.get_payload(decode=True)
+        if raw_part is None:
+            raw_part = part.get_payload()
+            return raw_part if isinstance(raw_part, str) else ""
+        try:
+            return raw_part.decode(part.get_content_charset() or "utf-8", "replace")
+        except LookupError:
+            return raw_part.decode("utf-8", "replace")
+
+    if plain:
+        return "\n".join(body_of(p) for p in plain).strip()
+    if rich:
+        text = "\n".join(body_of(p) for p in rich)
+        text = re.sub(r"(?is)<(script|style).*?</\1>", " ", text)
+        text = re.sub(r"(?s)<[^>]+>", " ", text)
+        return re.sub(r"[ \t]+", " ", html_mod.unescape(text)).strip()
+    if msg.get_content_maintype() == "text":
+        return body_of(msg)
+    return ""
+
+
+def mail_inbox(settings, limit=60):
+    """The inbox's newest `limit` messages as envelope dicts with `uid`, oldest first.
+
+    Read-only: BODY.PEEK never sets \\Seen, and the mailbox is only SELECTed
+    readonly, so looking never marks anything read on the server.
+    """
+    rows = []
+    imap = mail_imap_open(settings)
+    try:
+        typ, _ = imap.select("INBOX", readonly=True)
+        if typ != "OK":
+            return rows
+        typ, data = imap.uid("search", None, "ALL")
+        uids = (data[0] or b"").split()[-limit:] if typ == "OK" else []
+        for i in range(0, len(uids), 20):
+            chunk = ",".join(u.decode() for u in uids[i:i + 20])
+            typ, fetched = imap.uid("fetch", chunk, "(BODY.PEEK[HEADER.FIELDS (FROM SUBJECT DATE)])")
+            if typ != "OK":
+                continue
+            for item in fetched:
+                if not isinstance(item, tuple) or len(item) != 2:
+                    continue
+                meta, literal = item
+                m = re.search(rb"UID (\d+)", meta if isinstance(meta, bytes) else b"")
+                body = literal[0] if isinstance(literal, list) and literal else b""
+                if m and body:
+                    row = mail_envelope(body)
+                    row["uid"] = m.group(1).decode()
+                    rows.append(row)
+    finally:
+        try:
+            imap.logout()
+        except Exception:
+            pass
+    rows.sort(key=lambda r: (r["stamp"], int(r["uid"])))
+    return rows
+
+
+def mail_read_message(settings, uid):
+    """One whole message as (envelope, plain-text body), or (None, "") when it's gone."""
+    imap = mail_imap_open(settings)
+    try:
+        imap.select("INBOX", readonly=True)
+        typ, fetched = imap.uid("fetch", str(uid), "(BODY.PEEK[])")
+        raw = b""
+        for item in fetched:
+            if isinstance(item, tuple) and item[1]:
+                raw = item[1][0] if isinstance(item[1], list) else item[1]
+                break
+        if not raw:
+            return None, ""
+        return mail_envelope(raw), mail_body_text(raw)
+    finally:
+        try:
+            imap.logout()
+        except Exception:
+            pass
+
+
+def mail_send(settings, to, subject, body):
+    """Send one plain-text email through the Bridge's SMTP port. None, or the error."""
+    import datetime
+    import smtplib
+    from email.message import EmailMessage
+    from email.utils import format_datetime, make_msgid
+    msg = EmailMessage()
+    msg["From"] = settings["address"]
+    msg["To"] = to
+    msg["Subject"] = subject
+    msg["Date"] = format_datetime(datetime.datetime.now().astimezone())
+    msg["Message-ID"] = make_msgid("comms-deck")
+    msg.set_content(body or "")
+    try:
+        smtp = smtplib.SMTP(settings["smtp"][0], settings["smtp"][1], timeout=20)
+        try:
+            host = settings["smtp"][0]
+            try:
+                smtp.ehlo()  # has_extn only sees features after EHLO
+            except smtplib.SMTPHeloError:
+                pass
+            if smtp.has_extn("STARTTLS"):
+                smtp.starttls(context=mail_tls_context(host))
+            elif not mail_loopback(host):
+                raise ValueError(f"{host}:{settings['smtp'][1]} offers no STARTTLS; refusing plain login")
+            smtp.login(settings["address"], settings["password"])
+            smtp.send_message(msg)
+        finally:
+            smtp.quit()
+    except Exception as error:
+        return str(error)
+    return None
+
+
+def mail_seen_uids():
+    """Uids the owner has opened, kept locally so the server flags stay untouched."""
+    return set(str(u) for u in (read_json(DATA / "mail-seen.json", []) or []))
+
+
+def mail_mark_seen(uid):
+    seen = mail_seen_uids() | {str(uid)}
+    write_json(DATA / "mail-seen.json", sorted(seen)[-2000:])
+
+
+# -- the compose editor: a tiny text buffer with a (row, col) cursor --------
+
+
+def te_clamp(text, cur):
+    """Keep a [row, col] cursor inside `text`."""
+    row, col = cur
+    lines = text.split("\n")
+    return [max(0, min(row, len(lines) - 1)), max(0, min(col, len(lines[min(max(row, 0), len(lines) - 1)])))]
+
+
+def te_insert(text, cur, ch):
+    """Insert `ch` at the cursor; returns (text, cur)."""
+    row, col = cur
+    lines = text.split("\n")
+    lines[row] = lines[row][:col] + ch + lines[row][col:]
+    return "\n".join(lines), [row, col + len(ch)]
+
+
+def te_newline(text, cur):
+    """Enter at the cursor: split the line, cursor to the start of the new one."""
+    row, col = cur
+    lines = text.split("\n")
+    lines[row:row + 1] = [lines[row][:col], lines[row][col:]]
+    return "\n".join(lines), [row + 1, 0]
+
+
+def te_backspace(text, cur):
+    """Delete the character before the cursor, joining lines at a line start."""
+    row, col = cur
+    lines = text.split("\n")
+    if col:
+        lines[row] = lines[row][:col - 1] + lines[row][col:]
+        return "\n".join(lines), [row, col - 1]
+    if row:
+        prev = len(lines[row - 1])
+        lines[row - 1:row + 1] = [lines[row - 1] + lines[row]]
+        return "\n".join(lines), [row - 1, prev]
+    return text, cur
+
+
+def te_delete(text, cur):
+    """Delete the character at the cursor, joining lines at a line end."""
+    row, col = cur
+    lines = text.split("\n")
+    if col < len(lines[row]):
+        lines[row] = lines[row][:col] + lines[row][col + 1:]
+        return "\n".join(lines), cur
+    if row < len(lines) - 1:
+        lines[row:row + 2] = [lines[row] + lines[row + 1]]
+        return "\n".join(lines), cur
+    return text, cur
+
+
+def te_move(text, cur, key):
+    """Arrow/Home/End movement for the compose editor."""
+    row, col = cur
+    lines = text.split("\n")
+    if key == "left":
+        if col:
+            col -= 1
+        elif row:
+            row, col = row - 1, len(lines[row - 1])
+    elif key == "right":
+        if col < len(lines[row]):
+            col += 1
+        elif row < len(lines) - 1:
+            row, col = row + 1, 0
+    elif key == "up":
+        if row:
+            row -= 1
+            col = min(col, len(lines[row]))
+    elif key == "down":
+        if row < len(lines) - 1:
+            row += 1
+            col = min(col, len(lines[row]))
+    elif key == "home":
+        col = 0
+    elif key == "end":
+        col = len(lines[row])
+    return te_clamp(text, [row, col])
+
+
+def te_cursor_line(line, col, width):
+    """One compose line with the cursor cell in reverse video, fitted to `width`."""
+    line = line[:width]
+    col = min(col, len(line))
+    cell = line[col] if col < len(line) else " "
+    rest = line[col + 1:] if col < len(line) else ""
+    return fit(line[:col] + "\033[7m" + cell + "\033[0m" + rest, width)
+
+
+def mail():
+    """The mail screen: inbox on the left, the open message on the right,
+    a compose editor over both. Quits on q/Esc at the inbox; restarts itself
+    on new code like the chat screen does."""
+    settings = mail_settings()
+    out = sys.stdout
+    tty = sys.stdin.isatty()
+    if not tty:
+        # A script or a pipe: just say whether the client is set up.
+        if settings:
+            print(f"comms-deck mail: configured for {settings['address']} "
+                  f"(imap {settings['imap'][0]}:{settings['imap'][1]}, smtp {settings['smtp'][0]}:{settings['smtp'][1]}); "
+                  "run `comms-deck mail` in a terminal for the screen.")
+        else:
+            print("comms-deck mail: not set up yet. Create ~/.config/comms-deck/mail.json "
+                  "({\"address\": \"...\"}) and ~/.config/comms-deck/mail.secret (the Bridge password), "
+                  "then run `comms-deck mail` in a terminal.")
+        return
+
+    saved_tty = None
+    if tty:
+        import termios
+        import tty as tty_mod
+        saved_tty = termios.tcgetattr(sys.stdin)
+        tty_mod.setcbreak(sys.stdin)
+        attrs = termios.tcgetattr(sys.stdin)
+        attrs[0] &= ~termios.IXON  # Ctrl+S is the compose screen's send key, not XOFF
+        termios.tcsetattr(sys.stdin, termios.TCSANOW, attrs)
+        out.write("\033[?2004h")  # bracketed paste
+
+    S = {"mode": "list", "sel": 0, "msgs": [], "open": None, "scroll": 0,
+         "compose": None, "return_mode": "list", "seen": mail_seen_uids(),
+         "notice": "", "notice_until": 0.0, "last_poll": 0.0, "quitting": False}
+    decoder = __import__("codecs").getincrementaldecoder("utf-8")(errors="ignore")
+    pending_esc = ""
+    pending_since = 0.0
+    in_paste = False
+
+    def flash(text, seconds=6):
+        S["notice"], S["notice_until"] = text, time.time() + seconds
+
+    def refresh_mail(force=False):
+        if not force and time.time() - S["last_poll"] < MAIL_POLL:
+            return
+        S["last_poll"] = time.time()
+        try:
+            S["msgs"] = mail_inbox(settings)
+            S["sel"] = min(S["sel"], max(0, len(S["msgs"]) - 1))
+        except Exception as error:
+            flash("mail unreachable: " + str(error)[:80], 10)
+
+    def open_message(row):
+        try:
+            env, text = mail_read_message(settings, row["uid"])
+        except Exception as error:
+            env, text = row, f"(couldn't read the message: {error})"
+        S["open"] = {"row": row, "env": env or row, "text": text}
+        S["scroll"] = 0
+        mail_mark_seen(row["uid"])
+        S["seen"].add(str(row["uid"]))
+        S["mode"] = "read"
+
+    def compose_end(compose, name):
+        lines = compose[name].split("\n")
+        compose["cur"] = [len(lines) - 1, len(lines[-1])]
+
+    def compose_go(compose, name):
+        compose["field"] = name
+        compose_end(compose, name)
+
+    def start_compose(reply=None):
+        to, subject = "", ""
+        if reply:
+            to = reply.get("addr") or reply.get("from") or ""
+            subject = reply.get("subject") or ""
+            if subject and not subject.lower().startswith("re:"):
+                subject = "Re: " + subject
+        S["compose"] = {"to": to, "subject": subject, "body": "", "field": "to", "cur": [0, 0]}
+        compose_end(S["compose"], "to")
+        S["return_mode"] = S["mode"]
+        S["mode"] = "compose"
+
+    def compose_send():
+        compose = S["compose"]
+        to = compose["to"].strip()
+        if not to:
+            flash("compose: no recipient")
+            return
+        subject = compose["subject"].strip() or "(no subject)"
+        error = mail_send(settings, to, subject, compose["body"])
+        if error:
+            flash("send failed: " + error[:80], 10)
+            return
+        flash("sent to " + to, 4)
+        S["compose"] = None
+        S["mode"] = S["return_mode"]
+        refresh_mail(force=True)
+
+    def compose_key(key):
+        """One key in the compose editor. Returns True when Esc cancels it."""
+        compose = S["compose"]
+        name = compose["field"]
+        text, cur = compose[name], compose["cur"]
+        order = ["to", "subject", "body"]
+        if key in ("left", "right", "home", "end"):
+            compose["cur"] = te_move(text, cur, key)
+        elif key in ("up", "down"):
+            if name == "body":
+                compose["cur"] = te_move(text, cur, key)
+                if key == "up" and cur[0] == 0:  # up from the body's first line: the subject
+                    compose_go(compose, "subject")
+            elif key == "down":
+                compose_go(compose, order[min(order.index(name) + 1, 2)])
+            else:
+                compose_go(compose, order[max(order.index(name) - 1, 0)])
+        elif key == "tab":
+            compose_go(compose, order[(order.index(name) + 1) % 3])
+        elif key == "enter":
+            if name == "body":
+                compose["body"], compose["cur"] = te_newline(compose["body"], cur)
+            else:
+                compose_go(compose, order[min(order.index(name) + 1, 2)])
+        elif key == "backspace":
+            compose[name], compose["cur"] = te_backspace(text, cur)
+        elif key == "delete":
+            compose[name], compose["cur"] = te_delete(text, cur)
+        elif key == "esc":
+            return True
+        return False
+
+    def type_char(c):
+        if S["mode"] == "compose":
+            compose = S["compose"]
+            name = compose["field"]
+            compose[name], compose["cur"] = te_insert(compose[name], compose["cur"], c)
+        elif S["mode"] == "list":
+            if c == "j" and S["msgs"]:
+                S["sel"] = min(len(S["msgs"]) - 1, S["sel"] + 1)
+            elif c == "k":
+                S["sel"] = max(0, S["sel"] - 1)
+            elif c == "c":
+                start_compose()
+            elif c == "g":
+                refresh_mail(force=True)
+            elif c == "q":
+                S["quitting"] = True
+        elif S["mode"] == "read":
+            if c == "j":
+                S["scroll"] += 1
+            elif c == "k":
+                S["scroll"] = max(0, S["scroll"] - 1)
+            elif c == "r" and S["open"]:
+                start_compose(reply=S["open"]["row"])
+            elif c == "c":
+                start_compose()
+            elif c == "g":
+                refresh_mail(force=True)
+            elif c == "q":
+                S["mode"] = "list"
+
+    def press(key):
+        mode = S["mode"]
+        if key == "ctrl_s" and mode == "compose":
+            compose_send()
+        elif mode == "list":
+            if key == "down" and S["msgs"]:
+                S["sel"] = min(len(S["msgs"]) - 1, S["sel"] + 1)
+            elif key == "up":
+                S["sel"] = max(0, S["sel"] - 1)
+            elif key == "enter" and S["msgs"]:
+                open_message(S["msgs"][S["sel"]])
+            elif key == "g":
+                refresh_mail(force=True)
+            elif key in ("q", "esc"):
+                S["quitting"] = True
+        elif mode == "read":
+            if key in ("down", "pgdn"):
+                S["scroll"] += 10 if key == "pgdn" else 1
+            elif key in ("up", "pgup"):
+                S["scroll"] = max(0, S["scroll"] - (10 if key == "pgup" else 1))
+            elif key == "g":
+                refresh_mail(force=True)
+            elif key in ("esc", "q"):
+                S["mode"] = "list"
+        elif mode == "compose":
+            if compose_key(key):  # Esc cancels the compose
+                S["compose"] = None
+                S["mode"] = S["return_mode"]
+
+    def handle_keys():
+        """Read whatever was typed. Returns True so the screen redraws."""
+        nonlocal pending_esc, pending_since, in_paste
+        import select
+        ready = tty and select.select([sys.stdin], [], [], 0)[0]
+        if pending_esc == "\033" and not ready and time.time() - pending_since > ESC_GRACE:
+            pending_esc = ""
+            press("esc")  # a lone Esc, not the start of a split sequence
+            return True
+        if not ready:
+            return False
+        chars = pending_esc + decoder.decode(os.read(sys.stdin.fileno(), 4096))
+        pending_esc = ""
+        i = 0
+        while i < len(chars):
+            c = chars[i]
+            if c == "\033":
+                m = re.match(r"\033\[[0-9;?]*[ -/]*[@-~]", chars[i:])
+                if m:
+                    seq = m.group(0)
+                    in_paste = {"\033[200~": True, "\033[201~": False}.get(seq, in_paste)
+                    key = MAIL_KEYS.get(seq)
+                    if key and not in_paste:
+                        press(key)
+                    i += len(seq)
+                    continue
+                if i + 1 >= len(chars) or chars[i + 1] == "[":
+                    pending_esc = chars[i:]  # sequence split across reads
+                    pending_since = time.time()
+                    break
+                press("esc")
+            elif c in "\r\n":
+                if in_paste:
+                    if S["mode"] == "compose":
+                        compose = S["compose"]
+                        compose["body"], compose["cur"] = te_insert(compose["body"], compose["cur"], "\n")
+                else:
+                    press("enter")
+            elif c == "\t":
+                press("tab")
+            elif c in "\x7f\x08":
+                press("backspace")
+            elif c == "\x13":
+                press("ctrl_s")
+            elif c >= " ":
+                type_char(c)
+            i += 1
+        return True
+
+    def mail_header(cols):
+        unread = sum(1 for m in S["msgs"] if str(m["uid"]) not in S["seen"])
+        left = "comms-deck mail · " + settings["address"]
+        right = f"{unread} unread"
+        ver = deck_version()
+        if ver:
+            right += " · " + ver
+        if visible_len(left) + visible_len(right) + 2 > cols:
+            left = "comms-deck mail"
+        if visible_len(left) + visible_len(right) + 2 > cols:
+            right = f"{unread} unread"
+        gap = max(1, cols - visible_len(left) - visible_len(right) - 2)
+        return ("\033[48;5;234m\033[1;38;5;255m " + left + " " * gap
+                + "\033[2;38;5;244m" + right + " \033[0m")
+
+    def list_row(row, width, selected):
+        unread = str(row["uid"]) not in S["seen"]
+        dot = "\033[38;5;208m●\033[0m" if unread else "\033[2m·\033[0m"
+        frm = (row["from"] or row["addr"])[:18].ljust(18)
+        when = row.get("when", "")
+        w_subj = max(8, width - 1 - 1 - 18 - 4 - len(when) - 2)
+        subj = row["subject"][:w_subj].ljust(w_subj)
+        plain = f"{'●' if unread else '·'} {frm}  {subj}  {when}"
+        if selected:
+            return "\033[7m" + fit(ANSI.sub("", plain), width)
+        return fit(dot + " " + frm + "  " + subj + "  " + when, width)
+
+    def read_lines(width, height):
+        import textwrap
+        op = S["open"]
+        env = op["env"]
+        head = []
+        sender = env.get("from") or ""
+        if env.get("addr") and env["addr"] != sender:
+            sender += f" <{env['addr']}>"
+        head += [f"From:    {sender}", f"Subject: {env.get('subject', '')}",
+                 f"Date:    {env.get('when') or env.get('date', '')}", ""]
+        body = []
+        for para in op["text"].splitlines() or [""]:
+            body += textwrap.wrap(para, max(20, width - 2)) or [""]
+        lines = head + body
+        start = min(max(0, S["scroll"]), max(0, len(lines) - height))
+        return [fit(l, width) for l in lines[start:start + height]]
+
+    def compose_lines(width, height):
+        compose = S["compose"]
+        lines = []
+        for name, label in (("to", "To"), ("subject", "Subject")):
+            active = compose["field"] == name
+            if active:
+                shown = te_cursor_line(compose[name], compose["cur"][1], width - len(label) - 4)
+            else:
+                shown = fit(compose[name], width - len(label) - 4)
+            lines.append(f"  {label + ':':<10} " + shown)
+        lines.append("  " + "\033[2m" + "─" * (width - 4) + "\033[0m")
+        body_h = max(1, height - len(lines))
+        blines = compose["body"].split("\n") or [""]
+        cur = compose["cur"] if compose["field"] == "body" else None
+        start = 0
+        if cur and cur[0] >= body_h:
+            start = min(cur[0] - body_h + 1, max(0, len(blines) - body_h))
+        for i in range(start, min(len(blines), start + body_h)):
+            if cur and i == cur[0]:
+                lines.append("  " + te_cursor_line(blines[i], cur[1], width - 2))
+            else:
+                lines.append("  " + fit(blines[i], width - 2))
+        return lines
+
+    def mail_input(cols):
+        hints = {"list": "j/k move · enter read · c compose · g refresh · q quit",
+                 "read": "j/k scroll · r reply · c compose · g refresh · esc back",
+                 "compose": "tab/↑↓ field · enter newline · ctrl+s send · esc cancel"}[S["mode"]]
+        line = "  " + hints
+        if time.time() < S["notice_until"]:
+            line += "   " + S["notice"]
+        return "\033[48;5;234m" + fit("\033[2m" + line, cols) + "\033[0m"
+
+    def mail_frame(cols, rows):
+        inner = cols - 2  # one-space margin each side
+        body_h = rows - 2  # the header band and the input line
+        split = cols >= 90 and S["mode"] != "compose"
+        if S["mode"] == "compose":
+            content = compose_lines(inner, body_h)
+        elif split:
+            list_w = max(28, min(44, inner // 3))
+            pane_w = inner - list_w - 3
+            # newest at the bottom, like the chat screen
+            shown = S["msgs"][-body_h:] if len(S["msgs"]) > body_h else S["msgs"]
+            offset = len(S["msgs"]) - len(shown)
+            left = [list_row(row, list_w, offset + i == S["sel"]) for i, row in enumerate(shown)]
+            left = ([""] * (body_h - len(left)) + left)[-body_h:]
+            if S["mode"] == "read" and S["open"]:
+                right = read_lines(pane_w, body_h)
+            else:
+                op = S["open"]
+                right = ([fit("From: " + (op["env"].get("from") or ""), pane_w),
+                          fit("Subj: " + op["env"].get("subject", ""), pane_w), ""]
+                         if op else [])
+                right += [fit("enter: read · c: compose", pane_w)]
+            right = (right + [""] * body_h)[:body_h]
+            content = [fit(l, list_w) + " \033[38;5;238m│\033[0m " + fit(r, pane_w)
+                       for l, r in zip(left, right)]
+        else:
+            if S["mode"] == "read" and S["open"]:
+                content = read_lines(inner, body_h)
+            else:
+                shown = S["msgs"][-body_h:] if len(S["msgs"]) > body_h else S["msgs"]
+                offset = len(S["msgs"]) - len(shown)
+                content = [list_row(row, inner, offset + i == S["sel"]) for i, row in enumerate(shown)]
+        content = (content + [""] * body_h)[:body_h]
+        lines = [mail_header(cols), ""] + [" " + l for l in content] + [mail_input(cols)]
+        return [fit(l, cols) for l in lines[:rows]]
+
+    out.write("\033[?25l\033[2J")
+    last_draw = 0.0
+    try:
+        if settings is None:
+            # The setup screen: what to create, then any key closes it.
+            cols, rows = shutil.get_terminal_size((100, 40))
+            notes = ["comms-deck mail isn't set up yet.", "",
+                     "Create ~/.config/comms-deck/mail.json:",
+                     '  {"address": "you@proton.me", "imap_port": 1143, "smtp_port": 1025}',
+                     "and ~/.config/comms-deck/mail.secret (chmod 600) with the",
+                     "Proton Mail Bridge password on the first line.", "",
+                     "Bridge: sudo pacman -S protonmail-bridge, sign in, then",
+                     "run `comms-deck mail` again once Bridge answers.", "", "any key closes this"]
+            frame = ["", "", ""] + ["  " + fit(n, cols - 2) for n in notes] + [""] * (rows - 3 - len(notes))
+            out.write("\033[H" + "\n".join(frame[:rows]) + "\n")
+            out.flush()
+            import select
+            while True:
+                select.select([sys.stdin], [], [], 0.25)
+                if select.select([sys.stdin], [], [], 0)[0]:
+                    os.read(sys.stdin.fileno(), 1024)
+                    break
+        else:
+            while not S["quitting"]:
+                cols, rows = shutil.get_terminal_size((100, 40))
+                refresh_mail()
+                typed = handle_keys()
+                if typed or time.time() - last_draw >= 1 or S["mode"] == "compose":
+                    out.write("\033[H" + "\n".join(mail_frame(cols, rows)) + "\n")
+                    out.flush()
+                    last_draw = time.time()
+                fresh_ok = not (S["mode"] == "compose" and (S["compose"]["to"] or S["compose"]["subject"]
+                                                            or S["compose"]["body"]))
+                if fresh_ok and fresh_code():
+                    raise FreshCode  # nothing half typed: reopen on the new code
+                import select
+                select.select([sys.stdin], [], [], 0.25)
+    finally:
+        if saved_tty is not None:
+            import termios
+            termios.tcsetattr(sys.stdin, termios.TCSADRAIN, saved_tty)
+            out.write("\033[?2004l")
+        out.write("\033[0m\033[2J\033[H\033[?25h")
+        out.flush()
+
+
 # The status line (`comms-deck statusline --source <agent>`): Claude Code and
 # Grok both pipe their session details (model, context, cost, and for Claude
 # plan limits) to a status line command as JSON. This saves that JSON as
@@ -6124,7 +6873,7 @@ def install(yes):
     def desktop():
         """The chat and mail screens' launchers, the scratchpad layout, app
         menu entries, and (for a Lua Hyprland config) the rules that put the
-        chat screen fullscreen on workspace 1 and the mail screen on 2."""
+        chat screen fullscreen on the comms desktop and the mail screen on mail."""
         for name in ("comms-deck-chat", "comms-deck-mail", "scratchpad-layout",
                      "navigation-deck", "navigation-deck-chat"):
             link(name, here / "desktop" / name)
@@ -6150,15 +6899,15 @@ def install(yes):
             lua_now = lua.read_text()
             lua_new = lua_now
             if "comms-deck-chat" not in lua_now:  # each rule lands once
-                lua_new += ('\n-- comms-deck chat: the agents\' live notes, fullscreen on workspace 1.\n'
+                lua_new += ('\n-- comms-deck chat: the agents\' live notes, fullscreen on the comms desktop.\n'
                             'hl.window_rule({\n    name       = "comms-deck-chat",\n'
                             '    match      = { class = "^comms-deck-chat$" },\n'
-                            '    workspace  = "1 silent",\n    fullscreen = true,\n})\n')
+                            '    workspace  = "name:comms silent",\n    fullscreen = true,\n})\n')
             if "comms-deck-mail" not in lua_now:
-                lua_new += ('\n-- comms-deck mail: the owner\'s mailbox, fullscreen on workspace 2.\n'
+                lua_new += ('\n-- comms-deck mail: the owner\'s mailbox, fullscreen on the mail desktop.\n'
                             'hl.window_rule({\n    name       = "comms-deck-mail",\n'
                             '    match      = { class = "^comms-deck-mail$" },\n'
-                            '    workspace  = "2 silent",\n    fullscreen = true,\n})\n')
+                            '    workspace  = "name:mail silent",\n    fullscreen = true,\n})\n')
             if "navigation-deck" not in lua_now:
                 lua_new += ('\n-- navigation-deck: the seats, usage and workspaces dashboard, fullscreen on the navigation deck.\n'
                             'hl.window_rule({\n    name       = "navigation-deck",\n'
@@ -7609,6 +8358,41 @@ def self_test():
     r = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True, timeout=30)
     check("strict cite-check refuses PRs whose text never cites the touched files",
           r.returncode == 0 and r.stdout.strip() == "ok", r.stdout + r.stderr)
+    # mail: settings, envelope/body parsing and the compose editor. No server
+    # in tests - the IMAP/SMTP paths are thin wrappers over the stdlib, and
+    # the real Bridge check comes once Proton Mail Bridge is installed.
+    Path(f"{tmp}/config").mkdir(parents=True, exist_ok=True)
+    Path(f"{tmp}/config/mail.json").write_text(json.dumps(
+        {"address": "me@example.com", "imap_port": 1143, "smtp_port": 1025}))
+    Path(f"{tmp}/config/mail.secret").write_text("bridge-pass\n")
+    code = "\n".join([
+        "import importlib.machinery as m, importlib.util as u",
+        f"l = m.SourceFileLoader('ml', {me!r}); s = u.spec_from_loader('ml', l)",
+        "x = u.module_from_spec(s); l.exec_module(x)",
+        "st = x.mail_settings()",
+        "assert st and st['address'] == 'me@example.com' and st['imap'] == ('127.0.0.1', 1143) "
+        "and st['smtp'] == ('127.0.0.1', 1025) and st['password'] == 'bridge-pass', st",
+        "raw = (b'From: =?utf-8?q?J=C3=BCrgen?= <j@example.com>\\r\\n'"
+        "       b'Subject: =?utf-8?q?Gr=C3=BC=C3=9Fe?=\\r\\n'"
+        "       b'Date: Wed, 26 Nov 2026 10:00:00 +0000\\r\\n\\r\\nBody text here.')",
+        "env = x.mail_envelope(raw)",
+        "assert env['from'] == 'Jürgen' and env['subject'] == 'Grüße' "
+        "and env['addr'] == 'j@example.com' and env['when'], env",
+        "assert x.mail_body_text(raw) == 'Body text here.'",
+        "html = (b'From: a@b.com\\r\\nSubject: hi\\r\\n'"
+        "        b'Content-Type: text/html; charset=utf-8\\r\\n\\r\\n<p>Hello <b>there</b></p>')",
+        "assert 'Hello there' in x.mail_body_text(html)",
+        "assert x.te_insert('hello', [0, 5], '!') == ('hello!', [0, 6])",
+        "assert x.te_newline('ab', [0, 1]) == ('a\\nb', [1, 0])",
+        "assert x.te_backspace('a\\nb', [1, 0]) == ('ab', [0, 1])",
+        "assert x.te_delete('ab', [0, 1]) == ('a', [0, 1])",
+        "assert x.te_move('ab\\ncd', [0, 1], 'down') == [1, 1]",
+        "assert x.te_move('ab\\ncd', [1, 2], 'up') == [0, 2]",
+        "print('ok')",
+    ])
+    r = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True, timeout=30)
+    check("mail: settings, envelope and body parsing, and the compose editor",
+          r.returncode == 0 and r.stdout.strip() == "ok", r.stdout + r.stderr)
     shutil.rmtree(tmp, ignore_errors=True)
     print(f"\n{'all passed' if not failures else f'{len(failures)} failed'}")
     return 1 if failures else 0
@@ -7811,6 +8595,7 @@ def main():
     p = sub.add_parser("chat")
     p.add_argument("--hide-private", action="store_true")
     p.add_argument("--history", type=int, default=200)
+    sub.add_parser("mail", help="the mail client (Proton Mail Bridge on localhost; workspace 2)")
     sub.add_parser("serve")
     sub.add_parser("mcp")
     sub.add_parser("mcp-call")  # internal: one tool call for an MCP server running old code
@@ -7876,6 +8661,11 @@ def main():
         elif args.cmd == "chat":
             try:
                 chat(args.history, args.hide_private)
+            except FreshCode:
+                run_fresh()  # the screen has been restored; same window, new code
+        elif args.cmd == "mail":
+            try:
+                mail()
             except FreshCode:
                 run_fresh()  # the screen has been restored; same window, new code
         elif args.cmd == "serve":
