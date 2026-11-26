@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- **Firefox gets the whole left half while Grok is offline.** Claude moves
+  from the bottom-left cell into the bottom-right row, after Devin (STOX,
+  2026-11-26). With Grok back, the old layout returns. By Claude.
 - **The owner is STOX.** The owner chose a name (2026-11-26): screens,
   delivered notes and Discord show STOX instead of "You" or "owner", the
   crew panel's centre reads ( STOX ), the chat box prompt is `stox ›`, and
