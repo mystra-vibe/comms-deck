@@ -302,6 +302,38 @@ def open_chat_views():
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
+REOPEN_EVERY = 30  # seconds: at most one reopen this often, so a chat that dies at start can't loop
+
+
+def chat_missing(clients):
+    """True when no full chat view (class comms-deck-chat) is open."""
+    return not any(c.get("class") == "comms-deck-chat" for c in clients)
+
+
+def reopen_chat_if_closed(last, now=None):
+    """Open the full chat again if it has closed. Returns the time of the last reopen.
+
+    The chat is STOX's only window onto the deck. On 2026-11-26 it closed
+    twice and stayed closed until someone noticed. The launcher itself does
+    nothing if the window is open, so a reopen that races another one is
+    harmless.
+    """
+    import json
+    import time
+    now = time.time() if now is None else now
+    if now - last < REOPEN_EVERY:
+        return last
+    try:
+        clients = json.loads(hypr("clients", "-j"))
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return last
+    if not chat_missing(clients):
+        return last
+    print("the chat is closed; reopening it", flush=True)
+    open_chat_views()
+    return now
+
+
 def _stamp(path):
     """(mtime, size) of a file, or None."""
     try:
@@ -347,6 +379,7 @@ def watch():
     import time
     started, since = _stamp(Path(__file__).resolve()), {}
     open_chat_views()
+    reopened = time.time()  # just opened above
     while True:
         try:
             sock, path = connect_event_socket()
@@ -378,6 +411,7 @@ def watch():
                         first = False
                         if n:
                             print(f"rearranged {n} window(s)", flush=True)
+                        reopened = reopen_chat_if_closed(reopened)
                     except (OSError, subprocess.SubprocessError, SystemExit, StopIteration, ValueError) as error:
                         print(f"arrange failed: {error}", flush=True)
 
@@ -436,6 +470,10 @@ def _open_clients(shared_open):
 
 def self_check():
     """Check that the cells tile exactly. Does not talk to Hyprland or move windows."""
+    # The keeper reopens a closed chat, at most once per REOPEN_EVERY.
+    assert chat_missing([{"class": "kitty"}, {"class": "comms-deck-chat-half"}])
+    assert not chat_missing([{"class": "comms-deck-chat"}])
+    assert reopen_chat_if_closed(100.0, now=110.0) == 100.0  # too soon: no query, no reopen
     if GAP_OUT != 22 or GAP_IN != 0:
         raise SystemExit(f"expected GAP_OUT 22 and GAP_IN 0, got {GAP_OUT}, {GAP_IN}")
     monitors = [
