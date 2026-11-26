@@ -4774,7 +4774,7 @@ def chat(history=200, hide_private=False):
 # next to the chat screen on 1. It talks to Proton Mail Bridge on localhost
 # (IMAP 127.0.0.1:1143, SMTP 127.0.0.1:1025 unless mail.json says otherwise):
 # Bridge is the only door Proton opens to outside programs, and the owner
-# signs in to it himself. The Bridge password is the first line of
+# signs in to it themselves. The Bridge password is the first line of
 # ~/.config/comms-deck/mail.secret (chmod 600); the address and ports are in
 # mail.json next to it ("password" there works too). Neither is ever logged
 # or sent anywhere, and the client only reads the mailbox (BODY.PEEK), so
@@ -4784,6 +4784,7 @@ def chat(history=200, hide_private=False):
 # it's open, so no agent has to stay up for mail to arrive.
 
 MAIL_POLL = 60  # seconds between inbox checks while the screen is open
+ESC_GRACE = 0.05  # a lone Esc sits this long waiting for a split sequence
 MAIL_KEYS = {"\033[A": "up", "\033[B": "down", "\033[C": "right", "\033[D": "left",
              "\033[H": "home", "\033[F": "end", "\033[1~": "home", "\033[4~": "end",
              "\033[3~": "delete", "\033[5~": "pgup", "\033[6~": "pgdn",
@@ -4812,6 +4813,15 @@ def mail_settings():
     return {"address": str(cfg["address"]), "password": password,
             "imap": (str(cfg.get("imap_host") or "127.0.0.1"), int(cfg.get("imap_port") or 1143)),
             "smtp": (str(cfg.get("smtp_host") or "127.0.0.1"), int(cfg.get("smtp_port") or 1025))}
+
+
+def mail_tls_context():
+    """SSL context for the Bridge's self-signed localhost cert (127.0.0.1 only)."""
+    import ssl
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    return ctx
 
 
 def mail_decode(value):
@@ -4891,6 +4901,8 @@ def mail_inbox(settings, limit=60):
     rows = []
     imap = imaplib.IMAP4(settings["imap"][0], settings["imap"][1], timeout=20)
     try:
+        if imap.has_capability("STARTTLS"):
+            imap.starttls(mail_tls_context())
         imap.login(settings["address"], settings["password"])
         typ, _ = imap.select("INBOX", readonly=True)
         if typ != "OK":
@@ -4926,6 +4938,8 @@ def mail_read_message(settings, uid):
     import imaplib
     imap = imaplib.IMAP4(settings["imap"][0], settings["imap"][1], timeout=20)
     try:
+        if imap.has_capability("STARTTLS"):
+            imap.starttls(mail_tls_context())
         imap.login(settings["address"], settings["password"])
         imap.select("INBOX", readonly=True)
         typ, fetched = imap.uid("fetch", str(uid), "(BODY.PEEK[])")
@@ -4960,6 +4974,8 @@ def mail_send(settings, to, subject, body):
     try:
         smtp = smtplib.SMTP(settings["smtp"][0], settings["smtp"][1], timeout=20)
         try:
+            if smtp.has_extn("STARTTLS"):
+                smtp.starttls(context=mail_tls_context())
             smtp.login(settings["address"], settings["password"])
             smtp.send_message(msg)
         finally:
@@ -5105,6 +5121,7 @@ def mail():
          "notice": "", "notice_until": 0.0, "last_poll": 0.0, "quitting": False}
     decoder = __import__("codecs").getincrementaldecoder("utf-8")(errors="ignore")
     pending_esc = ""
+    pending_since = 0.0
     in_paste = False
 
     def flash(text, seconds=6):
@@ -5260,9 +5277,14 @@ def mail():
 
     def handle_keys():
         """Read whatever was typed. Returns True so the screen redraws."""
-        nonlocal pending_esc, in_paste
+        nonlocal pending_esc, pending_since, in_paste
         import select
-        if not tty or not select.select([sys.stdin], [], [], 0)[0]:
+        ready = tty and select.select([sys.stdin], [], [], 0)[0]
+        if pending_esc == "\033" and not ready and time.time() - pending_since > ESC_GRACE:
+            pending_esc = ""
+            press("esc")  # a lone Esc, not the start of a split sequence
+            return True
+        if not ready:
             return False
         chars = pending_esc + decoder.decode(os.read(sys.stdin.fileno(), 4096))
         pending_esc = ""
@@ -5281,6 +5303,7 @@ def mail():
                     continue
                 if i + 1 >= len(chars) or chars[i + 1] == "[":
                     pending_esc = chars[i:]  # sequence split across reads
+                    pending_since = time.time()
                     break
                 press("esc")
             elif c in "\r\n":
@@ -5426,7 +5449,7 @@ def mail():
                      "and ~/.config/comms-deck/mail.secret (chmod 600) with the",
                      "Proton Mail Bridge password on the first line.", "",
                      "Bridge: sudo pacman -S protonmail-bridge, sign in, then",
-                     "this window picks it up on the next refresh.", "", "any key closes this"]
+                     "run `comms-deck mail` again once Bridge answers.", "", "any key closes this"]
             frame = ["", "", ""] + ["  " + fit(n, cols - 2) for n in notes] + [""] * (rows - 3 - len(notes))
             out.write("\033[H" + "\n".join(frame[:rows]) + "\n")
             out.flush()
