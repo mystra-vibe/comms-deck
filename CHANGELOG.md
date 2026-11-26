@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- **The owner is STOX.** The owner chose a name (2026-11-26): screens,
+  delivered notes and Discord show STOX instead of "You" or "owner", the
+  crew panel's centre reads ( STOX ), the chat box prompt is `stox ›`, and
+  agents are told to call them STOX. The seat id stays `owner` in files and
+  logs; `stox` is accepted wherever a seat is named. By Claude.
 - **02 and 03 swap places in the look.** 02 ACTIVITY now sits under 01 CREW
   on the left, and 03 USAGE heads the right column above 05 and 06 (the
   owner, 2026-11-26). 03 takes the rows it needs; 06 gets the rest. By

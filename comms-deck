@@ -256,6 +256,15 @@ for _line in (_app_file.read_text().splitlines() if _app_file.exists() else []):
             HIDDEN_SEATS.add(_name.strip())
 APP_SEATS = tuple(APP_PROCESS)
 SEATS = tuple(AGENTS) + APP_SEATS + ("owner",)
+# The owner's chosen name (2026-11-26: "You may all call me, STOX"). The seat
+# id stays "owner" in files and logs; screens, notes and Discord show this,
+# and "stox" is accepted wherever a seat is named.
+OWNER_NAME = "STOX"
+
+
+def shown_name(seat):
+    """How a seat is named on screens and in notes: the owner is STOX."""
+    return OWNER_NAME if seat == "owner" else seat.title()
 
 # The repos the notes are copied to. A missing clone just means no copy.
 PUBLIC_REPO = Path(setting("PUBLIC_REPO") or HOME / "flight-log")
@@ -642,6 +651,7 @@ def send(sender, to, text, quiet=False, private=False):
         token = token.strip().lstrip("@")
         if not token:
             continue
+        token = re.sub(rf"^(-?){OWNER_NAME.lower()}$", r"\1owner", token)  # STOX is the owner
         (excludes if token.startswith("-") else names).append(token.lstrip("-"))
     names = list(dict.fromkeys(names))
     excludes = list(dict.fromkeys(excludes))
@@ -892,9 +902,9 @@ def render(records, seat):
     lines = []
     for r in records:
         tags = [t for t, on in (("quiet", r.get("quiet")), ("private", r.get("private"))) if on]
-        to = "" if r.get("to") == seat else f" (to {str(r.get('to')).replace('+', ', ')})"
+        to = "" if r.get("to") == seat else f" (to {', '.join(OWNER_NAME if t == 'owner' else t for t in str(r.get('to')).split('+'))})"
         tag = f" [{', '.join(tags)}]" if tags else ""
-        lines.append(f"From {r['from']}{to} at {r['time'][11:16]} ({note_age(r)}){tag}:\n{r['text']}")
+        lines.append(f"From {OWNER_NAME if r['from'] == 'owner' else r['from']}{to} at {r['time'][11:16]} ({note_age(r)}){tag}:\n{r['text']}")
         balancer = load_balancer() if r.get("task") else None
         task = balancer.load_task(r.get("task")) if balancer else None
         if task and task["state"] in balancer.TASK_ACTIVE:
@@ -917,16 +927,16 @@ def render(records, seat):
         # its chat reply is picked up and filed, so tell it how that works.
         who = "owner" if "owner" in senders or not senders else senders[0]  # not just the first alphabetically
         return (f"{MARK} {len(records)} note(s) for {seat}:\n\n" + "\n\n".join(lines)
-                + f"\n\nReply here in this chat. Your reply goes to {'the owner' if who == 'owner' else who}"
+                + f"\n\nReply here in this chat. Your reply goes to {OWNER_NAME if who == 'owner' else who}"
                   " on the comms-deck screen; start it with @claude, @grok or another seat to send it"
                   " to that agent instead. To have something done on this iMac (the scratchpad,"
                   " a workspace, a link, a YouTube search), write a line starting @deck, e.g."
-                  " \"@deck scratchpad\"; \"@deck help\" lists them. Say \"the owner\", never a name.")
+                  f" \"@deck scratchpad\"; \"@deck help\" lists them. Call the owner {OWNER_NAME}, never another name.")
     if "owner" in senders:
-        reply = ("\n\nThe owner sent this from the comms-deck chat screen and reads the answer "
-                 "there, not in this window. Answer with the send_message tool, to: owner "
+        reply = (f"\n\n{OWNER_NAME} (the owner) sent this from the comms-deck chat screen and reads "
+                 "the answer there, not in this window. Answer with the send_message tool, to: owner "
                  "(or `comms-deck send owner \"...\"`). Anything you say only in this window, "
-                 "the owner won't see.")
+                 f"{OWNER_NAME} won't see. Call them {OWNER_NAME}, not \"the owner\" or \"you\".")
     return f"{MARK} {len(records)} note(s) for {seat}:\n\n" + "\n\n".join(lines) + reply
 
 
@@ -2391,8 +2401,8 @@ def post_discord():
         if not r or r.get("private") or looks_secret(r.get("text", "")):
             path.unlink(missing_ok=True)
             continue
-        who = r["from"].title()
-        to_names = "Everyone" if r["to"] == "all" else ", ".join(t.title() for t in r["to"].split("+"))
+        who = shown_name(r["from"])
+        to_names = "Everyone" if r["to"] == "all" else ", ".join(shown_name(t) for t in r["to"].split("+"))
         name = f"{who} → {to_names}" if r["kind"] == "message" else f"{who} (commentary)"
         text = r["text"] if len(r["text"]) <= 1900 else r["text"][:1900] + " …"
         body = json.dumps({"username": name[:80], "content": text,
@@ -2779,7 +2789,7 @@ def chat_lines(r, width):
     """The terminal lines for one record, wrapped to `width`."""
     import textwrap
     esc = "\033["
-    name = lambda seat: "You" if seat == "owner" else seat.title()
+    name = shown_name
     who = f"{esc}1;38;5;{colour(r['from'])}m{name(r['from'])}{esc}0m"
     if r["kind"] == "message":
         to = "everyone" if r["to"] == "all" else ", ".join(name(t) for t in r["to"].split("+"))
@@ -4382,7 +4392,7 @@ def look_crew(cols, rows, records, snap, busy, split, now):
         dim = state in ("away", "not set up", "no chat yet")
         label(cx, min(h - 1, cy + spread + 5), f"[{seat_title(s, not dim).lower()}{' ●' if on else ''}]",
               "2;38;5;244" if dim else f"1;38;5;{colour(s)}")
-    label(*pos["owner"], "( YOU )", "1;38;5;255")
+    label(*pos["owner"], f"( {OWNER_NAME} )", "1;38;5;255")
     out = []
     for r in range(rows):
         row, cur = "", None
@@ -4632,9 +4642,9 @@ def chat(history=200, hide_private=False):
         if typed:
             shown_text = typed[-(cols - 12):]
             highlighted = MENTION.sub(lambda m: f"\033[1;38;5;{colour(m.group(1).lower())}m@{m.group(1)}\033[0m", shown_text)
-            line = f"  \033[1;38;5;{colour('owner')}myou ›\033[0m {highlighted}\033[7m \033[0m"
+            line = f"  \033[1;38;5;{colour('owner')}m{OWNER_NAME.lower()} ›\033[0m {highlighted}\033[7m \033[0m"
         else:
-            line = (f"  \033[1;38;5;{colour('owner')}myou ›\033[0m \033[7m \033[0m\033[2m type a note · "
+            line = (f"  \033[1;38;5;{colour('owner')}m{OWNER_NAME.lower()} ›\033[0m \033[7m \033[0m\033[2m type a note · "
                     + " ".join(f"@{s}" for s in SEATS if s != "owner" and s not in HIDDEN_SEATS) + " · no @ = everyone\033[0m")
         if notice and time.time() < notice_until:
             line += f"   \033[38;5;{196 if notice.startswith('no seat') else 78}m{notice}\033[0m"
@@ -5731,7 +5741,8 @@ MCP_TOOLS = [
      "inputSchema": {"type": "object", "required": ["to", "text"], "properties": {
          "to": {"type": "string",
                 "description": "A seat, several seats separated by commas (e.g. 'claude, grok'), "
-                               "'owner', or 'all'. Seats: " + ", ".join(SEATS) + ". A '-seat' token "
+                               "'owner' (" + OWNER_NAME + ", also accepted as '" + OWNER_NAME.lower() + "'), or 'all'. "
+                               "Seats: " + ", ".join(SEATS) + ". A '-seat' token "
                                "drops that seat from the recipients (e.g. 'all -grok')."},
          "text": {"type": "string"},
          "quiet": {"type": "boolean", "description": "Don't wake them; they get it next time."},
@@ -6648,7 +6659,7 @@ def self_test():
         "assert 'Reply here in this chat' in out and 'Your reply goes to grok' in out, out",
         "assert 'send_message' not in out, out",
         "owner_note = x.render([{'from': 'owner', 'to': 'alice', 'time': '2026-11-24 02:50:00', 'text': 'hi'}], 'alice')",
-        "assert 'Your reply goes to the owner' in owner_note, owner_note",
+        "assert 'Your reply goes to STOX' in owner_note, owner_note",
         "print('ok')",
     ])
     r = subprocess.run([sys.executable, "-c", code],
@@ -6824,7 +6835,7 @@ def self_test():
         "two = [{'from':'owner','to':'alice','time':'2026-11-24 07:00:00','text':'hi'},"
         " {'from':'gravity','to':'all','time':'2026-11-24 07:00:00','text':'yo'}]",
         "x.APP_SEATS = tuple(set(x.APP_SEATS) | {'alice'})",
-        "assert 'Your reply goes to the owner' in x.render(two, 'alice')",
+        "assert 'Your reply goes to STOX' in x.render(two, 'alice')",
         "assert x.app_delivery_allowed({'open':True,'replying':False,'composer':'draft'}, False, {'auto':0}, 'alice') is False",
         "assert x.app_delivery_allowed(idle, True, {'auto':0}, 'alice') is False",
         "assert x.app_delivery_allowed(idle, False, {'auto':2}, 'alice') is False",
@@ -7508,6 +7519,11 @@ def self_test():
         "assert '02  ACTIVITY' in half and '\u21b3' not in half, half",
         # easter egg: Gravity offline, Antigravity online
         "assert x.seat_title('gravity') == 'Gravity' and x.seat_title('gravity', True) == 'Antigravity' and x.seat_title('grok', True) == 'Grok'",
+        # the owner's name: STOX on screens and in notes, "stox" accepted as a seat
+        "assert x.shown_name('owner') == 'STOX' and x.shown_name('grok') == 'Grok'",
+        "rs, _ = x.send('claude', 'STOX', 'hello stox'); assert rs['to'] == 'owner', rs",
+        "rs, _ = x.send('claude', 'all -stox -grok', 'everyone'); assert 'owner' not in rs['to'], rs",
+        "assert '( STOX )' in plain and '( YOU )' not in plain",
         "tick = x.ANSI.sub('', x.look_ticker(400, recs, 0))",
         "assert '(private)' in tick and 'secret plan' not in tick and 'public hello' in tick, tick",
         "print('look ok')",
