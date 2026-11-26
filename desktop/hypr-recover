@@ -37,6 +37,7 @@ Written by: Claude (2026-11-26)
 """
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -73,7 +74,9 @@ def autostart_commands(config_text):
     """The hl.exec_cmd("...") lines inside hl.on("hyprland.start", ...).
 
     Only double-quoted commands are taken. The first-login welcome screen
-    uses a [[...]] string, so it is skipped on purpose.
+    uses a [[...]] string, so it is skipped on purpose. The block ends at
+    the first "end)" at the start of a line, as in hyprland.lua; anything
+    nested inside it is indented, so it doesn't end the block early.
     """
     m = re.search(r'hl\.on\(\s*"hyprland\.start"(.*?)\nend\)', config_text, re.S)
     if not m:
@@ -97,9 +100,24 @@ def swap_in_link(recovery, target):
     os.replace(tmp, recovery)
 
 
-def running(cmd):
-    return subprocess.run(["pgrep", "-f", "-x", re.escape(cmd)],
-                          capture_output=True).returncode == 0
+def same_command(cmd, argv):
+    """True if argv runs cmd: same arguments, program matched by its name,
+    so /usr/bin/waybar counts as waybar (systemd-run starts it that way)."""
+    want = shlex.split(cmd)
+    return (len(argv) == len(want) and bool(want)
+            and os.path.basename(argv[0]) == os.path.basename(want[0])
+            and argv[1:] == want[1:])
+
+
+def running(cmd, proc=Path("/proc")):
+    for d in proc.glob("[0-9]*"):
+        try:
+            raw = (d / "cmdline").read_bytes()
+        except OSError:
+            continue
+        if raw and same_command(cmd, raw.rstrip(b"\0").decode(errors="replace").split("\0")):
+            return True
+    return False
 
 
 def hyprctl(sig, *args):
@@ -153,7 +171,7 @@ def recover(recovery, dry):
             break
 
     if not dry and shutil.which("comms-deck"):
-        subprocess.run(["comms-deck", "--from", "claude", "send", "owner",
+        subprocess.run(["comms-deck", "--from", "hypr-recover", "send", "owner",
                         "STOX, Hyprland crashed and came back in safe mode. "
                         "hypr-recover has put your config back, started the "
                         "taskbar and dock, and reopened the deck windows. "
@@ -184,6 +202,19 @@ hl.exec_cmd("outside-the-block")
 '''
     got = autostart_commands(sample)
     assert got == ["waybar", "nwg-dock-hyprland -d"], got
+    assert same_command("waybar", ["/usr/bin/waybar"])
+    assert same_command("nwg-dock-hyprland -d", ["/usr/bin/nwg-dock-hyprland", "-d"])
+    assert not same_command("nwg-dock-hyprland -d", ["/usr/bin/nwg-dock-hyprland"])
+    text = "wl-paste --type text --watch cliphist store"
+    image = "wl-paste --type image --watch cliphist store"
+    assert same_command(text, ["/usr/bin/wl-paste", "--type", "text", "--watch", "cliphist", "store"])
+    assert not same_command(image, ["/usr/bin/wl-paste", "--type", "text", "--watch", "cliphist", "store"])
+    assert not same_command("bar", ["/usr/bin/waybar"])
+    with tempfile.TemporaryDirectory() as fake:
+        (Path(fake) / "42").mkdir()
+        (Path(fake) / "42" / "cmdline").write_bytes(b"/usr/bin/nwg-dock-hyprland\0-d\0")
+        assert running("nwg-dock-hyprland -d", Path(fake))
+        assert not running("waybar", Path(fake))
     assert lua_string('a "b" \\c') == '"a \\"b\\" \\\\c"'
 
     with tempfile.TemporaryDirectory() as d:
