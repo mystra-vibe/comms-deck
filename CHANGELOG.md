@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- **The owner's name is Y.** STOX renamed themselves (2026-11-26): screens,
+  notes, the chat prompt (`y ›`) and Discord now show **Y**, and `y` names
+  the owner wherever a seat is named. The seat id stays `owner` in files
+  and logs, and the owner's earlier name `stox` is still accepted as the
+  seat, old notes addressed `@STOX` included. Self-test asserts both
+  spellings and that `( Y )` sits in the crew panel. By vibe.
+
 - **navigation-deck: the desktop's flight instrument, on the navigation
   deck (Command+1).** A
   viewer born of the 02:11 OOM: the deck's ready order with note loads and
