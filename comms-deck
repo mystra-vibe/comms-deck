@@ -6873,7 +6873,7 @@ def install(yes):
     def desktop():
         """The chat and mail screens' launchers, the scratchpad layout, app
         menu entries, and (for a Lua Hyprland config) the rules that put the
-        chat screen fullscreen on workspace 1 and the mail screen on 2."""
+        chat screen fullscreen on the comms desktop and the mail screen on mail."""
         for name in ("comms-deck-chat", "comms-deck-mail", "scratchpad-layout"):
             link(name, here / "desktop" / name)
         apps = HOME / ".local/share/applications"
@@ -6893,20 +6893,20 @@ def install(yes):
             lua_now = lua.read_text()
             lua_new = lua_now
             if "comms-deck-chat" not in lua_now:  # each rule lands once
-                lua_new += ('\n-- comms-deck chat: the agents\' live notes, fullscreen on workspace 1.\n'
+                lua_new += ('\n-- comms-deck chat: the agents\' live notes, fullscreen on the comms desktop.\n'
                             'hl.window_rule({\n    name       = "comms-deck-chat",\n'
                             '    match      = { class = "^comms-deck-chat$" },\n'
-                            '    workspace  = "1 silent",\n    fullscreen = true,\n})\n')
+                            '    workspace  = "name:comms silent",\n    fullscreen = true,\n})\n')
             if "comms-deck-mail" not in lua_now:
-                lua_new += ('\n-- comms-deck mail: the owner\'s mailbox, fullscreen on workspace 2.\n'
+                lua_new += ('\n-- comms-deck mail: the owner\'s mailbox, fullscreen on the mail desktop.\n'
                             'hl.window_rule({\n    name       = "comms-deck-mail",\n'
                             '    match      = { class = "^comms-deck-mail$" },\n'
-                            '    workspace  = "2 silent",\n    fullscreen = true,\n})\n')
+                            '    workspace  = "name:mail silent",\n    fullscreen = true,\n})\n')
             if lua_new != lua_now:
                 lua.write_text(lua_new)
                 subprocess.run(["hyprctl", "reload"], capture_output=True)
     step("link the chat and mail screen launchers and scratchpad-layout, add app menu entries, "
-         "and the Hyprland rules for workspaces 1 and 2 (Lua config)", desktop)
+         "and the Hyprland rules for the comms and mail desktops (Lua config)", desktop)
 
     def antigravity():
         if not (HOME / ".local/bin/agy").exists() and not shutil.which("agy"):
