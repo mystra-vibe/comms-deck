@@ -4494,16 +4494,23 @@ def look_screen(cols, body_h, shown, records, now):
     busy = busy_seats(snap)
     split = context_split()
     lw, cw, rw = look_widths(cols)
-    usage = usage_panel(lw - 4)[2:]  # its own USAGE heading is in the frame now
+    usage = usage_panel(rw - 4)[2:]  # its own USAGE heading is in the frame now
+    parts = look_activity_parts(activity_panel(lw - 4))
+    # 02 sits under 01 on the left and 03 on the right (swapped by the
+    # owner, 2026-11-26). Short of room, 02 drops the "↳ last note" lines
+    # (one row per seat) and is cut to fit, rather than look_stack skipping it.
+    crew_h = max(10, int(body_h * 0.45))
+    room = body_h - crew_h - 4
+    if len(parts["activity"]) > room:
+        parts["activity"] = [l for l in parts["activity"]
+                             if not ANSI.sub("", l).lstrip().startswith("↳")][:max(room, 0)]
     left = look_stack([
-        (max(10, int(body_h * 0.45)), lambda w, h: look_frame(
+        (crew_h, lambda w, h: look_frame(
             "01", "CREW", "who talks to whom", look_tag(bool(busy), f"{len(busy)} WORKING"),
             LOOK_ACCENT["crew"], w, h, look_crew(w - 4, h - 4, records, snap, busy, split, now))),
-        # The look drops 03's own head line, so the /sort choice takes the
-        # frame's subtitle (a narrow column would cut it off the end).
-        (None, lambda w, h: look_frame("03", "USAGE", "allocation · spend"
-                                       if usage_sort() == "provider" else f"sorted by {usage_sort()}", "",
-                                       LOOK_ACCENT["usage"], w, h, fit_column(usage, h - 4))),
+        (None, lambda w, h: look_frame(
+            "02", "ACTIVITY", "ready order", look_tag(bool(busy)), LOOK_ACCENT["activity"], w, h,
+            parts["activity"][:h - 4])),
     ], lw, body_h)
     alerts = [l for l in notify_lines(cw - 4) if ANSI.sub("", l).strip()][:6]
     centre_panels = [(None, lambda w, h: look_frame(
@@ -4513,20 +4520,17 @@ def look_screen(cols, body_h, shown, records, now):
         centre_panels.append((len(alerts) + 4, lambda w, h: look_frame(
             "07", "ALERTS", "desktop notifications", "", LOOK_ACCENT["alerts"], w, h, alerts)))
     centre = look_stack(centre_panels, cw, body_h)
-    parts = look_activity_parts(activity_panel(rw - 4))
-    # Half-height look (chat on the top half, a terminal below): 02 at full
-    # length doesn't fit, and look_stack would skip it -- and 06 with it --
-    # leaving the column blank. Short of room, 02 drops the "↳ last note"
-    # lines (one row per seat) and is cut to the column; 06 shows if it fits.
-    # (The owner, 2026-11-26: "add something to the righthand column".)
-    room = body_h - 4 - (len(parts["tasks"]) + 4 if parts["tasks"] else 0)
-    if len(parts["activity"]) > room:
-        parts["activity"] = [l for l in parts["activity"]
-                             if not ANSI.sub("", l).lstrip().startswith("↳")][:max(room, 0)]
-    right_panels = [(len(parts["activity"]) + 4, lambda w, h: look_frame(
-        "02", "ACTIVITY", "ready order", look_tag(bool(busy)), LOOK_ACCENT["activity"], w, h, parts["activity"]))]
+    tasks_h = len(parts["tasks"]) + 4 if parts["tasks"] else 0
+    # 03 takes what it needs (cut to the column if short of room); 06 the rest.
+    usage_h = min(len(usage) + 4, max(body_h - tasks_h, 0))
+    right_panels = [
+        # The look drops 03's own head line, so the /sort choice takes the
+        # frame's subtitle (a narrow column would cut it off the end).
+        (usage_h, lambda w, h: look_frame("03", "USAGE", "allocation · spend"
+                                          if usage_sort() == "provider" else f"sorted by {usage_sort()}", "",
+                                          LOOK_ACCENT["usage"], w, h, fit_column(usage, h - 4)))]
     if parts["tasks"]:
-        right_panels.append((len(parts["tasks"]) + 4, lambda w, h: look_frame(
+        right_panels.append((tasks_h, lambda w, h: look_frame(
             "05", "TASKS", "one task, one holder", "", LOOK_ACCENT["tasks"], w, h, parts["tasks"])))
     right_panels.append((None, lambda w, h: look_frame(
         "06", "CONTEXT SPLIT", "the shared pool", look_tag(bool(busy), "GLOWING", "STILL"),
@@ -7499,8 +7503,8 @@ def self_test():
         "plain = '\\n'.join(x.ANSI.sub('', l) for l in x.look_screen(200, 40, shown, recs, time.time()))",
         "assert 'sorted by spend' in plain, 'the look shows the /sort choice in 03\\'s frame'",
         "assert x.set_sort('provider') is None and 'sorted by' not in '\\n'.join(x.look_screen(200, 40, shown, recs, time.time()))",
-        # half-height look (a terminal below the chat): 02 still shows, one row a seat
-        "half = '\\n'.join(x.ANSI.sub('', l) for l in x.look_screen(200, 7, shown, recs, time.time()))",
+        # a short look: 02 (under 01 on the left) still shows, one row a seat
+        "half = '\\n'.join(x.ANSI.sub('', l) for l in x.look_screen(200, 17, shown, recs, time.time()))",
         "assert '02  ACTIVITY' in half and '\u21b3' not in half, half",
         # easter egg: Gravity offline, Antigravity online
         "assert x.seat_title('gravity') == 'Gravity' and x.seat_title('gravity', True) == 'Antigravity' and x.seat_title('grok', True) == 'Grok'",
