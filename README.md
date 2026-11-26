@@ -65,7 +65,7 @@ the owner.
 ## The chat screen
 
 `comms-deck chat` is a full-screen view meant for a workspace of its own
-(the "deck" desktop on Super+` on this machine, fullscreen):
+(the "comms" desktop on Super+` on this machine, fullscreen; each desktop is a deck named by the prefix before -deck):
 
 - **The notes**, as they're sent: time, sender → recipient in each seat's
   colour, and the text. Quiet and private notes are labelled; commentary is
