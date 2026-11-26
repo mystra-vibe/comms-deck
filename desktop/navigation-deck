@@ -676,6 +676,15 @@ def event_tail_panel(width, height, now, records=None, live=None):
 # side needs — that's the whole comms-deck contract.
 
 TWITCH_CHAT = DATA / "twitch-chat.jsonl"
+TWITCH_STATUS = TWITCH_CHAT.with_suffix(".status.json")
+
+def twitch_chat_state():
+    """What the reader says about itself (devin's #128 status file):
+    live / connecting / auth-failed / config, else an empty dict."""
+    try:
+        return json.loads(TWITCH_STATUS.read_text())
+    except (OSError, ValueError):
+        return {}
 
 def twitch_chat_panel(width, height, now, lines=None):
     """10 COCKPIT-CHAT's body: 'HH:MM  user: what was said', newest last.
@@ -1092,8 +1101,11 @@ def cockpit_frame(width, height, status, clients, workspaces, hours, busy,
     nt_body = nav_time_panel(rw - 4, timing)[1:]
     pulse_body = pulse_panel(rw - 4, hours, busy)[1:]
     tc_body = twitch_chat_panel(rw - 4, 8, now)
-    streaming = bool(stream_state())
-    CHAT_TAG = (f"{esc}38;5;42m● LIVE{esc}0m" if streaming
+    tc_state = (twitch_chat_state().get("state") or "")   # the reader's word
+    CHAT_TAG = (f"{esc}38;5;42m● LIVE{esc}0m" if tc_state == "live"
+                else f"{esc}38;5;196m⚠ AUTH{esc}0m" if tc_state == "auth-failed"
+                else f"{esc}38;5;226m◌ connecting{esc}0m" if tc_state == "connecting"
+                else f"{esc}38;5;214m○ config{esc}0m" if tc_state == "config"
                 else f"{esc}2m○ idle{esc}0m")
     right = CD.look_stack([
         (min(len(usage) + 4, max(10, body_h // 3)), lambda w, h: frame(
