@@ -4719,7 +4719,8 @@ def chat(history=200, hide_private=False):
                 gap = 1 / 30 if animating else (0.1 if getattr(activity_panel, "fast", False)
                                                  else 1 if getattr(activity_panel, "ticking", False) else 2)
                 if look:
-                    gap = max(gap, 1 / 15)  # a look frame costs tens of ms: 15 fps, not 120
+                    gap = max(gap, 1 / 5)  # a look frame costs tens of ms: at 15 fps the full chat held
+                                           # ~40% of a core on this 8 GB box; 5 fps (STOX, 2026-11-26)
                 if look and (changed or time.time() - last_draw >= gap):
                     body = rows - 4 - (1 if tty else 0)  # the strip (3), the ticker, the chat box
                     screen = ["\033[H", "\n".join(look_screen(cols, body, shown, records, time.time()))]
