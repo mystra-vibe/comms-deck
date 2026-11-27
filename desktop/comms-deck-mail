@@ -1,6 +1,6 @@
 #!/bin/sh
 # Open the mail view in its own kitty window. One copy, like the chat screen.
-#   comms-deck-mail          fullscreen on the mail desktop, Super+2 (the window rule does it)
+#   comms-deck-mail          fullscreen on the mail desktop, Super+9 (the window rule does it)
 # The mail view talks to Proton Mail Bridge on localhost (IMAP/SMTP); Bridge
 # being down shows an offline banner, it never makes the window fail.
 # Written by: Vibe (2026-11-26)

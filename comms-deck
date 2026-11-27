@@ -4848,8 +4848,8 @@ def chat(history=200, hide_private=False):
 # SECTION 9b: mail - a small email client for the owner's Proton account
 # -----------------------------------------------------------------------------
 #
-# The owner reads and sends mail from the window on workspace 2 (Super+2),
-# next to the chat screen on 1. It talks to Proton Mail Bridge on localhost
+# The owner reads and sends mail from the window on the mail desktop
+# (workspace 10, Super+9). It talks to Proton Mail Bridge on localhost
 # (IMAP 127.0.0.1:1143, SMTP 127.0.0.1:1025 unless mail.json says otherwise):
 # Bridge is the only door Proton opens to outside programs, and the owner
 # signs in to it themselves. The Bridge password is the first line of
@@ -6990,17 +6990,22 @@ def install(yes):
                 lua_new += ('\n-- comms-deck mail: the owner\'s mailbox, fullscreen on the mail desktop.\n'
                             'hl.window_rule({\n    name       = "comms-deck-mail",\n'
                             '    match      = { class = "^comms-deck-mail$" },\n'
-                            '    workspace  = "3 silent",\n    fullscreen = true,\n})\n')
+                            '    workspace  = "10 silent",\n    fullscreen = true,\n})\n')
             if "nav-deck" not in lua_now and "navigation-deck" not in lua_now:
                 lua_new += ('\n-- nav-deck: the seats, usage and workspaces dashboard, fullscreen on the nav deck.\n'
                             'hl.window_rule({\n    name       = "nav-deck",\n'
                             '    match      = { class = "^nav-deck$" },\n'
-                            '    workspace  = "2 silent",\n    fullscreen = true,\n})\n')
+                            '    workspace  = "9 silent",\n    fullscreen = true,\n})\n')
+            if "warp-core" not in lua_now:
+                lua_new += ('\n-- warp-core: the comms-deck on the GPU, fullscreen on the scratchpad (Super+S).\n'
+                            'hl.window_rule({\n    name       = "warp-core",\n'
+                            '    match      = { class = "^warp-core$" },\n'
+                            '    workspace  = "special:magic silent",\n    fullscreen = true,\n})\n')
             if "default_name" not in lua_now:  # desktops are decks: numbered, with names
                 lua_new += ('\n-- Desktops are decks: numbered workspaces with names, so the bar sorts\n'
                             '-- them by number and shows the name (STOX, 2026-11-26).\n'
-                            'for i, name in ipairs({ "comms", "nav", "mail", "3", "4", "5",\n'
-                            '                        "6", "7", "8", "9", "0" }) do\n'
+                            'for i, name in ipairs({ "comms", "claude", "grok", "vibe", "devin", "gravity",\n'
+                            '                        "lumo", "alice", "nav", "mail", "0" }) do\n'
                             '    hl.workspace_rule({ workspace = tostring(i), default_name = name })\nend\n')
             if lua_new != lua_now:
                 lua.write_text(lua_new)
@@ -8262,8 +8267,8 @@ def self_test():
     layout = Path(__file__).resolve().parent / "desktop" / "scratchpad-layout"
     r = subprocess.run([sys.executable, str(layout), "--self-test"], env=env,
                        capture_output=True, text=True, timeout=30)
-    check("scratchpad cells tile flush, including Vibe and the shared bottom right",
-          r.returncode == 0 and "layout tiles ok" in r.stdout, r.stdout + r.stderr)
+    check("each agent has its own desktop (Super+1..7) and the warp core the scratchpad",
+          r.returncode == 0 and "desktops ok" in r.stdout, r.stdout + r.stderr)
 
     # --- remote seats (docs/REMOTE.md): join from another device through the git repos ---
     upstream, rlog = Path(tmp) / "remote-upstream", Path(tmp) / "remote-log"
@@ -8695,7 +8700,7 @@ def main():
     p = sub.add_parser("chat")
     p.add_argument("--hide-private", action="store_true")
     p.add_argument("--history", type=int, default=200)
-    sub.add_parser("mail", help="the mail client (Proton Mail Bridge on localhost; workspace 2)")
+    sub.add_parser("mail", help="the mail client (Proton Mail Bridge on localhost; the mail desktop, Super+9)")
     sub.add_parser("serve")
     sub.add_parser("mcp")
     sub.add_parser("mcp-call")  # internal: one tool call for an MCP server running old code
