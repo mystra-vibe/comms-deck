@@ -1,7 +1,6 @@
 #!/bin/sh
 # Open the nav-deck in its own kitty window: fullscreen on the nav deck
-# (workspace 2; the desk's default_name becomes "nav" once claude flips it,
-# Command+1 either way).
+# (workspace 9, Super+8: the agents have Super+1..7 since 2026-11-27).
 # One copy per view. It reads the deck's public surfaces only; see the
 # nav-deck docstring for what the screen shows.
 #   nav-deck-chat        fullscreen on the nav deck
@@ -27,12 +26,12 @@ done
 w="window = \"address:$addr\""
 if [ "$view" = full ]; then
     sleep 0.5
-    hyprctl dispatch "hl.dsp.window.move({ $w, workspace = 2, follow = false })" >/dev/null
+    hyprctl dispatch "hl.dsp.window.move({ $w, workspace = 9, follow = false })" >/dev/null
     hyprctl clients -j | grep "\"class\": \"$class\"" >/dev/null \
         && hyprctl dispatch "hl.dsp.window.fullscreen({ $w, action = \"set\" })" >/dev/null
 # action = "set": the browser window rule already opens it fullscreen, and a
 # bare fullscreen here would toggle it straight off again.
 else
-    hyprctl dispatch "hl.dsp.window.move({ $w, workspace = 2, follow = false })" >/dev/null
+    hyprctl dispatch "hl.dsp.window.move({ $w, workspace = 9, follow = false })" >/dev/null
 fi
 wait
